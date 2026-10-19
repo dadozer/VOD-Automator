@@ -19,12 +19,12 @@ export async function fetchThirdPartyEmotes(twitchId: string): Promise<ThirdPart
 
   try {
     const [bttvGlobal, bttvChannel, ffzGlobal, ffzChannel, stvGlobal, stvChannel] = await Promise.allSettled([
-      axios.get("https://api.betterttv.net/3/cached/emotes/global"),
-      axios.get(`https://api.betterttv.net/3/cached/users/twitch/${twitchId}`),
-      axios.get("https://api.frankerfacez.com/v1/set/global"),
-      axios.get(`https://api.frankerfacez.com/v1/room/id/${twitchId}`),
-      axios.get("https://7tv.io/v3/emote-sets/global"),
-      axios.get(`https://7tv.io/v3/users/twitch/${twitchId}`)
+      axios.get("https://api.betterttv.net/3/cached/emotes/global", { timeout: 5000 }),
+      axios.get(`https://api.betterttv.net/3/cached/users/twitch/${twitchId}`, { timeout: 5000 }),
+      axios.get("https://api.frankerfacez.com/v1/set/global", { timeout: 5000 }),
+      axios.get(`https://api.frankerfacez.com/v1/room/id/${twitchId}`, { timeout: 5000 }),
+      axios.get("https://7tv.io/v3/emote-sets/global", { timeout: 5000 }),
+      axios.get(`https://7tv.io/v3/users/twitch/${twitchId}`, { timeout: 5000 })
     ]);
 
     if (bttvGlobal.status === "fulfilled") bttvGlobal.value.data.forEach((e: any) => pushEmote(1, e.id, e.code));

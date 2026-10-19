@@ -41,7 +41,7 @@ export function cleanChannelName(channel: string): string {
       cleaned = url.pathname.split('/').filter(Boolean)[0] || cleaned;
     }
   } catch (e) {}
-  cleaned = cleaned.replace(/^(https?:\/\/)?(www\.)?twitch\.tv\//, '').split('?')[0].replace(/\/$/, '');
+  cleaned = cleaned.replace(/^(https?:\/\/)?(www\.)?twitch\.tv\//, '').split('?')[0].replace(/\/$/, '').replace(/[^a-z0-9_]/g, '');
   return cleaned.trim();
 }
 
@@ -361,6 +361,10 @@ function getSerializableSessions() {
         chatFilePath: session.chatFilePath,
         videoDurationSeconds: session.videoDurationSeconds,
         videoStartTimeMs: session.videoStartTimeMs,
+        streamCreatedAtMs: session.streamCreatedAtMs,
+        initialJoinOffsetSec: session.initialJoinOffsetSec,
+        firstSeqNum: session.firstSeqNum,
+        gapAdjustments: session.gapAdjustments,
         missingCount: session.missingCount,
         downloadedSegments: serializeDownloadedSegments(session.downloadedSegments),
         autoRenderChat: session.autoRenderChat
@@ -371,9 +375,13 @@ function getSerializableSessions() {
 
 let stateSaveTimeout: NodeJS.Timeout | null = null;
 let isSavingState = false;
+let pendingStateSave = false;
 
 function executeStateSave() {
-  if (isSavingState) return;
+  if (isSavingState) {
+    pendingStateSave = true;
+    return;
+  }
   isSavingState = true;
   try {
     const serializableSessions = getSerializableSessions();
@@ -386,10 +394,18 @@ function executeStateSave() {
       .catch(err => console.error("Failed to save state.json dynamically", err))
       .finally(() => {
         isSavingState = false;
+        if (pendingStateSave) {
+          pendingStateSave = false;
+          executeStateSave();
+        }
       });
   } catch (err) {
     isSavingState = false;
     console.error("Failed to save state.json", err);
+    if (pendingStateSave) {
+      pendingStateSave = false;
+      executeStateSave();
+    }
   }
 }
 

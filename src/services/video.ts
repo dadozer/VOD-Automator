@@ -621,13 +621,8 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
       };
 
       try {
-        let runSucceeded = false;
         try {
           await runFfmpegProcess();
-          const testStats = await fs.promises.stat(outputPath).catch(() => null);
-          if (testStats && testStats.size > 1000) {
-            runSucceeded = true;
-          }
         } catch (pipeErr: any) {
           // If pipe remuxing encountered an error on fMP4, fall back to direct file assembly
           if (isFmp4Pipe && resolvedInitPath && !state.activeTasks[taskId]?.cancelled) {
@@ -665,7 +660,6 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
 
               if (remuxOk && fs.existsSync(outputPath)) {
                 try { await fs.promises.unlink(tempConcatPath); } catch (e) {}
-                runSucceeded = true;
                 addLog(`[Video Fallback] Direct fMP4 assembly succeeded for ${label}.`);
               }
             } catch (combErr: any) {
@@ -903,12 +897,10 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
 
       addLog(`[Video] Slicing custom export (${taskObj.customExportMode}) with ${customChunks.length} chunks (range ${startIdx} - ${endIdx})...`);
       let customDuration = 0;
-      let customStitchError: Error | null = null;
       try {
         customDuration = await stitchGroup(customChunks, videoOutputName, taskObj.name || 'Custom Slice');
         successfullyStitchedMp4s.push(videoOutputName.replace(/\.ts$/, '.mp4'));
       } catch (err: any) {
-        customStitchError = err;
         addLog(`[Video Warning] Custom slice video stitching failed: ${err.message}. Proceeding with chat slice...`);
       }
 
@@ -921,16 +913,34 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
             const firstChunkInVideo = getChunkIndex(customChunks[0]);
             const actualVideoDurationSec = customDuration > 0 ? customDuration : Math.max(1, Math.round(customChunks.length * 2));
             const avgChunkDur = customChunks.length > 0 ? (actualVideoDurationSec / customChunks.length) : 2.0;
-            const videoStartOffset = Math.max(0, firstChunkInVideo * avgChunkDur);
+
+            const baseOffsetSec = session?.initialJoinOffsetSec ?? taskObj?.initialJoinOffsetSec ?? 0;
+            const baseSeq = session?.firstSeqNum ?? taskObj?.firstSeqNum ?? (activeChunkList.length > 0 ? getChunkIndex(activeChunkList[0]) : 0);
+            const broadcastStartMs = session?.streamCreatedAtMs || session?.videoStartTimeMs || taskObj?.streamCreatedAtMs;
+            const targetGameIdx = taskObj?.targetGameIndex;
+            const targetGame = (targetGameIdx !== undefined && games[targetGameIdx])
+              ? games[targetGameIdx]
+              : games.find(g => g.gameName === taskObj?.gameName);
+
+            let videoStartOffset = Math.max(0, baseOffsetSec + Math.max(0, firstChunkInVideo - baseSeq) * avgChunkDur);
+            if (targetGame && targetGameIdx !== undefined && targetGameIdx > 0 && broadcastStartMs && targetGame.startTimeMs && targetGame.startTimeMs >= broadcastStartMs) {
+              const gameSwitchOffsetSec = (targetGame.startTimeMs - broadcastStartMs) / 1000;
+              const chunkDelta = firstChunkInVideo - targetGame.startChunk;
+              videoStartOffset = Math.max(0, gameSwitchOffsetSec + (chunkDelta * avgChunkDur));
+            } else if (targetGame && targetGame.startTimeOffset !== undefined && targetGame.startTimeOffset > 0 && targetGame.startChunk > 0) {
+              const chunkDelta = firstChunkInVideo - targetGame.startChunk;
+              videoStartOffset = Math.max(0, targetGame.startTimeOffset + (chunkDelta * avgChunkDur));
+            }
+
             const videoEndOffset = videoStartOffset + actualVideoDurationSec;
 
-            const gapAdjustments = session?.gapAdjustments || (taskObj as any)?.gapAdjustments || [];
+            const gapAdjustments = session?.gapAdjustments || taskObj?.gapAdjustments || [];
             const filteredComments = [];
             for (const c of chatData.comments || []) {
               let streamTime = c.content_offset_seconds;
               if (gapAdjustments.length > 0) {
                 for (const gap of gapAdjustments) {
-                  const gapOffsetSec = gap.atChunk * avgChunkDur;
+                  const gapOffsetSec = baseOffsetSec + Math.max(0, gap.atChunk - baseSeq) * avgChunkDur;
                   if (streamTime > gapOffsetSec) {
                     streamTime -= gap.missingDurationSec;
                   }
@@ -1123,12 +1133,12 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
             const avgChunkDur = gameChunks.length > 0 ? (actualVideoDurationSec / gameChunks.length) : 2.0;
 
             // Accurate start offset determination:
-            // For the initial game (i === 0), anchor directly to physical chunk presentation timeline.
-            // When recording from broadcast start (firstChunkInVideo === 0), offset is 0s.
-            // If recording started mid-stream (firstChunkInVideo > 0), offset is firstChunkInVideo * avgChunkDur.
-            // For subsequent games (i > 0), anchor to the real stream timeline switch point.
-            const broadcastStartMs = session?.streamCreatedAtMs || session?.videoStartTimeMs || (taskObj as any)?.streamCreatedAtMs;
-            let videoStartOffset = Math.max(0, firstChunkInVideo * avgChunkDur);
+            // Anchor initial game (i === 0) to broadcast join offset (initialJoinOffsetSec) + relative chunk delta from firstSeqNum.
+            // Anchor subsequent games (i > 0) to real stream presentation timeline switch point.
+            const baseOffsetSec = session?.initialJoinOffsetSec ?? taskObj?.initialJoinOffsetSec ?? 0;
+            const baseSeq = session?.firstSeqNum ?? taskObj?.firstSeqNum ?? (activeChunkList.length > 0 ? getChunkIndex(activeChunkList[0]) : 0);
+            const broadcastStartMs = session?.streamCreatedAtMs || session?.videoStartTimeMs || taskObj?.streamCreatedAtMs;
+            let videoStartOffset = Math.max(0, baseOffsetSec + Math.max(0, firstChunkInVideo - baseSeq) * avgChunkDur);
 
             if (i > 0 && broadcastStartMs && game.startTimeMs && game.startTimeMs >= broadcastStartMs) {
               const gameSwitchOffsetSec = (game.startTimeMs - broadcastStartMs) / 1000;
@@ -1137,8 +1147,8 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
               videoStartOffset = Math.max(0, gameSwitchOffsetSec + (chunkDelta * avgChunkDur));
               addLog(`[Chat Split] Anchored ${game.gameName} start offset to real stream timeline: ${videoStartOffset.toFixed(1)}s (Switch: ${gameSwitchOffsetSec.toFixed(1)}s, Delta chunks: ${chunkDelta}, AvgChunk: ${avgChunkDur.toFixed(3)}s)`);
             } else if (i === 0) {
-              videoStartOffset = Math.max(0, firstChunkInVideo * avgChunkDur);
-              addLog(`[Chat Split] Anchored initial game ${game.gameName} start offset to chunk presentation timeline: ${videoStartOffset.toFixed(1)}s (firstChunk: ${firstChunkInVideo}, avgChunk: ${avgChunkDur.toFixed(3)}s)`);
+              videoStartOffset = Math.max(0, baseOffsetSec + Math.max(0, firstChunkInVideo - baseSeq) * avgChunkDur);
+              addLog(`[Chat Split] Anchored initial game ${game.gameName} start offset to broadcast timeline: ${videoStartOffset.toFixed(1)}s (joinOffset: ${baseOffsetSec}s, firstChunk: ${firstChunkInVideo}, baseSeq: ${baseSeq}, avgChunk: ${avgChunkDur.toFixed(3)}s)`);
             } else if (game.startTimeOffset !== undefined && game.startTimeOffset > 0) {
               const chunkDelta = firstChunkInVideo - game.startChunk;
               videoStartOffset = Math.max(0, game.startTimeOffset + (chunkDelta * avgChunkDur));
@@ -1146,13 +1156,13 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
 
             const videoEndOffset = videoStartOffset + actualVideoDurationSec;
 
-            const gapAdjustments = session?.gapAdjustments || (taskObj as any)?.gapAdjustments || [];
+            const gapAdjustments = session?.gapAdjustments || taskObj?.gapAdjustments || [];
             const filteredComments = [];
             for (const c of chatData.comments || []) {
               let streamTime = c.content_offset_seconds;
               if (gapAdjustments.length > 0) {
                 for (const gap of gapAdjustments) {
-                  const gapOffsetSec = gap.atChunk * avgChunkDur;
+                  const gapOffsetSec = baseOffsetSec + Math.max(0, gap.atChunk - baseSeq) * avgChunkDur;
                   if (streamTime > gapOffsetSec) {
                     streamTime -= gap.missingDurationSec;
                   }
@@ -1208,7 +1218,6 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
       try {
         const remainingEntries = await fs.promises.readdir(folderPath);
         const remainingLive = remainingEntries.filter(f => f.startsWith('seq_') && f.endsWith('.ts'));
-        const remainingVod = remainingEntries.filter(f => f.startsWith('vod_seq_') && f.endsWith('.ts'));
 
         if (remainingLive.length > 0) {
           addLog(`[Video] Cleaning up ${remainingLive.length} remaining live sequence files...`);

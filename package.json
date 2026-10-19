@@ -2,7 +2,7 @@
   "name": "vod-automator",
   "description": "Self-hosted Twitch livestream video & chat recording appliance with 1440p60 HEVC CMAF support, automated game category slicing, VOD backfill recovery, and TwitchDownloaderCLI chat rendering.",
   "private": true,
-  "version": "4.8.5",
+  "version": "4.9.0",
   "license": "MIT",
   "type": "module",
   "engines": {

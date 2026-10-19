@@ -1,11 +1,9 @@
 import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
-import axios from "axios";
-import { Parser } from "m3u8-parser";
 import WebSocket from "ws";
 import { state, addLog, updateTask, removeTask, resolveTdPath } from "./state";
-import { getTwitchHeaders, twitchAxios, fetchRecentVods } from "./twitch";
+import { postTwitchGql, fetchRecentVods } from "./twitch";
 import { fetchThirdPartyEmotes } from "./emotes";
 import { ensureFfmpeg, getVideoDurationSeconds, checkVideoIsHevc } from "./ffmpeg";
 
@@ -164,6 +162,7 @@ export function buildFragments(message: string, emotesTag: string) {
       let contentOffset = startOffset || 0.0;
       let pageCount = 0;
       let emptyOffsetJumps = 0;
+      let consecutiveNetworkErrors = 0;
       let useCursor = true;
       let commentsWritten = initialCommentsWritten || 0;
 
@@ -215,20 +214,27 @@ export function buildFragments(message: string, emotesTag: string) {
           }
         }
 
-        let args = `first: 100`;
-        if (cursor && useCursor) {
-          args += `, after: "${cursor}"`;
-        } else {
-          args += `, contentOffsetSeconds: ${Math.floor(contentOffset)}`;
-        }
-
         let chatQuery: any;
         try {
-          chatQuery = await twitchAxios.post("https://gql.twitch.tv/gql", {
-            query: `query { video(id: "${vodId}") { comments(${args}) { edges { cursor node { id createdAt contentOffsetSeconds commenter { id login displayName } message { fragments { text emote { emoteID from } } userBadges { setID version } userColor } } } pageInfo { hasNextPage } } } }`
-          }, { headers: getTwitchHeaders() });
+          if (cursor && useCursor) {
+            chatQuery = await postTwitchGql({
+              query: `query($vodId: ID!, $after: Cursor!) { video(id: $vodId) { comments(first: 100, after: $after) { edges { cursor node { id createdAt contentOffsetSeconds commenter { id login displayName } message { fragments { text emote { emoteID from } } userBadges { setID version } userColor } } } pageInfo { hasNextPage } } } }`,
+              variables: { vodId, after: cursor }
+            });
+          } else {
+            chatQuery = await postTwitchGql({
+              query: `query($vodId: ID!, $offset: Int!) { video(id: $vodId) { comments(first: 100, contentOffsetSeconds: $offset) { edges { cursor node { id createdAt contentOffsetSeconds commenter { id login displayName } message { fragments { text emote { emoteID from } } userBadges { setID version } userColor } } } pageInfo { hasNextPage } } } }`,
+              variables: { vodId, offset: Math.floor(contentOffset) }
+            });
+          }
+          consecutiveNetworkErrors = 0;
         } catch (err: any) {
-          addLog(`[Chat] Network error at offset ${contentOffset}: ${err.message}. Retrying...`);
+          consecutiveNetworkErrors++;
+          if (consecutiveNetworkErrors >= 10 || (videoLength > 0 && contentOffset >= videoLength)) {
+            addLog(`[Chat] Stopping VOD chat download after ${consecutiveNetworkErrors} consecutive network errors at offset ${contentOffset}s (${err.message}).`);
+            break;
+          }
+          addLog(`[Chat] Network error at offset ${contentOffset}: ${err.message}. Retrying (${consecutiveNetworkErrors}/10)...`);
           await new Promise(resolve => setTimeout(resolve, 2000));
           if (cursor && useCursor) {
             cursor = "";
@@ -442,6 +448,7 @@ export function buildFragments(message: string, emotesTag: string) {
       addLog(`[Chat] Successfully saved vod_chat.json to ${folderPath} (${commentsWritten} messages)`);
       updateTask(taskId, `VOD Chat Downloaded (${channelLogin})`, `Saved to ${folderPath}`, "success", false, [
         { label: "Render Chat", value: "render_chat" },
+        { label: "Open Folder", value: "open_folder" },
         { label: "Close", value: "dismiss" }
       ]);
       state.activeTasks[taskId].folderPath = folderPath;
@@ -1444,6 +1451,7 @@ export function buildFragments(message: string, emotesTag: string) {
 
       const completedLabel = segments.length === 1 ? segments[0].filename : `${segments.length} files`;
       updateTask(taskId, `Chat Rendered (${completedLabel})`, `Saved to ${folderPath}`, "success", false, [
+        { label: "Open Folder", value: "open_folder" },
         { label: "Close", value: "dismiss" }
       ]);
       state.activeTasks[taskId].folderPath = folderPath;

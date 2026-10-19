@@ -1,4 +1,4 @@
-import axios, { AxiosInstance, AxiosRequestConfig } from "axios";
+import axios, { AxiosInstance } from "axios";
 import { Parser } from "m3u8-parser";
 import { state, addLog, DEFAULT_TWITCH_BROWSER_CLIENT_ID } from "./state";
 
@@ -205,7 +205,8 @@ export async function fetchChannelStreamStatus(channelLogin: string) {
     () =>
       postTwitchGql(
         {
-          query: `query { user(login: "${channelLogin}") { id stream { id type title createdAt viewersCount game { name } previewImageURL(width: 320, height: 180) } } }`
+          query: `query($login: String!) { user(login: $login) { id stream { id type title createdAt viewersCount game { name } previewImageURL(width: 320, height: 180) } } }`,
+          variables: { login: channelLogin }
         },
         6000
       ),
@@ -221,7 +222,8 @@ export async function checkChannelStreamId(channelLogin: string) {
     () =>
       postTwitchGql(
         {
-          query: `query { user(login: "${channelLogin}") { stream { id } } }`
+          query: `query($login: String!) { user(login: $login) { stream { id } } }`,
+          variables: { login: channelLogin }
         },
         6000
       ),
@@ -402,7 +404,8 @@ export async function fetchRecentVods(channelLogin: string, count = 5) {
   return requestWithBackoff(
     () =>
       postTwitchGql({
-        query: `query { user(login: "${channelLogin}") { id videos(first: ${count}, type: ARCHIVE) { edges { node { id title createdAt lengthSeconds broadcast { id } game { name } } } } } }`
+        query: `query($login: String!, $count: Int!) { user(login: $login) { id videos(first: $count, type: ARCHIVE) { edges { node { id title createdAt lengthSeconds broadcast { id } game { name } } } } } }`,
+        variables: { login: channelLogin, count }
       }),
     { description: `Fetch recent VODs for ${channelLogin}` }
   );

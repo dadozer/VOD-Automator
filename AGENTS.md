@@ -11,8 +11,9 @@
 - Suggest incrementing the "middle" or "large" version number when a more significant change is made.
 - Ensure the version number is synchronized across `package.json` and the visible badge at the top left of the UI dashboard (`src/App.tsx`).
 
-## 3. Approval Rule
+## 3. Approval & Plan Tracking Rules
 - Always ask for approval to make code changes if the prompt did not specifically ask to make a change or update.
+- **Live Plan Synchronization**: Whenever working from a plan document (e.g., `docs/CODE_AUDIT_REMEDIATION_PLAN.md`), always update that plan document as you go so completed phases, items, and status markers stay accurately reflected in real time.
 
 ## 4. Production Service & Build Invariant
 - **Bundled Service Execution**: Windows background services must execute the bundled, self-contained `dist/server.js` with an explicit `workingDirectory: projectRoot`.

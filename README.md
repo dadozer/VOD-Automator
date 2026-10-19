@@ -1,6 +1,6 @@
 # VOD Automator
 
-**VOD Automator** (`v4.8.5`) is a local, self-hosted Twitch livestream & chat recording appliance built with Node.js, TypeScript, and React. It monitors up to two Twitch channels simultaneously, captures source-quality video segments (including **1440p60 HEVC / Enhanced Broadcasting CMAF** and **1080p60 H.264 MPEG-TS**) alongside real-time IRC chat (with BTTV, FFZ, 7TV, and Giphy emotes), automatically slices broadcasts by game category, backfills missed VOD footage when joining mid-stream, and renders synchronized chat overlay videos via `TwitchDownloaderCLI`.
+**VOD Automator** (`v4.9.0`) is a local, self-hosted Twitch livestream & chat recording appliance built with Node.js, TypeScript, and React. It monitors up to two Twitch channels simultaneously, captures source-quality video segments (including **1440p60 HEVC / Enhanced Broadcasting CMAF** and **1080p60 H.264 MPEG-TS**) alongside real-time IRC chat (with BTTV, FFZ, 7TV, and Giphy emotes), automatically slices broadcasts by game category, backfills missed VOD footage when joining mid-stream, and renders synchronized chat overlay videos via `TwitchDownloaderCLI`.
 
 ---
 
@@ -27,10 +27,11 @@
   - **Strict VOD vs. Live Isolation:** Standalone VOD backfills (`vod_seq_*.ts`) and live segments (`seq_*.ts`) are never interleaved into the same container, preventing timestamp and discontinuity corruption.
 - **Automated & Custom Chat Rendering (`TwitchDownloaderCLI`)**
   - Probes exact container durations via `ffprobe` / `ffmpeg` and normalizes chat offsets with codec-specific sync presets (`-2.5s` for H.264 1080p, `-7.5s` for HEVC 1440p) and long-broadcast clock drift compensation.
-  - Supports transparent **VP9 (`.webm`)**, **ProRes (`.mov`)**, and standard **H.264 / HEVC (`.mp4` / `.mkv`)** chat renders.
+  - Supports transparent **VP9 (`.webm`)**, **ProRes (`.mov`)**, and standard **H.264 / HEVC (`.mp4` / `.mkv`)** chat renders, with a quick-select **Recent Recording Folders** picker for manual chat renders and un-stitched folder video recovery.
 - **Windows Background Service & Storage Safety**
   - One-click `install.bat` compiles the production bundle (`dist/server.js`) and registers **VOD Automator** as a native Windows Service (`node-windows`) running on `http://localhost:3000`.
   - Pre-flight and periodic 5-minute disk space checks warn at `< 20 GB` free and gracefully finalize/seal recordings at `< 5 GB` free to prevent disk exhaustion.
+  - Real-time **System Log** with keyword search, category filters (`Errors & Warnings`, `Video & Stitch`, `Chat & Render`), and one-click **Open Folder** actions across all completed tasks.
 
 ---
 
@@ -122,7 +123,7 @@ downloads/
 │   │   └── api.ts             # REST API endpoints (/api/status, /api/config, /api/start, /api/stop, /api/channels/splice-game, etc.)
 │   └── services/
 │       ├── download.ts        # Stream status polling, HLS/CMAF segment downloading, game switch detection & VOD backfill
-│       ├── video.ts           # FIFO FFmpeg remux queue, fMP4 pipe/concat assembly, container probing &paired chat slicing
+│       ├── video.ts           # FIFO FFmpeg remux queue, fMP4 pipe/concat assembly, container probing & paired chat slicing
 │       ├── chat.ts            # Live Twitch IRC WebSocket client, VOD chat GQL pagination, JSON repair & TwitchDownloaderCLI runner
 │       ├── twitch.ts          # Twitch GraphQL & Usher master playlist resolution (1440p60 HEVC sorting & CloudFront VOD upgrade)
 │       ├── emotes.ts          # 7TV, BetterTTV, and FrankerFaceZ emote fetching & embedding

@@ -3,12 +3,11 @@ import http from "http";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import fs from "fs";
-import { fileURLToPath } from "url";
 import cors from "cors";
 import dotenv from "dotenv";
 
 import { state, loadState, addLog, flushStateSync, PROJECT_ROOT } from "./src/services/state";
-import { checkStreamStatus, startMonitoring, checkOrphanedSession } from "./src/services/download";
+import { startMonitoring, checkOrphanedSession } from "./src/services/download";
 import { abortAllFfmpegProcesses } from "./src/services/video";
 import { abortAllChatProcesses } from "./src/services/chat";
 import { setupRoutes } from "./src/routes/api";
@@ -29,8 +28,6 @@ process.on('unhandledRejection', (reason: any) => {
   } catch {}
 });
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const LOCK_FILE = path.join(PROJECT_ROOT, "app.lock");
 
 function acquireSingleInstanceLock(): boolean {

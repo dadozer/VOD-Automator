@@ -1,8 +1,18 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import axios from "axios";
-import { Settings, Play, Square, Activity, Terminal, Folder, Bell, RefreshCw, Clock, Key, Download, AlertTriangle, HardDrive, Cpu, Gamepad2, Users, Check, ArrowDown, Layers, MessageSquare, Trash2, X, CheckCircle2, AlertCircle, Film, Sparkles, Edit2, Plus, Tv, Scissors } from "lucide-react";
+import { Settings, Play, Square, Activity, Terminal, Folder, Bell, RefreshCw, Clock, Key, Download, AlertTriangle, HardDrive, Cpu, Gamepad2, Users, Check, ArrowDown, Layers, MessageSquare, Trash2, X, CheckCircle2, AlertCircle, Film, Sparkles, Edit2, Plus, Tv, Scissors, Eye, EyeOff, Search, Wrench, RotateCcw } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import type { Config, Status } from "./types";
+
+interface RecentFolderItem {
+  name: string;
+  folderPath: string;
+  updatedAt: number;
+  chatFiles: string[];
+  liveChunkCount: number;
+  vodChunkCount: number;
+  mp4Files: string[];
+}
 
 function formatBytes(bytes: number, decimals = 2) {
   if (bytes === 0) return '0 Bytes';
@@ -33,7 +43,7 @@ function cleanChannel(channel: string): string {
       cleaned = url.pathname.split("/").filter(Boolean)[0] || cleaned;
     }
   } catch (e) {}
-  cleaned = cleaned.replace(/^(https?:\/\/)?(www\.)?twitch\.tv\//, "").split("?")[0].replace(/\/$/, "");
+  cleaned = cleaned.replace(/^(https?:\/\/)?(www\.)?twitch\.tv\//, "").split("?")[0].replace(/\/$/, "").replace(/[^a-z0-9_]/g, "");
   return cleaned.trim();
 }
 
@@ -44,9 +54,11 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<"dashboard" | "settings" | "logs">("dashboard");
   const [settingsTab, setSettingsTab] = useState<"general" | "render">("general");
   const [channelsInput, setChannelsInput] = useState<string>("");
+  const [isConfigDirty, setIsConfigDirty] = useState<boolean>(false);
+  const [pendingTabSwitch, setPendingTabSwitch] = useState<"dashboard" | "settings" | "logs" | null>(null);
+  const [showOAuthToken, setShowOAuthToken] = useState<boolean>(false);
   const [timeSinceCheck, setTimeSinceCheck] = useState<number>(0);
   const [renderDialog, setRenderDialog] = useState<{ taskId: string, channelLogin: string, folderPath: string, width: number, height: number, files?: {filename: string, width: number, height: number, enabled?: boolean}[] } | null>(null);
-  const [isTogglingMonitoring, setIsTogglingMonitoring] = useState(false);
   const [pendingTaskActions, setPendingTaskActions] = useState<Record<string, string>>({});
   const [forceStitchingChannels, setForceStitchingChannels] = useState<Record<string, boolean>>({});
   const [isSavingConfig, setIsSavingConfig] = useState(false);
@@ -59,9 +71,18 @@ export default function App() {
   const [manualRenderHeight, setManualRenderHeight] = useState<number>(800);
   const [isStartingManualRender, setIsStartingManualRender] = useState<boolean>(false);
   const [manualRenderMsg, setManualRenderMsg] = useState<{ type: 'success' | 'error', text: string } | null>(null);
+  const [recentFolders, setRecentFolders] = useState<RecentFolderItem[]>([]);
+  const [isLoadingRecentFolders, setIsLoadingRecentFolders] = useState<boolean>(false);
+  const [recoverFolderDialog, setRecoverFolderDialog] = useState<boolean>(false);
+  const [recoverFolderPath, setRecoverFolderPath] = useState<string>("");
+  const [isStartingRecovery, setIsStartingRecovery] = useState<boolean>(false);
+  const [recoverFolderMsg, setRecoverFolderMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [logSearchQuery, setLogSearchQuery] = useState<string>("");
+  const [logCategory, setLogCategory] = useState<'all' | 'errors' | 'video' | 'chat'>('all');
   const [autoScrollLogs, setAutoScrollLogs] = useState(true);
   const logEndRef = useRef<HTMLDivElement>(null);
   const logContainerRef = useRef<HTMLDivElement>(null);
+  const toastTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const formatDuration = (seconds: number) => {
     const h = Math.floor(seconds / 3600);
@@ -80,6 +101,7 @@ export default function App() {
       if (data && typeof data === 'object') {
         setConfig(data);
         setChannelsInput(data.channels ? data.channels.join(', ') : "");
+        setIsConfigDirty(false);
       }
     } catch (err) {
       console.warn("Failed to fetch configuration", err);
@@ -166,9 +188,21 @@ export default function App() {
     }
   };
 
-  const handleSaveConfig = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!config || isSavingConfig) return;
+  const updateDraftConfig = (nextConfig: Config) => {
+    setConfig(nextConfig);
+    setIsConfigDirty(true);
+  };
+
+  const handleTabSelect = (targetTab: "dashboard" | "settings" | "logs") => {
+    if (activeTab === "settings" && isConfigDirty && targetTab !== "settings") {
+      setPendingTabSwitch(targetTab);
+      return;
+    }
+    setActiveTab(targetTab);
+  };
+
+  const saveConfigInternal = async (): Promise<boolean> => {
+    if (!config || isSavingConfig) return false;
     setIsSavingConfig(true);
     setSaveStatusMessage(null);
     try {
@@ -192,34 +226,26 @@ export default function App() {
         const updatedConfig = await res.json();
         setConfig(updatedConfig);
         setChannelsInput((updatedConfig.channels || []).join(', '));
+        setIsConfigDirty(false);
         setSaveStatusMessage({ type: 'success', text: "Settings saved successfully!" });
         await fetchStatus();
         setTimeout(() => setSaveStatusMessage(null), 3000);
+        return true;
       } else {
         setSaveStatusMessage({ type: 'error', text: "Failed to save settings." });
+        return false;
       }
     } catch (err) {
       setSaveStatusMessage({ type: 'error', text: "Failed to save settings." });
+      return false;
     } finally {
       setIsSavingConfig(false);
     }
   };
 
-  const executeReset = async () => {
-    if (isResetting) return;
-    setIsResetting(true);
-    try {
-      const res = await fetch("/api/reset", { method: "POST" });
-      if (res.ok) {
-        await fetchStatus();
-      } else {
-        alert("Failed to reboot program");
-      }
-    } catch (err) {
-      alert("Failed to reboot program");
-    } finally {
-      setIsResetting(false);
-    }
+  const handleSaveConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await saveConfigInternal();
   };
 
   const [stopConfirmChannel, setStopConfirmChannel] = useState<string | null>(null);
@@ -234,7 +260,36 @@ export default function App() {
   const [tempChannelName, setTempChannelName] = useState<string>("");
   const [togglingChannelMap, setTogglingChannelMap] = useState<Record<string, boolean>>({});
   const [cancelRenderConfirmTask, setCancelRenderConfirmTask] = useState<any>(null);
-  const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'info' | 'error' } | null>(null);
+  const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'info' | 'error'; title?: string } | null>(null);
+
+  const showToast = (text: string, type: 'success' | 'info' | 'error' = 'info', title?: string) => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+    }
+    setToastMessage({ text, type, title });
+    toastTimerRef.current = setTimeout(() => {
+      setToastMessage(null);
+      toastTimerRef.current = null;
+    }, 4000);
+  };
+
+  const executeReset = async () => {
+    if (isResetting) return;
+    setIsResetting(true);
+    try {
+      const res = await fetch("/api/reset", { method: "POST" });
+      if (res.ok) {
+        showToast("Program rebooted and all active background tasks cleared.", "success", "Emergency Reset");
+        await fetchStatus();
+      } else {
+        showToast("Failed to reboot program.", "error", "Emergency Reset");
+      }
+    } catch (err: any) {
+      showToast(`Failed to reboot program: ${err?.message || "network error"}`, "error", "Emergency Reset");
+    } finally {
+      setIsResetting(false);
+    }
+  };
 
   const formatGraceCountdown = (sec?: number) => {
     if (sec === undefined || sec <= 0) return "0m 00s";
@@ -252,18 +307,18 @@ export default function App() {
         navigator.clipboard.writeText(targetFolder).catch(() => {});
       }
 
-      setToastMessage({
-        text: `Opening folder: ${targetFolder} (path copied to clipboard)`,
-        type: 'info'
-      });
-      setTimeout(() => setToastMessage(null), 4000);
+      showToast(
+        `Opening folder: ${targetFolder} (path copied to clipboard)`,
+        'info',
+        'File Manager'
+      );
     } catch (err: any) {
       console.error("Failed to open folder", err);
-      setToastMessage({
-        text: `Could not open folder: ${err.message}`,
-        type: 'error'
-      });
-      setTimeout(() => setToastMessage(null), 4000);
+      showToast(
+        `Could not open folder: ${err.message}`,
+        'error',
+        'File Manager'
+      );
     }
   };
 
@@ -282,10 +337,11 @@ export default function App() {
         clipMinutes: mins
       });
       if (res.data?.success) {
+        showToast(`Manual splice initiated for @${channel}.`, "success", "Video Splice");
         await fetchStatus();
       }
     } catch (err: any) {
-      alert(err.response?.data?.error || err.message || "Failed to trigger manual splice");
+      showToast(err.response?.data?.error || err.message || "Failed to trigger manual splice", "error", "Video Splice");
     } finally {
       setIsManualSplicing(prev => {
         const copy = { ...prev };
@@ -300,10 +356,11 @@ export default function App() {
     try {
       const res = await axios.post("/api/channels/override-buffer", { channel, gameIndex });
       if (res.data?.success) {
+        showToast(`Skipped transition buffer for @${channel}. Splicing now...`, "success", "Game Switch");
         await fetchStatus();
       }
     } catch (err: any) {
-      alert(err.response?.data?.error || err.message || "Failed to override buffer");
+      showToast(err.response?.data?.error || err.message || "Failed to override buffer", "error", "Game Switch");
     } finally {
       setIsOverridingBuffer(prev => {
         const copy = { ...prev };
@@ -321,18 +378,16 @@ export default function App() {
   const commitChannelName = async (index: number) => {
     const trimmed = cleanChannel(tempChannelName);
     if (trimmed && config) {
-      const currentList = (config.channels || []).map(cleanChannel);
-      const updated = [...currentList];
-      while (updated.length <= index) {
-        updated.push("");
-      }
-      updated[index] = trimmed;
-      const filtered = updated.filter(Boolean).slice(0, 2);
+      const currentList = (config.channels || []).map(cleanChannel).filter(Boolean);
+      const slots: (string | null)[] = [currentList[0] || null, currentList[1] || null];
+      slots[index] = trimmed;
+      const filtered = Array.from(new Set(slots.filter((c): c is string => Boolean(c)))).slice(0, 2);
 
       const newConfig = { ...config, channels: filtered };
       setConfig(newConfig);
       setChannelsInput(filtered.join(', '));
       setEditingChannelIndex(null);
+      setTempChannelName("");
 
       try {
         const res = await fetch("/api/config", {
@@ -343,6 +398,7 @@ export default function App() {
         if (res.ok) {
           const saved = await res.json();
           setConfig(saved);
+          setChannelsInput((saved.channels || []).join(', '));
           await fetchStatus();
         }
       } catch (err) {
@@ -350,6 +406,43 @@ export default function App() {
       }
     } else {
       setEditingChannelIndex(null);
+      setTempChannelName("");
+    }
+  };
+
+  const clearChannelSlot = async (index: number) => {
+    if (!config) return;
+    const currentList = (config.channels || []).map(cleanChannel).filter(Boolean);
+    const slots: (string | null)[] = [currentList[0] || null, currentList[1] || null];
+    const removedChannel = slots[index];
+    slots[index] = null;
+    const filtered = slots.filter((c): c is string => Boolean(c));
+
+    const newConfig = { ...config, channels: filtered };
+    setConfig(newConfig);
+    setChannelsInput(filtered.join(', '));
+    if (editingChannelIndex === index) {
+      setEditingChannelIndex(null);
+      setTempChannelName("");
+    }
+
+    try {
+      const res = await fetch("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newConfig),
+      });
+      if (res.ok) {
+        const saved = await res.json();
+        setConfig(saved);
+        setChannelsInput((saved.channels || []).join(', '));
+        if (removedChannel) {
+          showToast(`Removed @${removedChannel} from monitored slots.`, "info", "Channel Removed");
+        }
+        await fetchStatus();
+      }
+    } catch (err) {
+      console.error("Failed to clear channel slot", err);
     }
   };
 
@@ -357,6 +450,7 @@ export default function App() {
     if (!config || !status || togglingChannelMap[channel]) return;
 
     const cleaned = cleanChannel(channel);
+    if (!cleaned) return;
     const monitoredList = (status.monitoredChannels || []).map(cleanChannel);
     const activeSession = status.activeSessions?.find(
       s => cleanChannel(s.channel) === cleaned
@@ -378,11 +472,11 @@ export default function App() {
         await fetchStatus();
       } else {
         const data = await res.json().catch(() => ({}));
-        alert(data.error || "Action failed");
+        showToast(data.error || "Action failed", "error", "Stream Monitor");
         await fetchStatus();
       }
     } catch (err: any) {
-      alert("Action failed: " + (err?.message || "network error"));
+      showToast("Action failed: " + (err?.message || "network error"), "error", "Stream Monitor");
       await fetchStatus();
     } finally {
       setTogglingChannelMap(prev => {
@@ -398,6 +492,7 @@ export default function App() {
     if (!config || !status || togglingChannelMap[channel]) return;
 
     const cleaned = cleanChannel(channel);
+    if (!cleaned) return;
     const monitoredList = (status.monitoredChannels || []).map(cleanChannel);
     const activeSession = status.activeSessions?.find(
       s => cleanChannel(s.channel) === cleaned
@@ -418,17 +513,20 @@ export default function App() {
     if (pendingTaskActions[taskId]) return;
 
     if (action === 'open_folder') {
+      const task = status?.activeTasks.find(t => t.id === taskId);
+      handleOpenFolder((task as any)?.folderPath);
       return;
     }
 
     if (action === 'render_chat') {
       const task = status?.activeTasks.find(t => t.id === taskId);
-      if (task && (task as any).channelLogin && (task as any).folderPath) {
+      if (task && (task as any).folderPath) {
+        const channelLogin = (task as any).channelLogin || "stream";
         axios.get(`/api/tasks/${taskId}/chat-files`).then(res => {
           const fetchedFiles = res.data.files || [];
           setRenderDialog({
             taskId,
-            channelLogin: (task as any).channelLogin,
+            channelLogin,
             folderPath: (task as any).folderPath,
             width: (config as any)?.chatRender?.width || 350,
             height: (config as any)?.chatRender?.height || 800,
@@ -443,12 +541,14 @@ export default function App() {
           console.error("Failed to fetch chat files", err);
           setRenderDialog({
             taskId,
-            channelLogin: (task as any).channelLogin,
+            channelLogin,
             folderPath: (task as any).folderPath,
             width: (config as any)?.chatRender?.width || 350,
             height: (config as any)?.chatRender?.height || 800
           });
         });
+      } else {
+        showToast("Task is missing its recording folder path.", "error", "Chat Render");
       }
       return;
     }
@@ -466,8 +566,9 @@ export default function App() {
     try {
       await axios.post(`/api/tasks/${taskId}/action`, { action });
       await fetchStatus();
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to send task action", err);
+      showToast(err.response?.data?.error || err.message || "Failed to execute task action", "error", "Task Queue");
       await fetchStatus();
     } finally {
       setPendingTaskActions(prev => {
@@ -544,7 +645,7 @@ export default function App() {
 
     try {
       const res = await axios.post(`/api/sessions/${cleaned}/auto-render`, { enabled: newVal });
-      if (res.data && res.data.config) {
+      if (res.data && res.data.config && !isConfigDirty) {
         setConfig(res.data.config);
       }
       await fetchStatus();
@@ -556,12 +657,12 @@ export default function App() {
 
   const submitRenderChat = async () => {
     if (!renderDialog || isSubmittingRender) return;
+    if (renderDialog.files && renderDialog.files.length > 0 && renderDialog.files.filter(f => f.enabled !== false).length === 0) {
+      showToast("Please select at least one chat file to render.", "error", "Chat Render");
+      return;
+    }
     setIsSubmittingRender(true);
     try {
-      if (renderDialog.files && renderDialog.files.filter(f => f.enabled !== false).length === 0) {
-        setRenderDialog(null);
-        return;
-      }
       const activeSegments = renderDialog.files ? renderDialog.files.filter(f => f.enabled !== false) : undefined;
       await axios.post(`/api/tasks/${renderDialog.taskId}/action`, { 
         action: 'render_chat', 
@@ -570,11 +671,27 @@ export default function App() {
         segments: activeSegments
       });
       setRenderDialog(null);
+      showToast(`Started chat render for @${renderDialog.channelLogin}.`, "success", "Chat Render");
       await fetchStatus();
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to start chat render", err);
+      showToast(err.response?.data?.error || err.message || "Failed to start chat render", "error", "Chat Render");
     } finally {
       setIsSubmittingRender(false);
+    }
+  };
+
+  const fetchRecentFolders = async () => {
+    setIsLoadingRecentFolders(true);
+    try {
+      const res = await axios.get("/api/recent-folders");
+      if (res.data && Array.isArray(res.data.folders)) {
+        setRecentFolders(res.data.folders);
+      }
+    } catch (err) {
+      console.warn("Failed to load recent folders", err);
+    } finally {
+      setIsLoadingRecentFolders(false);
     }
   };
 
@@ -584,6 +701,7 @@ export default function App() {
     setManualRenderHeight((config as any)?.chatRender?.height || 800);
     setManualRenderMsg(null);
     setManualRenderDialog(true);
+    fetchRecentFolders();
   };
 
   const submitManualRender = async () => {
@@ -616,13 +734,45 @@ export default function App() {
     }
   };
 
+  const openRecoverFolderModal = () => {
+    setRecoverFolderPath("");
+    setRecoverFolderMsg(null);
+    setRecoverFolderDialog(true);
+    fetchRecentFolders();
+  };
+
+  const submitRecoverFolder = async () => {
+    if (!recoverFolderPath.trim()) {
+      setRecoverFolderMsg({ type: 'error', text: 'Please select or enter a session folder path.' });
+      return;
+    }
+    setIsStartingRecovery(true);
+    setRecoverFolderMsg(null);
+    try {
+      const res = await axios.post('/api/recover-folder-video', {
+        folderPath: recoverFolderPath.trim()
+      });
+      if (res.data && res.data.success) {
+        setRecoverFolderMsg({ type: 'success', text: `Recovery started for ${res.data.folderPath}` });
+        setTimeout(() => {
+          setRecoverFolderDialog(false);
+          setActiveTab("dashboard");
+        }, 1000);
+      } else {
+        setRecoverFolderMsg({ type: 'error', text: res.data?.error || 'Failed to start folder recovery' });
+      }
+      await fetchStatus();
+    } catch (err: any) {
+      setRecoverFolderMsg({ type: 'error', text: err.response?.data?.error || err.message || 'Failed to trigger folder video recovery' });
+    } finally {
+      setIsStartingRecovery(false);
+    }
+  };
+
   const monitoredChannelsList = (status?.monitoredChannels || []).map(cleanChannel);
   const channelsToDisplay = useMemo(() => {
     const configured = (config?.channels || []).map(cleanChannel).filter(Boolean);
-    const result = [...configured];
-    while (result.length < 2) {
-      result.push(`channel${result.length + 1}`);
-    }
+    const result: (string | null)[] = [configured[0] || null, configured[1] || null];
     // Include active sessions if any are finishing up or orphaned
     if (status?.activeSessions) {
       for (const s of status.activeSessions) {
@@ -634,6 +784,10 @@ export default function App() {
     }
     return result;
   }, [config?.channels, status?.activeSessions]);
+  const configuredSlotsCount = useMemo(
+    () => channelsToDisplay.filter((c): c is string => Boolean(c)).length,
+    [channelsToDisplay]
+  );
 
   if (loading) {
     return (
@@ -653,21 +807,26 @@ export default function App() {
             </div>
             <div>
               <h1 className="font-bold text-base tracking-tight text-white leading-tight">VOD Automator</h1>
-              <p className="text-xs text-purple-400 font-mono font-medium">v4.8.5</p>
+              <p className="text-xs text-purple-400 font-mono font-medium">v4.9.0</p>
             </div>
           </div>
         </div>
 
         <nav className="flex-1 px-3 py-4 space-y-1.5 overflow-y-auto">
-          <button onClick={() => setActiveTab("dashboard")} className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all ${activeTab === "dashboard" ? "bg-purple-600/10 text-purple-400 border border-purple-500/20" : "text-gray-400 hover:bg-white/5 hover:text-white border border-transparent"}`}>
+          <button onClick={() => handleTabSelect("dashboard")} className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all cursor-pointer ${activeTab === "dashboard" ? "bg-purple-600/10 text-purple-400 border border-purple-500/20" : "text-gray-400 hover:bg-white/5 hover:text-white border border-transparent"}`}>
             <Tv className="w-4.5 h-4.5" />
             <span>Livestream Monitor</span>
           </button>
-          <button onClick={() => setActiveTab("settings")} className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all ${activeTab === "settings" ? "bg-purple-600/10 text-purple-400 border border-purple-500/20" : "text-gray-400 hover:bg-white/5 hover:text-white border border-transparent"}`}>
-            <Settings className="w-4.5 h-4.5" />
-            <span>Settings</span>
+          <button onClick={() => handleTabSelect("settings")} className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-sm font-semibold transition-all cursor-pointer ${activeTab === "settings" ? "bg-purple-600/10 text-purple-400 border border-purple-500/20" : "text-gray-400 hover:bg-white/5 hover:text-white border border-transparent"}`}>
+            <span className="flex items-center gap-2.5">
+              <Settings className="w-4.5 h-4.5" />
+              <span>Settings</span>
+            </span>
+            {isConfigDirty && (
+              <span className="w-2 h-2 rounded-full bg-amber-400" title="Unsaved settings changes" />
+            )}
           </button>
-          <button onClick={() => setActiveTab("logs")} className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all ${activeTab === "logs" ? "bg-purple-600/10 text-purple-400 border border-purple-500/20" : "text-gray-400 hover:bg-white/5 hover:text-white border border-transparent"}`}>
+          <button onClick={() => handleTabSelect("logs")} className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all cursor-pointer ${activeTab === "logs" ? "bg-purple-600/10 text-purple-400 border border-purple-500/20" : "text-gray-400 hover:bg-white/5 hover:text-white border border-transparent"}`}>
             <Terminal className="w-4.5 h-4.5" />
             <span>System Log</span>
           </button>
@@ -731,9 +890,40 @@ export default function App() {
         <AnimatePresence>
           {activeTab === "dashboard" && (
             <motion.div key="dashboard" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="space-y-6">
-              <div>
-                <h2 className="text-3xl font-bold text-white tracking-tight">Livestream Monitor</h2>
-                <p className="text-sm text-gray-400 mt-0.5">Livestream video and chat recording</p>
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-3xl font-bold text-white tracking-tight">Livestream Monitor</h2>
+                  <p className="text-sm text-gray-400 mt-0.5">Livestream video and chat recording</p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={openRecoverFolderModal}
+                    className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-200 border border-white/10 hover:border-purple-500/30 transition-all cursor-pointer"
+                    title="Stitch uncompiled raw .ts segments in an existing recording folder"
+                  >
+                    <Wrench className="w-3.5 h-3.5 text-purple-400" />
+                    <span>Recover Folder Video</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={openManualRenderModal}
+                    className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-200 border border-white/10 hover:border-purple-500/30 transition-all cursor-pointer"
+                    title="Render any downloaded chat JSON file with TwitchDownloaderCLI"
+                  >
+                    <Film className="w-3.5 h-3.5 text-purple-400" />
+                    <span>Manual Chat Render</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleOpenFolder()}
+                    className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-200 border border-white/10 hover:border-white/20 transition-all cursor-pointer"
+                    title="Open root downloads folder in OS file explorer"
+                  >
+                    <Folder className="w-3.5 h-3.5 text-purple-400" />
+                    <span>Open Downloads</span>
+                  </button>
+                </div>
               </div>
 
               {/* ========================================================================= */}
@@ -744,13 +934,95 @@ export default function App() {
                   <div>
                     <h3 className="text-base font-bold text-white tracking-tight flex items-center gap-2">
                       <Tv className="w-4.5 h-4.5 text-purple-400" />
-                      Monitored Streams ({channelsToDisplay.length}/2)
+                      Monitored Streams ({configuredSlotsCount}/2)
                     </h3>
-                    <p className="text-sm text-gray-400 mt-0.5">When monitoring is paused, click channel handle to change monitored stream</p>
+                    <p className="text-sm text-gray-400 mt-0.5">When monitoring is paused, click channel handle to change or clear monitored stream</p>
                   </div>
                 </div>
 
                 {channelsToDisplay.map((channelName, idx) => {
+                  if (!channelName) {
+                    const isEditingThisSlot = editingChannelIndex === idx;
+                    return (
+                      <div
+                        key={`empty-slot-${idx}`}
+                        className="bg-[#111113]/80 border border-dashed border-white/15 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition-all hover:border-purple-500/30"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="w-9 h-9 rounded-lg bg-white/5 border border-white/10 flex items-center justify-center shrink-0">
+                            <Plus className="w-4 h-4 text-purple-400" />
+                          </div>
+                          <div className="min-w-0">
+                            {isEditingThisSlot ? (
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-purple-400 font-bold text-sm">@</span>
+                                <input
+                                  type="text"
+                                  autoFocus
+                                  value={tempChannelName}
+                                  onChange={e => setTempChannelName(e.target.value)}
+                                  onKeyDown={e => {
+                                    if (e.key === "Enter") commitChannelName(idx);
+                                    if (e.key === "Escape") {
+                                      setEditingChannelIndex(null);
+                                      setTempChannelName("");
+                                    }
+                                  }}
+                                  placeholder="twitch_username"
+                                  className="bg-black/60 border border-purple-500/60 rounded-lg px-3 py-1.5 text-sm font-bold text-white focus:outline-none w-48"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => commitChannelName(idx)}
+                                  className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-semibold uppercase tracking-wider cursor-pointer"
+                                >
+                                  Save Slot
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingChannelIndex(null);
+                                    setTempChannelName("");
+                                  }}
+                                  className="px-2.5 py-1.5 bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white rounded-lg text-xs font-semibold cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <>
+                                <div className="flex items-center gap-2">
+                                  <h4 className="text-sm font-bold text-gray-200 tracking-tight">
+                                    Unassigned Stream Slot #{idx + 1}
+                                  </h4>
+                                  <span className="text-[11px] px-2 py-0.5 rounded-full bg-white/5 text-gray-400 border border-white/10 uppercase tracking-wider font-semibold">
+                                    Empty
+                                  </span>
+                                </div>
+                                <p className="text-xs text-gray-500 mt-0.5">
+                                  Assign a Twitch channel handle to monitor a {idx === 0 ? "primary" : "second"} broadcast slot.
+                                </p>
+                              </>
+                            )}
+                          </div>
+                        </div>
+
+                        {!isEditingThisSlot && (
+                          <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => startEditingChannel(idx, "")}
+                              className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold uppercase tracking-wider bg-purple-600/20 hover:bg-purple-600 text-purple-300 hover:text-white border border-purple-500/30 transition-all cursor-pointer"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                              <span>Assign Channel</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  }
+
                   const cleaned = cleanChannel(channelName);
                   const isChannelMonitored = monitoredChannelsList.includes(cleaned);
                   const activeSession = (status?.activeSessions || []).find(
@@ -810,16 +1082,28 @@ export default function App() {
                                     </button>
                                   </div>
                                 ) : (
-                                  <button
-                                    onClick={() => startEditingChannel(idx, channelName)}
-                                    className="group flex items-center gap-1.5 px-2 py-0.5 rounded-lg hover:bg-white/5 border border-transparent hover:border-white/10 transition-colors cursor-pointer"
-                                    title="Click to rename stream"
-                                  >
-                                    <h4 className="text-base font-bold text-white tracking-tight">
-                                      @{channelName}
-                                    </h4>
-                                    <Edit2 className="w-3.5 h-3.5 text-gray-500 group-hover:text-purple-400 transition-colors" />
-                                  </button>
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      onClick={() => startEditingChannel(idx, channelName)}
+                                      className="group flex items-center gap-1.5 px-2 py-0.5 rounded-lg hover:bg-white/5 border border-transparent hover:border-white/10 transition-colors cursor-pointer"
+                                      title="Click to rename stream"
+                                    >
+                                      <h4 className="text-base font-bold text-white tracking-tight">
+                                        @{channelName}
+                                      </h4>
+                                      <Edit2 className="w-3.5 h-3.5 text-gray-500 group-hover:text-purple-400 transition-colors" />
+                                    </button>
+                                    {idx < 2 && (
+                                      <button
+                                        type="button"
+                                        onClick={() => clearChannelSlot(idx)}
+                                        className="p-1 rounded-lg text-gray-500 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
+                                        title="Clear this channel slot"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </div>
                                 )
                               ) : (
                                 <h4 className="text-base font-bold text-white tracking-tight">
@@ -883,6 +1167,14 @@ export default function App() {
 
                         {/* Individual Channel Controls */}
                         <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleOpenFolder(activeSession?.folderPath)}
+                            className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white border border-white/10 transition-colors cursor-pointer"
+                            title={activeSession?.folderPath ? `Open session folder (${activeSession.folderPath})` : "Open downloads folder"}
+                          >
+                            <Folder className="w-4 h-4 text-purple-400" />
+                          </button>
                           <button
                             onClick={() => toggleChannelMonitoring(channelName)}
                             disabled={isToggling}
@@ -1014,7 +1306,10 @@ export default function App() {
                               <button
                                 type="button"
                                 disabled={Boolean(isManualSplicing[activeSession.channel])}
-                                onClick={() => setManualSpliceChannel(activeSession.channel)}
+                                onClick={() => {
+                                  setSpliceAction('split_new_part');
+                                  setManualSpliceChannel(activeSession.channel);
+                                }}
                                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white border border-white/10 hover:border-purple-500/40 transition-all cursor-pointer ${
                                   isManualSplicing[activeSession.channel] ? "opacity-75 cursor-wait" : ""
                                 }`}
@@ -1198,7 +1493,7 @@ export default function App() {
                               {/* Action Buttons */}
                               {task.actions && task.actions.length > 0 && (
                                 <div className="flex flex-wrap items-center gap-2 self-start md:self-center shrink-0">
-                                  {task.actions.filter(a => a.value !== 'open_folder').map((action) => {
+                                  {task.actions.map((action) => {
                                     const isActionPending = pendingTaskActions[task.id] === action.value;
                                     const isPrimary = action.value === 'render_chat' || action.value === 'yes' || action.value === 'retry_stitch' || action.value === 'backfill_full' || action.value === 'resume_vod_backfill';
                                     const isHighlight = action.value === 'backfill_current_game' || action.value === 'resume_stitch_gap';
@@ -1363,9 +1658,9 @@ export default function App() {
                       </button>
                       <button 
                         onClick={submitRenderChat} 
-                        disabled={isSubmittingRender}
+                        disabled={isSubmittingRender || Boolean(renderDialog.files && renderDialog.files.length > 0 && renderDialog.files.filter(f => f.enabled !== false).length === 0)}
                         className={`flex items-center gap-2 px-4.5 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-semibold uppercase tracking-wider transition-colors shadow-md shadow-purple-900/30 cursor-pointer ${
-                          isSubmittingRender ? "opacity-75 cursor-wait" : ""
+                          isSubmittingRender || Boolean(renderDialog.files && renderDialog.files.length > 0 && renderDialog.files.filter(f => f.enabled !== false).length === 0) ? "opacity-50 cursor-not-allowed" : ""
                         }`}
                       >
                         {isSubmittingRender && <RefreshCw className="w-4 h-4 animate-spin" />}
@@ -1408,20 +1703,31 @@ export default function App() {
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div className="space-y-1.5">
                         <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Browser OAuth Token</label>
-                        <input
-                          type="password"
-                          value={config?.browserOAuthToken}
-                          onChange={(e) => setConfig({ ...config!, browserOAuthToken: e.target.value })}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          placeholder="e.g. oauth:xxxxxxxxxxxxxxxxxxxx"
-                        />
+                        <div className="relative">
+                          <input
+                            type={showOAuthToken ? "text" : "password"}
+                            value={config?.browserOAuthToken || ""}
+                            onChange={(e) => updateDraftConfig({ ...config!, browserOAuthToken: e.target.value })}
+                            className="w-full bg-[#141416] border border-white/10 rounded-lg pl-3 pr-10 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            placeholder="e.g. a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5 (30-char auth-token)"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowOAuthToken(prev => !prev)}
+                            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white p-1 rounded cursor-pointer"
+                            title={showOAuthToken ? "Hide OAuth token" : "Show OAuth token"}
+                          >
+                            {showOAuthToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                          </button>
+                        </div>
+                        <p className="text-xs text-gray-500">Raw 30-character alphanumeric value from your Twitch <code>auth-token</code> cookie.</p>
                       </div>
                       <div className="space-y-1.5">
                         <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Browser Client ID</label>
                         <input
                           type="text"
-                          value={config?.browserClientId}
-                          onChange={(e) => setConfig({ ...config!, browserClientId: e.target.value })}
+                          value={config?.browserClientId || ""}
+                          onChange={(e) => updateDraftConfig({ ...config!, browserClientId: e.target.value })}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-gray-400"
                           placeholder="kimne78kx3ncx6brgo4mv6wki5h1ko"
                         />
@@ -1439,7 +1745,7 @@ export default function App() {
                           onChange={(e) => {
                             setChannelsInput(e.target.value);
                             const parsed = e.target.value.split(',').map(cleanChannel).filter(Boolean).slice(0, 2);
-                            setConfig({ ...config!, channels: parsed });
+                            updateDraftConfig({ ...config!, channels: parsed });
                           }}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg pl-24 pr-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                           placeholder="username1, username2"
@@ -1452,13 +1758,24 @@ export default function App() {
                         <div className="flex items-center justify-between">
                           <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Save Path</label>
                         </div>
-                        <input
-                          type="text"
-                          value={config?.savePath}
-                          onChange={(e) => setConfig({ ...config!, savePath: e.target.value })}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          placeholder="downloads"
-                        />
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={config?.savePath || ""}
+                            onChange={(e) => updateDraftConfig({ ...config!, savePath: e.target.value })}
+                            className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            placeholder="downloads"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleOpenFolder(config?.savePath)}
+                            className="flex items-center gap-1.5 px-3 py-2.5 bg-white/5 hover:bg-white/10 text-gray-200 border border-white/10 rounded-lg text-xs font-semibold shrink-0 transition-colors cursor-pointer"
+                            title="Open save path folder in OS file explorer"
+                          >
+                            <Folder className="w-4 h-4 text-purple-400" />
+                            <span>Open</span>
+                          </button>
+                        </div>
                         <p className="text-xs text-gray-500">
                           Relative to program root folder (default: downloads), or an absolute path.
                         </p>
@@ -1468,7 +1785,7 @@ export default function App() {
                           <input
                             type="checkbox"
                             checked={config?.autoStartMonitoring ?? true}
-                            onChange={(e) => setConfig({ ...config!, autoStartMonitoring: e.target.checked })}
+                            onChange={(e) => updateDraftConfig({ ...config!, autoStartMonitoring: e.target.checked })}
                             className="w-4.5 h-4.5 rounded border-white/20 bg-[#141416] text-purple-600 focus:ring-0 focus:ring-offset-0"
                           />
                           <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">Start monitoring automatically on launch</span>
@@ -1477,7 +1794,7 @@ export default function App() {
                           <input
                             type="checkbox"
                             checked={(config as any)?.autoRenderChat ?? false}
-                            onChange={(e) => setConfig({ ...config!, autoRenderChat: e.target.checked } as any)}
+                            onChange={(e) => updateDraftConfig({ ...config!, autoRenderChat: e.target.checked } as any)}
                             className="w-4.5 h-4.5 rounded border-white/20 bg-[#141416] text-purple-600 focus:ring-0 focus:ring-offset-0"
                           />
                           <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">Auto-Render Chat when stream finishes</span>
@@ -1496,7 +1813,7 @@ export default function App() {
                             min="0"
                             max="60"
                             value={(config as any)?.gameSwitchBufferMins ?? 5}
-                            onChange={(e) => setConfig({ ...config!, gameSwitchBufferMins: parseInt(e.target.value) || 0 } as any)}
+                            onChange={(e) => updateDraftConfig({ ...config!, gameSwitchBufferMins: parseInt(e.target.value) || 0 } as any)}
                             className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                          />
                       </div>
@@ -1510,7 +1827,7 @@ export default function App() {
                             min="1"
                             max="60"
                             value={(config as any)?.offlineGracePeriodMins ?? 5}
-                            onChange={(e) => setConfig({ ...config!, offlineGracePeriodMins: Math.max(1, parseInt(e.target.value) || 1) } as any)}
+                            onChange={(e) => updateDraftConfig({ ...config!, offlineGracePeriodMins: Math.max(1, parseInt(e.target.value) || 1) } as any)}
                             className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                          />
                       </div>
@@ -1533,7 +1850,7 @@ export default function App() {
                             id="autosplice-toggle"
                             type="checkbox"
                             checked={(config as any)?.longGameAutospliceEnabled ?? true}
-                            onChange={(e) => setConfig({ ...config!, longGameAutospliceEnabled: e.target.checked } as any)}
+                            onChange={(e) => updateDraftConfig({ ...config!, longGameAutospliceEnabled: e.target.checked } as any)}
                             className="sr-only peer"
                           />
                           <div className="w-11 h-6 bg-white/10 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-purple-600"></div>
@@ -1557,7 +1874,7 @@ export default function App() {
                                 onChange={(e) => {
                                   const val = Math.max(0.25, parseFloat(e.target.value) || 0.25);
                                   const curCut = (config as any)?.longGameAutospliceCutHours ?? 8;
-                                  setConfig({
+                                  updateDraftConfig({
                                     ...config!,
                                     longGameAutospliceTriggerHours: val,
                                     longGameAutospliceCutHours: curCut > val ? val : curCut
@@ -1581,7 +1898,7 @@ export default function App() {
                                   const trigger = (config as any)?.longGameAutospliceTriggerHours ?? 9;
                                   const rawVal = Math.max(0.25, parseFloat(e.target.value) || 0.25);
                                   const val = Math.min(trigger, rawVal);
-                                  setConfig({
+                                  updateDraftConfig({
                                     ...config!,
                                     longGameAutospliceCutHours: val
                                   } as any);
@@ -1610,7 +1927,7 @@ export default function App() {
                       <input
                         type="text"
                         value={(config as any)?.tdPath || ""}
-                        onChange={(e) => setConfig({ ...config!, tdPath: e.target.value } as any)}
+                        onChange={(e) => updateDraftConfig({ ...config!, tdPath: e.target.value } as any)}
                         className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         placeholder="TwitchDownloader\TwitchDownloaderCLI.exe (or absolute path)"
                       />
@@ -1622,7 +1939,7 @@ export default function App() {
                         <input
                           type="number"
                           value={(config as any)?.chatRender?.width || 350}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, width: parseInt(e.target.value) || 0 } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, width: parseInt(e.target.value) || 0 } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                       </div>
@@ -1631,7 +1948,7 @@ export default function App() {
                         <input
                           type="number"
                           value={(config as any)?.chatRender?.height || 800}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, height: parseInt(e.target.value) || 0 } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, height: parseInt(e.target.value) || 0 } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                       </div>
@@ -1640,7 +1957,7 @@ export default function App() {
                         <input
                           type="text"
                           value={(config as any)?.chatRender?.backgroundColor || "#111111"}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, backgroundColor: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, backgroundColor: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                           placeholder="#111111 or #FF111111"
                         />
@@ -1651,7 +1968,7 @@ export default function App() {
                         <input
                           type="text"
                           value={(config as any)?.chatRender?.altBackgroundColor || "#191919"}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, altBackgroundColor: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, altBackgroundColor: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                           placeholder="#191919 or #FF191919"
                         />
@@ -1661,7 +1978,7 @@ export default function App() {
                         <input
                           type="text"
                           value={(config as any)?.chatRender?.messageColor || "#ffffff"}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, messageColor: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, messageColor: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                           placeholder="#ffffff or #ffffffff"
                         />
@@ -1672,7 +1989,7 @@ export default function App() {
                         <input
                           type="text"
                           value={(config as any)?.chatRender?.font || "Inter"}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, font: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, font: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                       </div>
@@ -1682,7 +1999,7 @@ export default function App() {
                           type="number"
                           step="0.5"
                           value={(config as any)?.chatRender?.syncOffset ?? -2.5}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffset: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffset: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                         <p className="text-xs text-gray-500">Offset for standard H.264 streams (default: -2.5s). Negative values advance chat earlier.</p>
@@ -1693,7 +2010,7 @@ export default function App() {
                           type="number"
                           step="0.5"
                           value={(config as any)?.chatRender?.syncOffsetHevc ?? -7.5}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffsetHevc: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffsetHevc: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                         <p className="text-xs text-gray-500">Offset for HEVC/1440p Enhanced Broadcasts (default: -7.5s). Compensates for broadcaster encoder lag.</p>
@@ -1703,7 +2020,7 @@ export default function App() {
                         <input
                           type="number"
                           value={(config as any)?.chatRender?.fontSize || 24}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, fontSize: parseInt(e.target.value) || 0 } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, fontSize: parseInt(e.target.value) || 0 } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                       </div>
@@ -1711,7 +2028,7 @@ export default function App() {
                         <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Message Font Style</label>
                         <select
                           value={(config as any)?.chatRender?.messageFontStyle || "normal"}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, messageFontStyle: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, messageFontStyle: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
                         >
                           <option value="normal">Normal</option>
@@ -1724,7 +2041,7 @@ export default function App() {
                         <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Username Font Style</label>
                         <select
                           value={(config as any)?.chatRender?.usernameFontStyle || "bold"}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, usernameFontStyle: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, usernameFontStyle: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
                         >
                           <option value="normal">Normal</option>
@@ -1737,7 +2054,7 @@ export default function App() {
                         <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Emoji Vendor</label>
                         <select
                           value={(config as any)?.chatRender?.emojiVendor || "notocolor"}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, emojiVendor: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, emojiVendor: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
                         >
                           <option value="notocolor">Google (notocolor)</option>
@@ -1750,7 +2067,7 @@ export default function App() {
                         <input
                           type="number"
                           value={(config as any)?.chatRender?.outlineSize || 4}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, outlineSize: parseInt(e.target.value) || 0 } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, outlineSize: parseInt(e.target.value) || 0 } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                       </div>
@@ -1759,7 +2076,7 @@ export default function App() {
                         <input
                           type="number"
                           value={(config as any)?.chatRender?.framerate || 60}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, framerate: parseInt(e.target.value) || 0 } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, framerate: parseInt(e.target.value) || 0 } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                       </div>
@@ -1768,7 +2085,7 @@ export default function App() {
                         <input
                           type="number"
                           value={(config as any)?.chatRender?.updateRate || 0}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, updateRate: parseFloat(e.target.value) || 0 } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, updateRate: parseFloat(e.target.value) || 0 } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                       </div>
@@ -1797,7 +2114,7 @@ export default function App() {
                           <input
                             type="checkbox"
                             checked={(config as any)?.chatRender?.[opt.key] ?? (['bttv', 'ffz', 'stv', 'giphy', 'allowUnlistedEmotes', 'badges', 'subMessages', 'readableColors', 'autoCompensateClockDrift'].includes(opt.key))}
-                            onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
                             className="w-4.5 h-4.5 rounded border-white/20 bg-[#141416] text-purple-600 focus:ring-0 focus:ring-offset-0"
                           />
                           <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
@@ -1825,7 +2142,7 @@ export default function App() {
                             type="number"
                             step="0.1"
                             value={(config as any)?.chatRender?.[opt.key] ?? (opt.key === 'scaleVertical' ? 0.5 : 1.0)}
-                            onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: parseFloat(e.target.value) || 0 } } as any)}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: parseFloat(e.target.value) || 0 } } as any)}
                             className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                           />
                         </div>
@@ -1837,7 +2154,7 @@ export default function App() {
                         <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">File Format</label>
                         <select
                           value={(config as any)?.chatRender?.format || "mp4"}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, format: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, format: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
                         >
                           <option value="mp4">MP4 (.mp4)</option>
@@ -1858,7 +2175,7 @@ export default function App() {
                             } else if (newCodec === "prores" && newFormat !== "mov" && newFormat !== "mkv") {
                               newFormat = "mov";
                             }
-                            setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, codec: newCodec, format: newFormat } } as any);
+                            updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, codec: newCodec, format: newFormat } } as any);
                           }}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
                         >
@@ -1874,7 +2191,7 @@ export default function App() {
                         <input
                           type="number"
                           value={(config as any)?.chatRender?.badgeFilter || 0}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, badgeFilter: parseInt(e.target.value) || 0 } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, badgeFilter: parseInt(e.target.value) || 0 } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                         <p className="text-xs text-gray-500">
@@ -1886,7 +2203,7 @@ export default function App() {
                         <input
                           type="text"
                           value={(config as any)?.chatRender?.ignoreUsers || ""}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, ignoreUsers: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, ignoreUsers: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                       </div>
@@ -1895,7 +2212,7 @@ export default function App() {
                         <input
                           type="text"
                           value={(config as any)?.chatRender?.bannedWords || ""}
-                          onChange={(e) => setConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, bannedWords: e.target.value } } as any)}
+                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, bannedWords: e.target.value } } as any)}
                           className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                         />
                       </div>
@@ -1927,17 +2244,6 @@ export default function App() {
 
                 <div className="flex flex-wrap justify-between items-center gap-4 mt-6 pt-6 border-t border-white/10">
                   <div className="flex items-center gap-3">
-                    <button 
-                      type="button" 
-                      disabled={isResetting}
-                      onClick={() => setShowRebootConfirm(true)}
-                      className={`flex items-center gap-2 bg-red-500/10 text-red-400 border border-red-500/20 px-4 py-2.5 rounded-lg text-sm font-semibold uppercase tracking-wider hover:bg-red-500 hover:text-white transition-all cursor-pointer ${
-                        isResetting ? "opacity-75 cursor-wait" : ""
-                      }`}
-                    >
-                      {isResetting && <RefreshCw className="w-4 h-4 animate-spin" />}
-                      {isResetting ? "Rebooting..." : "Reboot Program"}
-                    </button>
                     <a
                       href="/api/system-log"
                       download
@@ -1947,7 +2253,23 @@ export default function App() {
                       Download System Log
                     </a>
                   </div>
-                  <div className="flex items-center gap-3">
+                  <div className="flex flex-wrap items-center gap-3">
+                    {isConfigDirty && (
+                      <div className="flex items-center gap-2">
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-semibold">
+                          <AlertCircle className="w-3.5 h-3.5" />
+                          Unsaved changes
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => fetchConfig()}
+                          className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white border border-white/10 transition-colors cursor-pointer"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          Discard
+                        </button>
+                      </div>
+                    )}
                     {saveStatusMessage && (
                       <div className={`flex items-center gap-2 text-sm font-semibold ${saveStatusMessage.type === 'success' ? 'text-emerald-400' : 'text-red-400'}`}>
                         {saveStatusMessage.type === 'success' && <Check className="w-4 h-4" />}
@@ -1967,6 +2289,30 @@ export default function App() {
                   </div>
                 </div>
               </form>
+
+              {/* Separated Emergency Reset / Danger Zone Card */}
+              <div className="bg-red-950/15 border border-red-500/20 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                  <h4 className="text-sm font-bold text-red-400 uppercase tracking-wider flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4" />
+                    Emergency Reset
+                  </h4>
+                  <p className="text-xs text-gray-400 mt-1">
+                    Immediately aborts all active FFmpeg stitches, chat renders, and recording sessions, and clears the task queue.
+                  </p>
+                </div>
+                <button 
+                  type="button" 
+                  disabled={isResetting}
+                  onClick={() => setShowRebootConfirm(true)}
+                  className={`flex items-center justify-center gap-2 bg-red-500/10 text-red-400 border border-red-500/30 px-4 py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider hover:bg-red-600 hover:text-white transition-all cursor-pointer shrink-0 ${
+                    isResetting ? "opacity-75 cursor-wait" : ""
+                  }`}
+                >
+                  {isResetting && <RefreshCw className="w-4 h-4 animate-spin" />}
+                  {isResetting ? "Rebooting..." : "Reboot Program"}
+                </button>
+              </div>
             </motion.div>
           )}
 
@@ -2002,24 +2348,101 @@ export default function App() {
                   </a>
                 </div>
               </div>
+              {/* System Log Filter & Search Bar */}
+              <div className="bg-[#111113] border border-white/10 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="relative flex-1">
+                  <Search className="w-4 h-4 text-gray-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={logSearchQuery}
+                    onChange={e => setLogSearchQuery(e.target.value)}
+                    placeholder="Filter logs by keyword, channel, error, or sequence..."
+                    className="w-full bg-[#18181b] border border-white/10 rounded-lg pl-9 pr-8 py-1.5 text-xs font-mono text-white placeholder-gray-500 focus:outline-none focus:border-purple-500/50"
+                  />
+                  {logSearchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setLogSearchQuery("")}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {[
+                    { id: 'all', label: 'All Events' },
+                    { id: 'errors', label: 'Errors & Warnings' },
+                    { id: 'video', label: 'Video & Stitch' },
+                    { id: 'chat', label: 'Chat & Render' }
+                  ].map((cat) => (
+                    <button
+                      key={cat.id}
+                      type="button"
+                      onClick={() => setLogCategory(cat.id as any)}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                        logCategory === cat.id
+                          ? "bg-purple-600 text-white"
+                          : "bg-white/5 text-gray-400 hover:text-white hover:bg-white/10"
+                      }`}
+                    >
+                      {cat.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div className="bg-[#111113] border border-white/10 rounded-xl overflow-hidden shadow-md">
                 <div 
                   ref={logContainerRef}
                   onScroll={handleLogScroll}
                   className="p-3.5 h-[620px] overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5 scrollbar-thin scrollbar-thumb-white/10"
                 >
-                  {status?.logs && status.logs.length > 0 ? (
-                    status.logs.map((log, i) => (
-                      <div 
-                        key={i} 
-                        className="text-gray-300 hover:bg-white/[0.04] px-2.5 py-0.5 rounded transition-colors break-words font-mono select-text whitespace-pre-wrap"
-                      >
-                        {log}
-                      </div>
-                    ))
-                  ) : (
-                    <div className="text-gray-500 text-center py-20 text-xs">No logs recorded yet.</div>
-                  )}
+                  {(() => {
+                    const allLogs = status?.logs || [];
+                    const filteredLogs = allLogs.filter(line => {
+                      const lower = line.toLowerCase();
+                      if (logCategory === 'errors') {
+                        if (!lower.includes('error') && !lower.includes('warn') && !lower.includes('critical') && !lower.includes('fail')) return false;
+                      } else if (logCategory === 'video') {
+                        if (!lower.includes('[video]') && !lower.includes('[stitch') && !lower.includes('[backfill]') && !lower.includes('[game slicing]') && !lower.includes('[manual splice]') && !lower.includes('[recovery]') && !lower.includes('[stream]')) return false;
+                      } else if (logCategory === 'chat') {
+                        if (!lower.includes('[chat') && !lower.includes('[render') && !lower.includes('[auto-render]')) return false;
+                      }
+                      if (logSearchQuery.trim()) {
+                        return lower.includes(logSearchQuery.trim().toLowerCase());
+                      }
+                      return true;
+                    });
+
+                    if (filteredLogs.length === 0) {
+                      return (
+                        <div className="text-gray-500 text-center py-20 text-xs">
+                          {allLogs.length === 0 ? "No logs recorded yet." : "No log entries match your current filter."}
+                        </div>
+                      );
+                    }
+
+                    return filteredLogs.map((log, i) => {
+                      const lower = log.toLowerCase();
+                      const isErr = lower.includes('error]') || lower.includes('critical') || lower.includes('fatal') || lower.includes('failed');
+                      const isWarn = !isErr && (lower.includes('warn') || lower.includes('warning]'));
+                      return (
+                        <div 
+                          key={i} 
+                          className={`px-2.5 py-0.5 rounded transition-colors break-words font-mono select-text whitespace-pre-wrap ${
+                            isErr
+                              ? "text-red-300 bg-red-500/10 hover:bg-red-500/15"
+                              : isWarn
+                              ? "text-amber-300 bg-amber-500/10 hover:bg-amber-500/15"
+                              : "text-gray-300 hover:bg-white/[0.04]"
+                          }`}
+                        >
+                          {log}
+                        </div>
+                      );
+                    });
+                  })()}
                   <div ref={logEndRef} />
                 </div>
               </div>
@@ -2046,6 +2469,37 @@ export default function App() {
               </div>
 
               <div className="space-y-4">
+                {recentFolders.some(f => f.chatFiles.length > 0) && (
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
+                      Quick Select Recent Chat JSON
+                    </label>
+                    <select
+                      value=""
+                      onChange={(e) => {
+                        if (e.target.value) {
+                          setManualRenderPath(e.target.value);
+                          setManualRenderMsg(null);
+                        }
+                      }}
+                      className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-purple-500/50 cursor-pointer"
+                    >
+                      <option value="">-- Choose a downloaded chat file from recent sessions --</option>
+                      {recentFolders.map(folder =>
+                        folder.chatFiles.map(cf => {
+                          const sep = folder.folderPath.includes('\\') ? '\\' : '/';
+                          const fullFile = `${folder.folderPath}${sep}${cf}`;
+                          return (
+                            <option key={fullFile} value={fullFile}>
+                              {folder.name} / {cf}
+                            </option>
+                          );
+                        })
+                      )}
+                    </select>
+                  </div>
+                )}
+
                 <div className="space-y-1.5">
                   <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
                     Chat JSON File Path
@@ -2057,11 +2511,11 @@ export default function App() {
                       setManualRenderPath(e.target.value);
                       setManualRenderMsg(null);
                     }}
-                    placeholder="e.g. downloads/the_happy_hob_.../chat.json (or full path)"
+                    placeholder="e.g. downloads/channel_2026-10-18/chat.json (or full path)"
                     className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3.5 py-2.5 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white placeholder-gray-600 shadow-inner"
                   />
                   <p className="text-xs text-gray-500">
-                    Paste the full path to the chat JSON file (or filename if it resides inside your configured downloads folder).
+                    Select a file above or paste the path to any chat JSON file.
                   </p>
                 </div>
 
@@ -2121,6 +2575,167 @@ export default function App() {
                 >
                   {isStartingManualRender && <RefreshCw className="w-4 h-4 animate-spin" />}
                   {isStartingManualRender ? "Starting..." : "Start Render"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Recover Folder Video Modal */}
+        {recoverFolderDialog && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+            <div className="bg-[#141416] border border-white/15 rounded-2xl w-full max-w-lg p-6 shadow-2xl space-y-5">
+              <div className="flex items-center justify-between border-b border-white/10 pb-4">
+                <div className="flex items-center gap-2.5">
+                  <Wrench className="w-5 h-5 text-purple-400" />
+                  <h3 className="text-lg font-bold text-white tracking-tight">Recover Folder Video</h3>
+                </div>
+                <button 
+                  type="button"
+                  onClick={() => setRecoverFolderDialog(false)}
+                  className="text-gray-400 hover:text-white p-1 rounded-lg transition-colors cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="space-y-4">
+                <p className="text-xs text-gray-400 leading-relaxed">
+                  Scans a recording session directory for uncompiled live (<code>seq_*.ts</code>) and VOD backfill (<code>vod_seq_*.ts</code>) chunks and stitches them into standalone MP4 videos with paired chat JSON files.
+                </p>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
+                    Select Recent Session Folder
+                  </label>
+                  <select
+                    value={recoverFolderPath}
+                    onChange={(e) => {
+                      setRecoverFolderPath(e.target.value);
+                      setRecoverFolderMsg(null);
+                    }}
+                    disabled={isLoadingRecentFolders}
+                    className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-purple-500/50 cursor-pointer"
+                  >
+                    <option value="">
+                      {isLoadingRecentFolders ? "Scanning downloads directory..." : "-- Select a session folder --"}
+                    </option>
+                    {recentFolders.map(folder => (
+                      <option key={folder.folderPath} value={folder.folderPath}>
+                        {folder.name} ({folder.liveChunkCount} live chunks, {folder.vodChunkCount} VOD chunks, {folder.mp4Files.length} MP4s)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
+                    Or Enter Folder Path Manually
+                  </label>
+                  <input
+                    type="text"
+                    value={recoverFolderPath}
+                    onChange={(e) => {
+                      setRecoverFolderPath(e.target.value);
+                      setRecoverFolderMsg(null);
+                    }}
+                    placeholder="e.g. downloads/streamer_2026-10-18_123456"
+                    className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3.5 py-2.5 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white placeholder-gray-600 shadow-inner"
+                  />
+                </div>
+
+                {recoverFolderMsg && (
+                  <div className={`p-3 rounded-lg text-xs flex items-center gap-2 ${
+                    recoverFolderMsg.type === 'success' 
+                      ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400' 
+                      : 'bg-red-500/10 border border-red-500/20 text-red-400'
+                  }`}>
+                    {recoverFolderMsg.type === 'success' ? (
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 shrink-0" />
+                    )}
+                    <span>{recoverFolderMsg.text}</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-3 border-t border-white/10">
+                <button
+                  type="button"
+                  onClick={() => setRecoverFolderDialog(false)}
+                  disabled={isStartingRecovery}
+                  className="px-4 py-2 text-sm font-semibold text-gray-400 hover:text-white rounded-lg transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={submitRecoverFolder}
+                  disabled={isStartingRecovery || !recoverFolderPath.trim()}
+                  className={`flex items-center gap-2 px-5 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-semibold uppercase tracking-wider transition-colors shadow-md shadow-purple-900/30 cursor-pointer ${
+                    isStartingRecovery || !recoverFolderPath.trim() ? "opacity-75 cursor-not-allowed" : ""
+                  }`}
+                >
+                  {isStartingRecovery && <RefreshCw className="w-4 h-4 animate-spin" />}
+                  {isStartingRecovery ? "Recovering..." : "Recover Video"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Unsaved Settings Changes Confirmation Modal */}
+        {pendingTabSwitch && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+            <div className="bg-[#141416] border border-amber-500/30 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-amber-500/10 border border-amber-500/25 flex items-center justify-center shrink-0">
+                  <AlertCircle className="w-5 h-5 text-amber-400" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white tracking-tight">Unsaved Settings Changes</h3>
+                  <p className="text-xs text-gray-400">You have modified settings that haven't been saved yet</p>
+                </div>
+              </div>
+
+              <p className="text-sm text-gray-300 leading-relaxed">
+                Would you like to save your configuration changes before leaving the Settings tab, or discard them?
+              </p>
+
+              <div className="flex flex-wrap items-center justify-end gap-2.5 pt-3 border-t border-white/10">
+                <button
+                  type="button"
+                  onClick={() => setPendingTabSwitch(null)}
+                  className="px-3.5 py-2 rounded-lg text-xs font-semibold text-gray-400 hover:text-white transition-colors cursor-pointer"
+                >
+                  Stay Here
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const dest = pendingTabSwitch;
+                    setPendingTabSwitch(null);
+                    fetchConfig();
+                    setActiveTab(dest);
+                  }}
+                  className="px-3.5 py-2 rounded-lg text-xs font-semibold text-gray-300 bg-white/5 hover:bg-white/10 border border-white/10 transition-colors cursor-pointer"
+                >
+                  Discard & Leave
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const dest = pendingTabSwitch;
+                    const saved = await saveConfigInternal();
+                    if (saved) {
+                      setPendingTabSwitch(null);
+                      setActiveTab(dest);
+                    }
+                  }}
+                  className="px-4 py-2 rounded-lg text-xs font-semibold uppercase tracking-wider text-white bg-purple-600 hover:bg-purple-500 transition-colors shadow-md shadow-purple-900/30 cursor-pointer"
+                >
+                  Save & Leave
                 </button>
               </div>
             </div>
@@ -2522,14 +3137,28 @@ export default function App() {
           <div className="fixed bottom-6 right-6 z-50 max-w-md animate-in fade-in slide-in-from-bottom-3 duration-200">
             <div className={`p-4 rounded-xl shadow-2xl border flex items-start gap-3 ${
               toastMessage.type === 'error'
-                ? 'bg-red-950/90 border-red-500/40 text-red-200'
+                ? 'bg-red-950/95 border-red-500/40 text-red-200'
                 : toastMessage.type === 'success'
-                ? 'bg-emerald-950/90 border-emerald-500/40 text-emerald-200'
+                ? 'bg-emerald-950/95 border-emerald-500/40 text-emerald-200'
                 : 'bg-zinc-900/95 border-purple-500/40 text-gray-200'
             }`}>
-              <Folder className="w-5 h-5 text-purple-400 shrink-0 mt-0.5" />
+              {toastMessage.type === 'error' ? (
+                <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+              ) : toastMessage.type === 'success' ? (
+                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+              ) : (
+                <Folder className="w-5 h-5 text-purple-400 shrink-0 mt-0.5" />
+              )}
               <div className="flex-1 min-w-0">
-                <p className="text-xs font-semibold uppercase tracking-wider text-purple-300">File Manager</p>
+                <p className={`text-xs font-semibold uppercase tracking-wider ${
+                  toastMessage.type === 'error'
+                    ? 'text-red-300'
+                    : toastMessage.type === 'success'
+                    ? 'text-emerald-300'
+                    : 'text-purple-300'
+                }`}>
+                  {toastMessage.title || (toastMessage.type === 'error' ? 'Error' : toastMessage.type === 'success' ? 'Success' : 'File Manager')}
+                </p>
                 <p className="text-sm mt-0.5 break-words font-mono">{toastMessage.text}</p>
               </div>
               <button

@@ -103,6 +103,10 @@ export interface ActiveTask {
   gameName?: string;
   vodMode?: 'full' | 'current_game' | 'none';
   vodStartOffsetSec?: number;
+  initialJoinOffsetSec?: number;
+  firstSeqNum?: number;
+  streamCreatedAtMs?: number;
+  gapAdjustments?: { atChunk: number; missingDurationSec: number }[];
   customExportMode?: 'append_previous' | 'extract_clip' | 'split_new_part';
   customChunkRange?: { startIdx: number; endIdx: number };
   customOutputName?: string;
@@ -122,6 +126,7 @@ export interface ActiveDownloadSession {
   twitchId?: string;
   startTime: string;
   streamCreatedAtMs?: number;
+  initialJoinOffsetSec?: number;
   chunksDownloaded: number;
   folderPath: string;
   segmentsFile: string;

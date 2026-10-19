@@ -1,7 +1,7 @@
 # VOD Automator: Unified Technical & UX Audit Remediation Plan
 
 **Created:** 2026-10-16 (Reconciled & Merged with UX Systems Audit: 2026-10-18)  
-**Baseline Version:** `v4.8.4` (Target: `v4.8.5` / `v4.9.0`)  
+**Current Version:** `v4.9.0` (All Phases 1–5 Completed & Verified)  
 **Guiding Principle:** Prioritized strictly by operational severity (**P0 Critical Data Integrity → P1 Timeline & Sync Invariants → P2 External API & Persistence Resilience → P3 Core Workflow & UX Blockers → P4 Frontend Polish, Ergonomics & Hygiene**) and secondarily grouped by architectural domain. All changes strictly enforce the reconciled invariants defined in `AGENTS.md`.
 
 ---
@@ -24,333 +24,306 @@ Every remediation item in this unified plan has been verified against `AGENTS.md
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────────────┐
-│ PHASE 1: Critical Data Integrity & Async Finalization Lifecycle (P0 - CRITICAL)   │
+│ PHASE 1: Critical Data Integrity & Async Finalization Lifecycle [✅ DONE v4.8.5]  │
 │  ├─ Domain 1A: VOD Backfill, Resumption Range & Unattended Prompt Integrity       │
-│  │   ├─ 1.1 Fix premature currentGame.startTimeOffset mutation in recovery        │
+│  │   ├─ 1.1 [DONE v4.8.5] Fix premature currentGame.startTimeOffset mutation      │
 │  │   ├─ 1.2 [DONE v4.8.4] Fix NaN timestamp & 10s CMAF chunk math in backfillVod  │
-│  │   └─ 1.3 [UX-B1] Add 60s AFK auto-selection timer to initial VOD Backfill      │
+│  │   └─ 1.3 [DONE v4.8.5] Add 60s AFK auto-selection timer to initial VOD Backfill│
 │  │          prompt so liveChatBuffer never freezes in RAM indefinitely            │
 │  └─ Domain 1B: Async Session Teardown & Chat Stream Sealing (api.ts, chat.ts)     │
-│      ├─ 1.4 Await stopActiveDownload() before triggerFinalizeFlow() in routes     │
-│      └─ 1.5 Coordinate auto-backfill promise (activeChatBackfillPromise)          │
+│      ├─ 1.4 [DONE v4.8.5] Await stopActiveDownload() before triggerFinalizeFlow() │
+│      └─ 1.5 [DONE v4.8.5] Coordinate auto-backfill (activeChatBackfillPromise)    │
 └─────────────────────────────────────────┬─────────────────────────────────────────┘
                                           │
                                           ▼
 ┌───────────────────────────────────────────────────────────────────────────────────┐
-│ PHASE 2: Timeline Sync, Chunk Separation & Duration Invariants (P1 - HIGH)        │
+│ PHASE 2: Timeline Sync, Chunk Separation & Duration Invariants [✅ DONE v4.8.6]   │
 │  ├─ Domain 2A: VOD/Live Chunk Separation & Accumulated Duration (download.ts)     │
-│  │   ├─ 2.1 Count only live seq_*.ts in chunksDownloaded & restore highestSeq     │
-│  │   ├─ 2.2 Preserve true videoDurationSeconds in stopActiveDownload              │
-│  │   └─ 2.3 Fix 9-hour time-based autosplice to use real accumulated duration     │
+│  │   ├─ 2.1 [DONE v4.8.6] Count only live seq_*.ts in chunksDownloaded & highestSeq│
+│  │   ├─ 2.2 [DONE v4.8.6] Preserve true videoDurationSeconds in stopActiveDownload│
+│  │   └─ 2.3 [DONE v4.8.6] Fix 9-hour time-based autosplice to use real duration   │
 │  └─ Domain 2B: Presentation Timeline Anchoring in Video & Chat Slicing            │
-│      ├─ 2.4 Anchor initial live duration to broadcast join offset (download.ts)   │
-│      └─ 2.5 Replace raw firstChunkInVideo * avgChunkDur in Game 1, Custom Clips,  │
-│             Extensions, and Gap Adjustments with broadcast timeline anchors       │
-│             (video.ts)                                                            │
+│      ├─ 2.4 [DONE v4.8.6] Anchor initial live duration to broadcast join offset   │
+│      └─ 2.5 [DONE v4.8.6] Replace raw firstChunkInVideo * avgChunkDur in Game 1,  │
+│             Custom Clips, Extensions, and Gap Adjustments with broadcast timeline │
+│             anchors (video.ts)                                                    │
 └─────────────────────────────────────────┬─────────────────────────────────────────┘
                                           │
                                           ▼
 ┌───────────────────────────────────────────────────────────────────────────────────┐
-│ PHASE 3: External API Resilience, Query Hardening & State Safety (P2 - MAJOR)     │
+│ PHASE 3: External API Resilience, Query Hardening & State Safety [✅ DONE v4.8.6] │
 │  ├─ Domain 3A: Twitch GQL, CDN & Emote Network Hardening (twitch/emotes/chat.ts)  │
-│  │   ├─ 3.1 Strict channel handle sanitization & GraphQL variables parameterization│
-│  │   ├─ 3.2 Add 5s request timeouts to all 6 third-party emote API calls          │
-│  │   ├─ 3.3 Cap consecutive network retries in downloadVodChat pagination loop    │
-│  │   └─ 3.4 Add transient retry for .ts segments & await stalled playlist refresh │
+│  │   ├─ 3.1 [DONE v4.8.6] Strict channel handle sanitization & GQL variables      │
+│  │   ├─ 3.2 [DONE v4.8.6] Add 5s request timeouts to all 6 3rd-party emote calls  │
+│  │   ├─ 3.3 [DONE v4.8.6] Cap consecutive network retries in downloadVodChat loop │
+│  │   └─ 3.4 [DONE v4.8.6] Add transient retry for .ts segments & await stalled    │
+│  │          playlist refresh                                                      │
 │  └─ Domain 3B: State Persistence Concurrency (state.ts)                           │
-│      └─ 3.5 Queue follow-up save when scheduleStateSave fires during active write │
+│      └─ 3.5 [DONE v4.8.6] Queue follow-up save when executeStateSave is active    │
 └─────────────────────────────────────────┬─────────────────────────────────────────┘
                                           │
                                           ▼
 ┌───────────────────────────────────────────────────────────────────────────────────┐
-│ PHASE 4: Core Workflow Unblocking & State Ergonomics (P2.5 - HIGH FRICTION UX)    │
+│ PHASE 4: Core Workflow Unblocking & State Ergonomics [✅ DONE v4.8.7]             │
 │  ├─ Domain 4A: Post-Recording Actions & Dead-End Elimination (App.tsx, download)  │
-│  │   ├─ 4.1 [UX-B3] Restore "Open Folder" action on tasks, stream cards & settings│
-│  │   ├─ 4.2 [UX-B4] Add "Render Chat" action to completed VOD Backfill task cards │
-│  │   └─ 4.3 [UX-H3/H4] Guard Render Chat modal (0-file disable, error feedback) & │
-│  │          clarify "Download VOD Chat" button on completed broadcasts            │
+│  │   ├─ 4.1 [DONE v4.8.7] Restore "Open Folder" action on tasks, stream cards & UI│
+│  │   ├─ 4.2 [DONE v4.8.7] Add "Render Chat" action to completed VOD Backfill cards│
+│  │   └─ 4.3 [DONE v4.8.7] Guard Render Chat modal (0-file disable, error feedback)│
+│  │          & clarify "Re-fetch VOD Chat" button on completed broadcasts          │
 │  └─ Domain 4B: Onboarding, Settings Dirty-State & Recovery Surfacing (App.tsx)    │
-│      ├─ 4.4 [UX-B2] Isolate Settings draft state & warn on unsaved tab switches   │
-│      ├─ 4.5 [UX-H1] Replace phantom @channel1/@channel2 with Empty Slot UI        │
-│      └─ 4.6 [UX-H2] Expose Folder Video Recovery & Folder/File Picker in UI       │
+│      ├─ 4.4 [DONE v4.8.7] Isolate Settings draft state & warn on unsaved switches │
+│      ├─ 4.5 [DONE v4.8.7] Replace phantom @channel1/@channel2 with Empty Slot UI  │
+│      └─ 4.6 [DONE v4.8.7] Expose Folder Video Recovery & Folder/File Picker in UI │
 └─────────────────────────────────────────┬─────────────────────────────────────────┘
                                           │
                                           ▼
 ┌───────────────────────────────────────────────────────────────────────────────────┐
-│ PHASE 5: Frontend UX Polish, Code Hygiene & Version Sync (P3 - MINOR / POLISH)    │
+│ PHASE 5: Frontend UX Polish, Code Hygiene & Version Sync [✅ DONE v4.9.0]         │
 │  ├─ Domain 5A: Non-Blocking Feedback, Modals & Log Ergonomics (App.tsx, api.ts)   │
-│  │   ├─ 5.1 [UX-P1] Fix global toast icon/title & replace 6 window.alert() calls  │
-│  │   ├─ 5.2 [UX-P2] Reset Manual Splice modal state on open (prevent Game 1 bug)  │
-│  │   ├─ 5.3 [UX-P3/P4/P5] Add System Log filter/search, OAuth token show/hide     │
+│  │   ├─ 5.1 [DONE v4.8.7] Fix global toast icon/title & replace 6 alert() calls   │
+│  │   ├─ 5.2 [DONE v4.8.7] Reset Manual Splice modal state on open                 │
+│  │   ├─ 5.3 [DONE v4.8.7] Add System Log filter/search, OAuth token show/hide     │
 │  │   │      toggle, and move "Reboot Program" to separated Danger Zone            │
-│  │   └─ 5.4 Standardize gameSwitchBufferMins fallback (5m) in /api/status         │
+│  │   └─ 5.4 [DONE v4.8.7] Standardize gameSwitchBufferMins fallback (5m)          │
 │  └─ Domain 5B: Dead Code Cleanup & Version Synchronization (server/api/package)   │
-│      ├─ 5.5 Remove unused imports and dead state variables                        │
-│      └─ 5.6 Synchronize version bump (v4.8.5 / v4.9.0) in package.json & App.tsx  │
+│      ├─ 5.5 [DONE v4.9.0] Remove unused imports and dead variables across project │
+│      └─ 5.6 [DONE v4.9.0] Synchronize version bump (v4.9.0) in package & App.tsx  │
 └───────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Phase 1: Critical Data Integrity & Async Finalization Lifecycle *(Priority: P0 — Critical)*
+## Phase 1: Critical Data Integrity & Async Finalization Lifecycle *(Priority: P0 — Critical)* — ✅ COMPLETED (`v4.8.5`)
 
 **Objective:** Eliminate immediate data-loss bugs where recovery backfills truncate to 6 seconds, where unattended mid-stream starts hold live chat in RAM indefinitely without writing to disk, or where stopping a stream triggers video/chat slicing before the master chat JSON file has finished closing and repairing on disk.
 
 ### Domain 1A: VOD Backfill, Resumption Range & Unattended Prompt Integrity (`src/services/download.ts`, `src/services/chat.ts`)
 
-#### 1.1 Fix Premature `currentGame.startTimeOffset` Mutation in `executeResumeVodBackfill`
-- **Location:** `src/services/download.ts` (lines 888–902)
-- **Failure Mode:** `currentGame.startTimeOffset = resumptionOffsetSec` is overwritten before reading `currentGame.startTimeOffset` to compute `gameStartOffsetSec`. For any game segment after the first (`currentGameIndex > 0`), `gameStartOffsetSec` becomes equal to `resumptionOffsetSec`, causing Option 2 ("VOD Backfill Current Game") to delete all recorded live chunks for the current game and only backfill the 6-second overlap window.
+#### 1.1 [COMPLETED in `v4.8.5`] Fix Premature `currentGame.startTimeOffset` Mutation in `executeResumeVodBackfill`
+- **Status:** ✅ Completed in `v4.8.5`.
+- **Location:** `src/services/download.ts` (lines 883–899)
+- **Failure Mode:** `currentGame.startTimeOffset = resumptionOffsetSec` was overwritten before reading `currentGame.startTimeOffset` to compute `gameStartOffsetSec`. For any game segment after the first (`currentGameIndex > 0`), `gameStartOffsetSec` became equal to `resumptionOffsetSec`, causing Option 2 ("VOD Backfill Current Game") to delete all recorded live chunks for the current game and only backfill the 6-second overlap window.
 - **Compliance:** Upholds `AGENTS.md` Rule 1 & Rule 6.
-- **Implementation:**
-  1. Compute `const gameStartOffsetSec = Math.max(0, Math.floor(currentGameIndex === 0 ? 0 : (currentGame.startTimeOffset || 0)));` **before** mutating `currentGame.startChunk`, `currentGame.startTimeMs`, and `currentGame.startTimeOffset`.
-  2. Then advance `currentGame` boundaries to the resumption edge for Part 2.
+- **Resolution Applied:** Computed `gameStartOffsetSec` before advancing `currentGame.startChunk`, `currentGame.startTimeMs`, and `currentGame.startTimeOffset` to the resumption edge for Part 2.
 
 #### 1.2 [COMPLETED in `v4.8.4`] Fix `NaN` Timestamp Math & 10s CMAF Segment Duration in `backfillVod`
 - **Status:** ✅ Completed in `v4.8.4` during the Enhanced Broadcasting proactive audit.
 - **Location:** `src/services/download.ts` & `src/services/video.ts`
 - **Resolution Applied:** Replaced `const startSeq = targetSegments[0] || seqNum` with numeric `startIdx` and computed actual average VOD segment duration (`avgVodSegDur`, supporting both `2.0s` normal VOD chunks and `10.0s` Enhanced Broadcasting CMAF chunks) for failure logging, FFmpeg progress estimation, and fallback VOD chat slicing. Also isolated VOD CMAF initialization segments to `vod_init.mp4` so they never collide with live `init.mp4`.
 
-#### 1.3 [UX-B1] Add 60-Second AFK Auto-Selection Timer to Initial VOD Backfill Prompt (`startDownloadSession`)
-- **Location:** `src/services/download.ts` (`startDownloadSession`, lines 591–688) & `src/services/chat.ts` (`startLiveChatDownload`, lines 1691–1703)
-- **Failure Mode:** When a user starts monitoring a stream that has already been live for >2 minutes, `startLiveChatDownload` sets `awaitsUserChoice = true` and buffers all incoming live IRC chat messages in `liveBuffer` in RAM while waiting for the user to click an option on `prompt_backfill_${streamId}`. Because `prompt_backfill_${streamId}` has no timeout, if the user is AFK or unattended (`autoStartMonitoring`), `commentsWritten` remains frozen at `0` on the dashboard and hours of live chat remain unpersisted in RAM (and are lost if the app restarts or crashes before a button is clicked).
+#### 1.3 [COMPLETED in `v4.8.5`] [UX-B1] Add 60-Second AFK Auto-Selection Timer to Initial VOD Backfill Prompt (`startDownloadSession`)
+- **Status:** ✅ Completed in `v4.8.5`.
+- **Location:** `src/services/download.ts` (`startDownloadSession`, lines 635–710) & `src/services/chat.ts` (`startLiveChatDownload`, lines 1691–1703)
+- **Failure Mode:** When a user started monitoring a stream that had already been live for >2 minutes, `startLiveChatDownload` set `awaitsUserChoice = true` and buffered all incoming live IRC chat messages in `liveBuffer` in RAM while waiting for the user to click an option on `prompt_backfill_${streamId}`. Because `prompt_backfill_${streamId}` had no timeout, if the user was AFK or unattended (`autoStartMonitoring`), `commentsWritten` remained frozen at `0` on the dashboard and hours of live chat remained unpersisted in RAM.
 - **Compliance:** Upholds `AGENTS.md` Rule 6 (Broadcast Start Anchor & Chat Timeline Synchronization).
-- **Implementation:**
-  1. When `prompt_backfill_${streamId}` is updated with its action buttons in `startDownloadSession`, attach `const countdownSec = 60; currentTask.expiresAt = Date.now() + (countdownSec * 1000); currentTask.autoCountdownSeconds = countdownSec;` (the UI at `src/App.tsx:188` already renders `task.expiresAt` countdown badges automatically).
-  2. Schedule a 60-second `setTimeout` that checks `if (state.activeTasks[taskId] && state.activeTasks[taskId].actionRequired)`. If still unanswered, log `[Backfill] AFK timeout (60s) elapsed for @${channelLogin}. Auto-selecting No Backfill to flush buffered live chat to disk.`, invoke `resolveLiveChatBackfill(channelLogin, 'none', 0)`, and call `removeTask(taskId)`.
+- **Resolution Applied:** Attached a 60-second `expiresAt` countdown (`defaultAction: "backfill_none"`) and `setTimeout` handler to `prompt_backfill_${streamId}` that automatically invokes `resolveLiveChatBackfill(channelLogin, 'none', 0)` and removes the prompt task if unanswered after 60 seconds.
 
 ### Domain 1B: Async Session Teardown & Chat Stream Sealing (`src/routes/api.ts`, `src/services/download.ts`, `src/services/chat.ts`)
 
-#### 1.4 Await `stopActiveDownload` Before `triggerFinalizeFlow` Across All API Routes
-- **Location:** `src/routes/api.ts` (`/api/config` line 146, `/api/force-stitch` line 357, `/api/stop` lines 750 & 769)
-- **Failure Mode:** `stopActiveDownload` is an `async` function that flushes batched chat writes, writes the closing `embeddedData` footer, awaits `chatStream.end()`, patches `video.end`/`video.length` via `fs.openSync`, and runs `repairChatJsonFile`. Calling `stopActiveDownload` without `await` immediately starts `triggerFinalizeFlow` -> `stitchVideoChunks`, reading and slicing `chat_[date].json` while it is still unsealed or mid-write.
+#### 1.4 [COMPLETED in `v4.8.5`] Await `stopActiveDownload` Before `triggerFinalizeFlow` Across All API Routes
+- **Status:** ✅ Completed in `v4.8.5`.
+- **Location:** `src/routes/api.ts` (`/api/config` line 146, `/api/force-stitch` line 355, `/api/stop` lines 746 & 764)
+- **Failure Mode:** `stopActiveDownload` is an `async` function that flushes batched chat writes, writes the closing `embeddedData` footer, awaits `chatStream.end()`, patches `video.end`/`video.length` via `fs.openSync`, and runs `repairChatJsonFile`. Calling `stopActiveDownload` without `await` immediately started `triggerFinalizeFlow` -> `stitchVideoChunks`, reading and slicing `chat_[date].json` while it was still unsealed or mid-write.
 - **Compliance:** Upholds `AGENTS.md` Rule 6 & Rule 7.
-- **Implementation:**
-  1. In `POST /api/config`: `await stopActiveDownload(matchingKey);` before `triggerFinalizeFlow(sessionData, removed);`.
-  2. Convert `POST /api/force-stitch` to `async (req, res)` and `await stopActiveDownload(channel);` before `triggerFinalizeFlow(sessionData, channel);`.
-  3. Convert `POST /api/stop` to `async (req, res)` and `await stopActiveDownload(...)` before `triggerFinalizeFlow(...)` for both single-channel and all-channel stops.
+- **Resolution Applied:** Converted `/api/force-stitch` and `/api/stop` to `async` route handlers and awaited `stopActiveDownload(...)` before `triggerFinalizeFlow(...)` across `/api/config`, `/api/force-stitch`, and `/api/stop` (both single-channel and all-channel stops).
 
-#### 1.5 Coordinate Auto-Backfill Chat Promises During Recovery & Shutdown
-- **Location:** `src/services/chat.ts` (`startLiveChatDownload`, lines 1703–1789) & `src/services/download.ts` (`stopActiveDownload`, lines 1564–1691)
-- **Failure Mode:** When `shouldAutoBackfill` triggers on chat recovery, `downloadVodChat(...)` runs asynchronously without storing its promise on `session.activeChatBackfillPromise`. If the stream ends or is stopped before recovery backfill finishes, `stopActiveDownload` closes `session.chatStream`, causing the finishing backfill to write to a closed stream and lose buffered messages.
+#### 1.5 [COMPLETED in `v4.8.5`] Coordinate Auto-Backfill Chat Promises During Recovery & Shutdown
+- **Status:** ✅ Completed in `v4.8.5`.
+- **Location:** `src/services/chat.ts` (`startLiveChatDownload`, lines 1705–1796) & `src/services/download.ts` (`stopActiveDownload`, lines 1583–1586)
+- **Failure Mode:** When `shouldAutoBackfill` triggered on chat recovery, `downloadVodChat(...)` ran asynchronously without storing its promise on `session.activeChatBackfillPromise`. If the stream ended or was stopped before recovery backfill finished, `stopActiveDownload` closed `session.chatStream`, causing the finishing backfill to write to a closed stream and lose buffered messages.
 - **Compliance:** Upholds `AGENTS.md` Rule 6 (Backfill Chat Slicing Coordination).
-- **Implementation:**
-  1. Assign the `shouldAutoBackfill` promise to `session.activeChatBackfillPromise` and clear it in `.finally()`.
-  2. In `stopActiveDownload`, if `session.activeChatBackfillPromise` is present, `await session.activeChatBackfillPromise.catch(() => {})` before calling `flushPendingChatWrites(session)` and closing `session.chatStream`.
+- **Resolution Applied:** Assigned `autoBackfillPromise` to `session.activeChatBackfillPromise` (clearing it in `.finally()`) and awaited `session.activeChatBackfillPromise` inside `stopActiveDownload` before calling `flushPendingChatWrites(session)` and closing `session.chatStream`.
 
 ---
 
-## Phase 2: Timeline Synchronization, Chunk Separation & Duration Invariants *(Priority: P1 — High)*
+## Phase 2: Timeline Synchronization, Chunk Separation & Duration Invariants *(Priority: P1 — High)* — ✅ COMPLETED (`v4.8.6`)
 
 **Objective:** Strictly enforce `AGENTS.md` Rules 1, 6, and 9 across `download.ts` and `video.ts`, eliminating every remaining place where `chunkIndex * 2`, `chunkCount * 2`, or unanchored `firstChunkInVideo * avgChunkDur` is used.
 
 ### Domain 2A: VOD vs. Live Chunk Separation & Accumulated Duration (`src/services/download.ts`)
 
-#### 2.1 Strict VOD/Live Separation on Session Folder Resume (`startDownloadSession`)
+#### 2.1 [COMPLETED in `v4.8.6`] Strict VOD/Live Separation on Session Folder Resume (`startDownloadSession`)
+- **Status:** ✅ Completed in `v4.8.6`.
 - **Location:** `src/services/download.ts` (lines 488–561)
 - **Failure Mode:** When resuming an existing folder, `downloadedSegments` adds both numeric `seq_*.ts` IDs and `vod_${seq}` strings. `chunksDownloaded: downloadedSegments.size` counts VOD chunks as live chunks, and `highestSeq: -1` is initialized instead of `currentChunkIndex`.
 - **Compliance:** Upholds `AGENTS.md` Rule 1 (Never mix VOD and Live chunks).
-- **Implementation:**
-  1. Set `chunksDownloaded: chunkFilesList.length` (counting exclusively `seq_*.ts` files).
-  2. Initialize `highestSeq: currentChunkIndex > 0 ? currentChunkIndex : -1`.
+- **Resolution Applied:** Set `chunksDownloaded: liveChunksCount` (counting exclusively `seq_*.ts` files) and initialized `highestSeq: currentChunkIndex > 0 ? currentChunkIndex : -1`.
 
-#### 2.2 Preserve True Accumulated `videoDurationSeconds` in `stopActiveDownload`
-- **Location:** `src/services/download.ts` (lines 1589–1606)
-- **Failure Mode:** `stopActiveDownload` reads `session.videoDurationSeconds`, which accumulates real `seg.duration` values from the HLS playlist, but immediately overwrites it with `(session.highestSeq + 1) * 2`, and the disk fallback regex `/(?:seq|vod)_(\d+)\.ts/` mixes VOD and live chunks.
+#### 2.2 [COMPLETED in `v4.8.6`] Preserve True Accumulated `videoDurationSeconds` in `stopActiveDownload`
+- **Status:** ✅ Completed in `v4.8.6`.
+- **Location:** `src/services/download.ts` (lines 1600–1620)
+- **Failure Mode:** `stopActiveDownload` read `session.videoDurationSeconds` (which accumulates real `seg.duration` values from the HLS playlist), but immediately overwrote it with `(session.highestSeq + 1) * 2`, and the disk fallback regex `/(?:seq|vod)_(\d+)\.ts/` mixed VOD and live chunks.
 - **Compliance:** Upholds `AGENTS.md` Rule 1 & Rule 9 (Never assume fixed 2.000s chunk length).
-- **Implementation:**
-  1. If `session.videoDurationSeconds && session.videoDurationSeconds > 0`, use `Math.round(session.videoDurationSeconds)` directly as the authoritative live broadcast duration.
-  2. Only fall back to scanning disk if `videoDurationSeconds` is `0`/undefined, and match strictly `^seq_(\d+)\.ts$` (never `vod_seq_*.ts`).
+- **Resolution Applied:** Retained `Math.round(session.videoDurationSeconds || 0)` as the primary duration when `> 0`, anchored `highestSeq` fallback to `firstSeqNum` and `initialJoinOffsetSec`, and restricted disk fallback to `/^seq_(\d+)\.ts$/`.
 
-#### 2.3 Fix Long-Broadcast Time Autosplice to Use Real Accumulated Duration (`pollPlaylist`)
-- **Location:** `src/services/download.ts` (lines 1203–1235)
-- **Failure Mode:** The 9-hour extended stream autosplice computes `recordedGameChunks * 2`, `chunksElapsed = Math.round(cutSec / 2)`, and `spliceTimeOffset = spliceStartChunk * 2`. Over 9 hours of `1.995s` chunks, multiplying by `2` drifts by ~40–50 seconds and corrupts `continuationGame.startTimeOffset`.
+#### 2.3 [COMPLETED in `v4.8.6`] Fix Long-Broadcast Time Autosplice to Use Real Accumulated Duration (`pollPlaylist`)
+- **Status:** ✅ Completed in `v4.8.6`.
+- **Location:** `src/services/download.ts` (lines 1220–1255)
+- **Failure Mode:** The 9-hour extended stream autosplice computed `recordedGameChunks * 2`, `chunksElapsed = Math.round(cutSec / 2)`, and `spliceTimeOffset = spliceStartChunk * 2`. Over 9 hours of `1.995s` chunks, multiplying by `2` drifted by ~40–50 seconds and corrupted `continuationGame.startTimeOffset`.
 - **Compliance:** Upholds `AGENTS.md` Rule 9.
-- **Implementation:**
-  1. Compute `currentGameDuration` from real elapsed broadcast duration (`(session.videoDurationSeconds || 0) - (lastGame.startTimeOffset || 0)`).
-  2. Compute the actual average chunk duration for the session (`avgDur = session.chunksDownloaded > 0 && session.videoDurationSeconds ? (session.videoDurationSeconds - (session.initialJoinOffsetSec || 0)) / session.chunksDownloaded : 2.0`) to determine `chunksElapsed = Math.round(cutSec / avgDur)`, and set `spliceTimeOffset = (lastGame.startTimeOffset || 0) + cutSec` and `startTimeMs = lastGame.startTimeMs + (cutSec * 1000)`.
+- **Resolution Applied:** Computed `currentGameDuration` from `(session.videoDurationSeconds || 0) - (lastGame.startTimeOffset || 0)`, derived `avgDur` from real accumulated session duration, and set `spliceTimeOffset = (lastGame.startTimeOffset || 0) + cutSec` and `startTimeMs = (lastGame.startTimeMs || Date.now()) + (cutSec * 1000)`.
 
 ### Domain 2B: Presentation Timeline Anchoring in Video & Chat Slicing (`src/services/download.ts`, `src/services/video.ts`)
 
-#### 2.4 Anchor Initial Live Duration to Broadcast Join Offset (`pollPlaylist`)
-- **Location:** `src/services/download.ts` (`pollPlaylist`, lines 1166–1179) & `src/types.ts` (`ActiveDownloadSession`)
-- **Failure Mode:** When `session.chunksDownloaded === 0`, line 1168 sets `session.videoDurationSeconds = seqNum * 2` and `firstGame.startTimeOffset = seqNum * 2`. If Twitch's `EXT-X-MEDIA-SEQUENCE` starts at a non-zero number on a newly started stream or resets after an ingest blip, `seqNum * 2` corrupts the session's duration and timeline offset.
+#### 2.4 [COMPLETED in `v4.8.6`] Anchor Initial Live Duration to Broadcast Join Offset (`pollPlaylist`)
+- **Status:** ✅ Completed in `v4.8.6`.
+- **Location:** `src/services/download.ts` (`pollPlaylist`), `src/types.ts` (`ActiveDownloadSession`, `ActiveTask`), `src/services/state.ts` (`getSerializableSessions`)
+- **Failure Mode:** When `session.chunksDownloaded === 0`, `pollPlaylist` set `session.videoDurationSeconds = seqNum * 2` and `firstGame.startTimeOffset = seqNum * 2`. If Twitch's `EXT-X-MEDIA-SEQUENCE` started at a non-zero number on a newly started stream or reset after an ingest blip, `seqNum * 2` corrupted the session's duration and timeline offset.
 - **Compliance:** Upholds `AGENTS.md` Rule 6 & Rule 9.
-- **Implementation:**
-  1. Add `initialJoinOffsetSec?: number` to `ActiveDownloadSession` (and persist it in `state.ts` `getSerializableSessions()`).
-  2. When the first live chunk is downloaded (`session.chunksDownloaded === 0`):
-     - Compute `elapsedSinceBroadcastStartSec = Math.max(0, (Date.now() - (session.streamCreatedAtMs || Date.now())) / 1000)`.
-     - If joining at stream launch (`elapsedSinceBroadcastStartSec < 60`), set `session.initialJoinOffsetSec = 0`. Otherwise (joining mid-stream), set `session.initialJoinOffsetSec = Math.max(0, elapsedSinceBroadcastStartSec - (segments.length * (seg.duration || 2)))`.
-     - Initialize `session.firstSeqNum = seqNum`, `session.videoDurationSeconds = session.initialJoinOffsetSec`, and `firstGame.startTimeOffset = session.initialJoinOffsetSec`.
+- **Resolution Applied:** Computed `initialJoinOffsetSec` from `(Date.now() - streamCreatedAtMs) / 1000` minus the active playlist window (`0s` when joining within 60s of broadcast start), persisted `initialJoinOffsetSec` and `firstSeqNum` in `state.ts`, and propagated timeline anchors (`initialJoinOffsetSec`, `firstSeqNum`, `streamCreatedAtMs`, `gapAdjustments`) onto mid-stream, custom, and finalization export tasks.
 
-#### 2.5 Replace Faulty `firstChunkInVideo * avgChunkDur` in Game 1, Custom Clips, Extensions, and Gap Adjustments (`src/services/video.ts`)
-- **Location:** `src/services/video.ts` (lines 920–944 for Custom Exports; lines 1121–1166 for Game Slicing)
-- **Failure Mode:**
-  1. **Game 1 (`i === 0`, line 1131 & 1140):** Uses `videoStartOffset = Math.max(0, firstChunkInVideo * avgChunkDur)`, which assumes `seq_00000000.ts` is `0.0s` of the broadcast and multiplies raw HLS sequence numbers.
-  2. **Custom Exports (`append_previous` / `extract_clip`, line 924):** Also uses `videoStartOffset = Math.max(0, firstChunkInVideo * avgChunkDur)`, ignoring `firstSeqNum`, `initialJoinOffsetSec`, and real `game.startTimeMs` anchors!
-  3. **Gap Adjustments (lines 933 & 1155):** Uses `gapOffsetSec = gap.atChunk * avgChunkDur` instead of anchoring relative to `firstSeqNum` and `initialJoinOffsetSec`.
+#### 2.5 [COMPLETED in `v4.8.6`] Replace Faulty `firstChunkInVideo * avgChunkDur` in Game 1, Custom Clips, Extensions, and Gap Adjustments (`src/services/video.ts`)
+- **Status:** ✅ Completed in `v4.8.6`.
+- **Location:** `src/services/video.ts` (Custom Exports & Game Slicing)
+- **Failure Mode:** Game 1 (`i === 0`), Custom Exports (`append_previous` / `extract_clip`), and Gap Adjustments multiplied raw HLS sequence numbers (`firstChunkInVideo * avgChunkDur` and `gap.atChunk * avgChunkDur`) instead of anchoring to `initialJoinOffsetSec`, `firstSeqNum`, and `game.startTimeMs`.
 - **Compliance:** Directly enforces reconciled `AGENTS.md` Rule 6 & Rule 9.
-- **Implementation:**
-  1. Define a unified helper in `src/services/video.ts` to compute the true broadcast presentation offset for any chunk index `chunkIdx`:
-     - Base anchor: `const baseOffsetSec = session?.initialJoinOffsetSec ?? 0;` and `const baseSeq = session?.firstSeqNum ?? getChunkIndex(activeChunkList[0]) ?? 0;`.
-     - For **Game 1 (`i === 0`)**: `videoStartOffset = Math.max(0, baseOffsetSec + Math.max(0, firstChunkInVideo - baseSeq) * avgChunkDur)`. (When recording from stream start and `firstChunkInVideo === baseSeq`, `videoStartOffset` is `0s`; when joining mid-stream, it equals `initialJoinOffsetSec`).
-     - For **Subsequent Games (`i > 0`)**: Keep the `broadcastStartMs` presentation time anchor `gameSwitchOffsetSec = (game.startTimeMs - broadcastStartMs) / 1000` adjusted by `(firstChunkInVideo - game.startChunk) * avgChunkDur`.
-     - For **Custom Exports (`append_previous` / `extract_clip`)**: Anchor to the active/target game's real presentation timestamp (`(targetGame.startTimeMs - broadcastStartMs) / 1000 + (firstChunkInVideo - targetGame.startChunk) * avgChunkDur`) when available, falling back to `baseOffsetSec + Math.max(0, firstChunkInVideo - baseSeq) * avgChunkDur`.
-     - For **Gap Adjustments**: Compute `gapOffsetSec = baseOffsetSec + Math.max(0, gap.atChunk - baseSeq) * avgChunkDur`.
+- **Resolution Applied:** Anchored Game 1 and fallback offsets to `baseOffsetSec + Math.max(0, firstChunkInVideo - baseSeq) * avgChunkDur`, anchored custom exports to `targetGame.startTimeMs` / `targetGame.startTimeOffset` + `(firstChunkInVideo - targetGame.startChunk) * avgChunkDur`, and anchored gap adjustments to `baseOffsetSec + Math.max(0, gap.atChunk - baseSeq) * avgChunkDur`.
 
 ---
 
-## Phase 3: External API Resilience, Query Hardening & Persistence Safety *(Priority: P2 — Major)*
+## Phase 3: External API Resilience, Query Hardening & Persistence Safety *(Priority: P2 — Major)* — ✅ COMPLETED (`v4.8.6`)
 
 **Objective:** Harden all external network boundaries (Twitch GraphQL, Twitch CDN, BTTV/FFZ/7TV APIs) against hangs, injection, and transient blips, and eliminate dropped state writes during concurrent `state.json` saves.
 
 ### Domain 3A: Twitch GQL, CDN & Emote Network Hardening (`src/services/state.ts`, `src/services/twitch.ts`, `src/services/emotes.ts`, `src/services/chat.ts`, `src/services/download.ts`)
 
-#### 3.1 Strict Channel Handle Sanitization & Parameterized GraphQL Queries
-- **Location:** `src/services/state.ts` (`cleanChannelName`), `src/services/twitch.ts` (`fetchChannelStreamStatus`, `checkChannelStreamId`, `fetchRecentVods`), `src/services/chat.ts` (`downloadVodChat`)
-- **Note on `v4.8.4` Reconciliation:** `src/services/twitch.ts` routes all GraphQL calls through `postTwitchGql(payload, timeoutMs)` (which automatically handles HTTP 401/403 expired OAuth fallback to unauthenticated headers). Keep `postTwitchGql` as the transport wrapper and pass `variables` inside `payload`.
-- **Failure Mode:** `cleanChannelName` strips URL prefixes but allows quotes or special characters that are interpolated directly into GraphQL query strings (`query { user(login: "${channelLogin}") ... }`).
-- **Implementation:**
-  1. Harden `cleanChannelName` in `src/services/state.ts` (and `cleanChannel` in `src/App.tsx`) with `.replace(/[^a-z0-9_]/g, '')` so only valid Twitch login handles can ever enter application state.
-  2. Refactor `fetchChannelStreamStatus`, `checkChannelStreamId`, `fetchRecentVods` (via `postTwitchGql`), and `downloadVodChat` to pass `login`, `vodId`, `count`, `cursor`, and `offset` via GraphQL `variables` objects rather than string interpolation.
+#### 3.1 [COMPLETED in `v4.8.6`] Strict Channel Handle Sanitization & Parameterized GraphQL Queries
+- **Status:** ✅ Completed in `v4.8.6`.
+- **Location:** `src/services/state.ts` (`cleanChannelName`), `src/App.tsx` (`cleanChannel`), `src/services/twitch.ts` (`fetchChannelStreamStatus`, `checkChannelStreamId`, `fetchRecentVods`), `src/services/chat.ts` (`downloadVodChat`)
+- **Resolution Applied:** Added `.replace(/[^a-z0-9_]/g, '')` to `cleanChannelName` (`state.ts`) and `cleanChannel` (`App.tsx`), and converted `fetchChannelStreamStatus`, `checkChannelStreamId`, `fetchRecentVods`, and `downloadVodChat` (now routed through `postTwitchGql` for automatic HTTP 401/403 OAuth fallback) to pass GraphQL `variables` instead of string interpolation.
 
-#### 3.2 Enforce 5-Second Request Timeouts on 3rd-Party Emote Providers
-- **Location:** `src/services/emotes.ts` (`fetchThirdPartyEmotes`, lines 21–28)
-- **Failure Mode:** Six `axios.get` calls to BetterTTV, FrankerFaceZ, and 7TV have no timeout configured. Because `startLiveChatDownload` awaits `fetchThirdPartyEmotes` before writing the chat header or opening the IRC WebSocket, an unresponsive emote server stalls chat recording indefinitely.
-- **Implementation:**
-  1. Pass `{ timeout: 5000 }` to all six `axios.get` calls in `src/services/emotes.ts`.
+#### 3.2 [COMPLETED in `v4.8.6`] Enforce 5-Second Request Timeouts on 3rd-Party Emote Providers
+- **Status:** ✅ Completed in `v4.8.6`.
+- **Location:** `src/services/emotes.ts` (`fetchThirdPartyEmotes`)
+- **Resolution Applied:** Added `{ timeout: 5000 }` to all six `axios.get` calls for BetterTTV, FrankerFaceZ, and 7TV.
 
-#### 3.3 Cap Consecutive Network Retries in `downloadVodChat`
-- **Location:** `src/services/chat.ts` (`downloadVodChat`, lines 225–240)
-- **Failure Mode:** On persistent network errors or deleted VODs, the `catch` block increments `contentOffset` by 1–10s and loops indefinitely (3,600+ retries for a 10h VOD).
-- **Implementation:**
-  1. Track `consecutiveNetworkErrors` (resetting to `0` on any successful GQL response).
-  2. If `consecutiveNetworkErrors >= 10` or `(videoLength > 0 && contentOffset >= videoLength)`, log a clear warning and break out of the pagination loop cleanly.
+#### 3.3 [COMPLETED in `v4.8.6`] Cap Consecutive Network Retries in `downloadVodChat`
+- **Status:** ✅ Completed in `v4.8.6`.
+- **Location:** `src/services/chat.ts` (`downloadVodChat`)
+- **Resolution Applied:** Added `consecutiveNetworkErrors` counter (reset to `0` on success) that cleanly exits the pagination loop if `consecutiveNetworkErrors >= 10` or `contentOffset >= videoLength`.
 
-#### 3.4 Transient Retry Helper for `.ts` Segment Downloads & Stalled Session Recovery
-- **Location:** `src/services/download.ts` (`checkStreamStatus` lines 291–303, `pollPlaylist` lines 1081 & 1151, `backfillVod` line 1863)
-- **Failure Mode:**
-  1. Single-shot `axios.get` calls for `.ts` segments drop 2s video chunks permanently on any momentary CDN edge timeout or HTTP 503.
-  2. In `checkStreamStatus`, `if (isStalled)` calls `refreshMediaPlaylist(channelLogin).then(...)` without `await` or `.catch()`, risking duplicate timers or unhandled rejections.
-- **Implementation:**
-  1. Introduce `downloadSegmentWithRetry(url, timeoutMs, retries = 2)` in `src/services/download.ts` with a 500ms backoff on timeout/5xx errors.
-  2. In `checkStreamStatus` (`if (isStalled)`), `await refreshMediaPlaylist(channelLogin)` and verify `!activeSession.playlistPollInterval && !activeSession.isStopped` before scheduling `pollPlaylist`.
+#### 3.4 [COMPLETED in `v4.8.6`] Transient Retry Helper for `.ts` Segment Downloads & Stalled Session Recovery
+- **Status:** ✅ Completed in `v4.8.6`.
+- **Location:** `src/services/download.ts` (`downloadSegmentWithRetry`, `checkStreamStatus`, `pollPlaylist`, `backfillVod`)
+- **Resolution Applied:** Implemented `downloadSegmentWithRetry(url, timeoutMs, retries = 2)` with linear backoff on transient/5xx/timeout errors across live polling, missing-segment recovery, and VOD backfill, and awaited `refreshMediaPlaylist` with `.catch()` and `!activeSession.playlistPollInterval && !activeSession.isStopped` guards on stalled-session recovery.
 
 ### Domain 3B: State Persistence Concurrency (`src/services/state.ts`)
 
-#### 3.5 Queue Follow-Up Save When `executeStateSave` Is Already Active
-- **Location:** `src/services/state.ts` (`executeStateSave` & `scheduleStateSave`, lines 375–410)
-- **Failure Mode:** If `executeStateSave()` is called while an async write to `state.json.tmp` is in flight (`isSavingState === true`), it returns immediately and drops the newer state mutation.
-- **Implementation:**
-  1. Add `let pendingStateSave = false;`.
-  2. If `isSavingState` is true when `executeStateSave()` is invoked, set `pendingStateSave = true; return;`.
-  3. In `.finally()`, set `isSavingState = false;` and if `pendingStateSave` is true, reset `pendingStateSave = false;` and invoke `executeStateSave()`.
+#### 3.5 [COMPLETED in `v4.8.6`] Queue Follow-Up Save When `executeStateSave` Is Already Active
+- **Status:** ✅ Completed in `v4.8.6`.
+- **Location:** `src/services/state.ts` (`executeStateSave`)
+- **Resolution Applied:** Added `pendingStateSave` flag so state mutations occurring while an async `state.json.tmp` write is in flight automatically trigger a follow-up `executeStateSave()` upon completion.
 
 ---
 
-## Phase 4: Core Workflow Unblocking & State Ergonomics *(Priority: P2.5 — High Friction UX)*
+## Phase 4: Core Workflow Unblocking & State Ergonomics *(Priority: P2.5 — High Friction UX)* — ✅ COMPLETED (`v4.8.7`)
 
 **Objective:** Eliminate broken user journeys, dead-end completion cards, silent form resets, phantom `@channel1`/`@channel2` onboarding traps, and unexposed backend recovery routes identified in the UX Systems Audit.
 
-### Domain 4A: Post-Recording Actions & Dead-End Elimination (`src/App.tsx`, `src/services/download.ts`)
+### Domain 4A: Post-Recording Actions & Dead-End Elimination (`src/App.tsx`, `src/services/download.ts`, `src/services/chat.ts`)
 
-#### 4.1 [UX-B3] Restore `"Open Folder"` Action on Completed Tasks, Stream Cards & Settings
-- **Location:** `src/App.tsx` (`handleOpenFolder` line 246, `handleTaskAction` line 420, Task Queue Action Filter line 1212) & `src/services/download.ts` (`triggerMidStreamGameExport` line 1297, `manualSpliceGame` lines 1406 & 1473, `backfillVod` line 1911, `handleStitchComplete` line 1941)
-- **Failure Mode:** `handleOpenFolder` is implemented in `src/App.tsx` (calling `POST /api/open-folder` and copying the path to clipboard) but is dead code: `handleTaskAction` returns early on `'open_folder'`, and line 1212 filters `'open_folder'` out of task buttons. Users have no one-click way to access their exported `.mp4` and `.json` files.
-- **Implementation:**
-  1. In `handleTaskAction` (`src/App.tsx:420`), invoke `const task = status?.activeTasks.find(t => t.id === taskId); handleOpenFolder(task?.folderPath); return;`.
-  2. Remove `.filter(a => a.value !== 'open_folder')` from `src/App.tsx:1212`.
-  3. Include `{ label: "Open Folder", value: "open_folder" }` on completed task cards in `download.ts` (`handleStitchComplete`, `backfillVod`, `triggerMidStreamGameExport`, `manualSpliceGame`) and `chat.ts` (`startChatRenderMultiple`, `downloadVodChat`).
-  4. Add an `"Open Folder"` icon button on active/offline Stream Cards (`handleOpenFolder(activeSession?.folderPath)`) and beside the `Save Path` input in `Settings -> General`.
+#### 4.1 [COMPLETED in `v4.8.7` — UX-B3] Restore `"Open Folder"` Action on Completed Tasks, Stream Cards & Settings
+- **Status:** ✅ Completed in `v4.8.7`.
+- **Location:** `src/App.tsx`, `src/services/download.ts`, `src/services/chat.ts`, `src/routes/api.ts`
+- **Resolution Applied:** Wired `'open_folder'` in `handleTaskAction` to `handleOpenFolder(task?.folderPath)`, removed the `.filter(a => a.value !== 'open_folder')` filter on task buttons, added `{ label: "Open Folder", value: "open_folder" }` to completed video/chat/recovery tasks, and added one-click `"Open Folder"` buttons on Stream Cards, the dashboard header, and beside `Save Path` in `Settings -> General`.
 
-#### 4.2 [UX-B4] Add `"Render Chat"` Action to Completed Standalone VOD Backfill Task Cards
-- **Location:** `src/services/download.ts` (`backfillVod`, lines 1910–1915)
-- **Failure Mode:** When a standalone VOD backfill finishes (`stitch_vod_...`) and auto-render is disabled, the task card only offers `[{ label: "Close", value: "dismiss" }]`. Unlike live broadcasts, there is no `"Render Chat"` button on the card, forcing the user to manually copy-paste the file path into `Settings -> Chat Render -> Manual Render`.
-- **Implementation:**
-  1. In `backfillVod` (`src/services/download.ts:1911`), update the completion actions to include `{ label: "Render Chat", value: "render_chat" }` and `{ label: "Open Folder", value: "open_folder" }` alongside `{ label: "Close", value: "dismiss" }`.
+#### 4.2 [COMPLETED in `v4.8.7` — UX-B4] Add `"Render Chat"` Action to Completed Standalone VOD Backfill Task Cards
+- **Status:** ✅ Completed in `v4.8.7`.
+- **Location:** `src/services/download.ts` (`backfillVod`)
+- **Resolution Applied:** Added `{ label: "Render Chat", value: "render_chat" }` and `{ label: "Open Folder", value: "open_folder" }` to completed standalone VOD backfill task cards (`stitch_vod_...`).
 
-#### 4.3 [UX-H3 & UX-H4] Guard `Render Chat Video` Modal & Clarify `"Download VOD Chat"` Action
-- **Location:** `src/App.tsx` (`handleTaskAction` lines 424–454, `submitRenderChat` lines 557–579, `renderDialog` modal lines 1289–1388) & `src/services/download.ts` (`handleStitchComplete` line 1941)
-- **Failure Mode:**
-  1. Unchecking all files in `Render Chat Video` and clicking `"Start Render"` silently closes the modal without starting a render or showing a message (`src/App.tsx:561`), and API errors during submission are swallowed in `console.error`.
-  2. `Broadcast Complete` cards display `"Download VOD Chat"` with equal prominence to `"Render Chat"`, misleading users into downloading redundant un-sliced `vod_chat.json` files on top of their already-sliced live game chats.
-- **Implementation:**
-  1. In `renderDialog` (`src/App.tsx`), disable the `"Start Render"` button when `renderDialog.files && renderDialog.files.filter(f => f.enabled !== false).length === 0`, and surface errors via `toastMessage`.
-  2. In `handleStitchComplete` (`src/services/download.ts:1941`), place `{ label: "Render Chat", value: "render_chat" }` and `{ label: "Open Folder", value: "open_folder" }` first, and relabel `download_vod_chat` to `"Re-fetch VOD Chat"` (or only show it if `sessionData.commentsWritten === 0`).
+#### 4.3 [COMPLETED in `v4.8.7` — UX-H3 & UX-H4] Guard `Render Chat Video` Modal & Clarify `"Download VOD Chat"` Action
+- **Status:** ✅ Completed in `v4.8.7`.
+- **Location:** `src/App.tsx` (`submitRenderChat`, `renderDialog`) & `src/services/download.ts` (`handleStitchComplete`)
+- **Resolution Applied:** Disabled `"Start Render"` when 0 files are checked, surfaced submission errors via non-blocking toast notifications, placed `"Render Chat"` and `"Open Folder"` first on `Broadcast Complete` task cards, and relabeled `download_vod_chat` to `"Re-fetch VOD Chat"`.
 
 ### Domain 4B: Onboarding, Settings Dirty-State Protection & Recovery Surfacing (`src/App.tsx`, `src/routes/api.ts`)
 
-#### 4.4 [UX-B2] Settings Dirty-State Protection & Sync Isolation
-- **Location:** `src/App.tsx` (`Settings` tab, lines 41, 169–206, 526–555, 661–674)
-- **Failure Mode:** Editing inputs in `Settings` mutates the top-level `config` state directly without saving to disk until `Save Configuration` is clicked. Switching tabs loses track of unsaved edits, and toggling `Auto-render chat` on the Dashboard overwrites `config` from the server response (`setConfig(res.data.config)`), wiping out unsaved Settings changes.
-- **Implementation:**
-  1. Track `isConfigDirty` in `src/App.tsx` whenever the user modifies any field in the Settings form (resetting `isConfigDirty = false` on `handleSaveConfig` or `fetchConfig`).
-  2. Display a sticky or inline `"Unsaved changes"` indicator next to `Save Configuration` (with a `"Discard Changes"` button that calls `fetchConfig()`), and prompt for confirmation if the user attempts to switch `activeTab` while `isConfigDirty` is true.
+#### 4.4 [COMPLETED in `v4.8.7` — UX-B2] Settings Dirty-State Protection & Sync Isolation
+- **Status:** ✅ Completed in `v4.8.7`.
+- **Location:** `src/App.tsx`
+- **Resolution Applied:** Added `isConfigDirty` tracking (`updateDraftConfig`), prevented `toggleAutoRender` from overwriting unsaved Settings edits, added an inline `"Unsaved changes"` badge with a `"Discard"` button in the Settings footer, and added a confirmation modal (`Stay Here` / `Discard & Leave` / `Save & Leave`) when navigating away from Settings with unsaved changes.
 
-#### 4.5 [UX-H1] Replace Phantom `@channel1` / `@channel2` Cards with True Empty Slot UI
-- **Location:** `src/App.tsx` (`channelsToDisplay` memo, lines 620–636; Stream Card list, lines 753–915)
-- **Failure Mode:** When `config.channels` has 0 or 1 channel, `channelsToDisplay` pads the array with literal `"channel1"` and `"channel2"`. Users can click `Start` on `@channel1`, causing the server to poll Twitch GQL for a literal user named `channel1`, and 1-channel users cannot clear Slot 2.
-- **Implementation:**
-  1. Change `channelsToDisplay` to represent two explicit slots (`[configured[0] || null, configured[1] || null]`, plus any orphaned active sessions).
-  2. When a slot is `null` (unconfigured), render a dedicated **"Empty Stream Slot — Click to Add Channel"** card with an inline handle input and a disabled `Start` button until a valid Twitch username is saved.
-  3. When a slot is configured and paused (`!isRunning`), provide a subtle `"Remove / Clear Slot"` (`X` or `Trash2`) button next to the inline edit pencil so a user monitoring 2 channels can easily drop back to 1.
+#### 4.5 [COMPLETED in `v4.8.7` — UX-H1] Replace Phantom `@channel1` / `@channel2` Cards with True Empty Slot UI
+- **Status:** ✅ Completed in `v4.8.7`.
+- **Location:** `src/App.tsx` (`channelsToDisplay`, `commitChannelName`, `clearChannelSlot`)
+- **Resolution Applied:** Replaced literal `"channel1"`/`"channel2"` padding with explicit `[configured[0] || null, configured[1] || null]` slots, rendered a dedicated **"Unassigned Stream Slot"** card with inline handle assignment when a slot is empty, and added a `"Clear Slot"` (`Trash2`) button next to paused channel handles.
 
-#### 4.6 [UX-H2] Expose Folder Video Recovery (`/api/recover-folder-video`) & Folder/File Picker in UI
-- **Location:** `src/routes/api.ts` (`/api/recover-folder-video`, line 364) & `src/App.tsx` (`Livestream Monitor` header & `Manual Render Modal`, line 2031)
-- **Failure Mode:**
-  1. `POST /api/recover-folder-video` is implemented on the backend to stitch uncompiled `.ts` chunks in any session folder, but has zero UI triggers in `src/App.tsx`.
-  2. `Manual Chat Render` is buried at the bottom of `Settings -> Chat Render` and requires manually typing file paths.
-- **Implementation:**
-  1. Add `GET /api/recent-folders` in `src/routes/api.ts` that scans `getResolvedSavePath()` (1 level deep) and returns recent session folders along with their `.json` chat files and raw `.ts` chunk counts.
-  2. Add quick-action buttons on the `Livestream Monitor` dashboard header for **"Manual Chat Render"** and **"Recover Folder Video"**, and populate both modals with a dropdown selector powered by `GET /api/recent-folders` (while retaining manual path input as an option).
+#### 4.6 [COMPLETED in `v4.8.7` — UX-H2] Expose Folder Video Recovery (`/api/recover-folder-video`) & Folder/File Picker in UI
+- **Status:** ✅ Completed in `v4.8.7`.
+- **Location:** `src/routes/api.ts` (`GET /api/recent-folders`) & `src/App.tsx` (`Recover Folder Video` & `Manual Chat Render` modals)
+- **Resolution Applied:** Added `GET /api/recent-folders` scanning `getResolvedSavePath()` for recent session folders, `.json` chat files, and raw `.ts` chunk counts; added `"Recover Folder Video"` and `"Manual Chat Render"` quick-action buttons on the `Livestream Monitor` header; and populated both modals with recent session/file dropdowns.
 
 ---
 
-## Phase 5: Frontend UX Polish, Code Hygiene & Version Sync *(Priority: P3 — Minor / Polish)*
+## Phase 5: Frontend UX Polish, Code Hygiene & Version Sync *(Priority: P3 — Minor / Polish)* — ✅ COMPLETED (`v4.8.7`)
 
 **Objective:** Fix the hardcoded toast header, replace blocking `window.alert()` calls, reset modal state on open, add log filtering and OAuth visibility ergonomics, unify configuration fallbacks, clean up dead code, and synchronize the application version badge per `AGENTS.md` Rule 2.
 
 ### Domain 5A: Non-Blocking Feedback, Modals & Log Ergonomics (`src/App.tsx`, `src/routes/api.ts`)
 
-#### 5.1 [UX-P1] Fix Global Toast Banner Icon/Title & Replace Blocking `window.alert()` Calls
-- **Location:** `src/App.tsx` (lines 49, 216, 219, 288, 306, 381, 385, and Toast Banner lines 1815–1839)
-- **Failure Mode:**
-  1. Six error paths invoke `alert(...)`, which blocks the main browser thread and fails inside embedded/headless webviews.
-  2. The `toastMessage` banner at `src/App.tsx:1825–1827` hardcodes `<Folder />` and `<p>File Manager</p>` even when displaying error or success messages.
-- **Implementation:**
-  1. Update the global `toastMessage` banner to dynamically render `AlertTriangle` / `"Error"` for `type === 'error'`, `CheckCircle2` / `"Success"` for `type === 'success'`, and `Folder` / `"Notice"` for `type === 'info'` (with optional `title` override).
-  2. Introduce a `showToast(text, type, title?)` helper with a 4-second auto-dismiss timer and replace all 6 `alert(...)` calls in `src/App.tsx`.
-  3. Remove unused `isTogglingMonitoring` state declaration (line 49).
+#### 5.1 [COMPLETED in `v4.8.7` — UX-P1] Fix Global Toast Banner Icon/Title & Replace Blocking `window.alert()` Calls
+- **Status:** ✅ Completed in `v4.8.7`.
+- **Location:** `src/App.tsx`
+- **Resolution Applied:** Added `showToast(text, type, title)` with a managed ref timer, replaced all 6 `alert(...)` calls with non-blocking toast notifications, updated the toast banner to render context-specific icons (`AlertTriangle`, `CheckCircle2`, `Folder`) and titles, and removed unused `isTogglingMonitoring` state.
 
-#### 5.2 [UX-P2] Reset Manual Video Splice Modal State on Open
-- **Location:** `src/App.tsx` (lines 228–230, 1017, 2213–2270)
-- **Failure Mode:** `spliceAction` persists across modal opens. If a user selects `'append_previous'` on a multi-game stream and later opens the modal on a stream that is on Game 1 (`hasPrevious === false`), the radio button is disabled but `spliceAction` remains `'append_previous'`, causing `"Execute Splice"` to submit a forbidden action.
-- **Implementation:**
-  1. When opening the Manual Splice modal (`onClick` at line 1017), reset `setSpliceAction('split_new_part')` (or `'extract_clip'`) so a disabled radio option is never pre-selected.
+#### 5.2 [COMPLETED in `v4.8.7` — UX-P2] Reset Manual Video Splice Modal State on Open
+- **Status:** ✅ Completed in `v4.8.7`.
+- **Location:** `src/App.tsx`
+- **Resolution Applied:** Reset `setSpliceAction('split_new_part')` whenever opening the Manual Splice modal so a disabled radio option (`append_previous` on Game 1) is never pre-selected.
 
-#### 5.3 [UX-P3, UX-P4 & UX-P5] System Log Filter Bar, OAuth Show/Hide Toggle & Danger Zone Separation
-- **Location:** `src/App.tsx` (`Settings -> General` lines 420–430, `Settings` footer lines 1928–1949, `System Log` tab lines 1973–2027)
-- **Implementation:**
-  1. **System Log Filtering (`UX-P3`):** Add a search input (`logSearchQuery`) and category filter pills (`All`, `Errors & Warnings`, `Video & Stitch`, `Chat & Render`) above the log viewer, plus semantic color highlighting for `[Error]`/`CRITICAL` (red) and `[Warning]` (amber) lines.
-  2. **OAuth Token Ergonomics (`UX-P4`):** Add a Show/Hide password toggle button on the `Browser OAuth Token` input and update its placeholder to reflect the raw 30-character alphanumeric cookie value.
-  3. **Danger Zone Separation (`UX-P5`):** Move the `Reboot Program` button out of the `Save Configuration` form footer into a clearly labeled `"Emergency Reset"` section so users never mistake it for a "Restart to apply settings" button.
+#### 5.3 [COMPLETED in `v4.8.7` — UX-P3, UX-P4 & UX-P5] System Log Filter Bar, OAuth Show/Hide Toggle & Danger Zone Separation
+- **Status:** ✅ Completed in `v4.8.7`.
+- **Location:** `src/App.tsx`
+- **Resolution Applied:** Added keyword search and category filter pills (`All Events`, `Errors & Warnings`, `Video & Stitch`, `Chat & Render`) with semantic red/amber highlighting in `System Log`; added an `Eye`/`EyeOff` show/hide toggle and accurate 30-char `auth-token` placeholder on `Browser OAuth Token`; and moved `"Reboot Program"` into a separated `"Emergency Reset"` danger zone card.
 
-#### 5.4 Unify `gameSwitchBufferMins` Fallback in `/api/status`
+#### 5.4 [COMPLETED in `v4.8.7`] Unify `gameSwitchBufferMins` Fallback in `/api/status`
+- **Status:** ✅ Completed in `v4.8.7`.
 - **Location:** `src/routes/api.ts` (line 260)
-- **Failure Mode:** `pendingGameSwitch` falls back to `6` minutes (`gameSwitchBufferMins ?? gameSegmentBufferMinutes ?? 6`), whereas `state.ts`, `download.ts`, `video.ts`, and `App.tsx` all default to `5` minutes.
-- **Implementation:**
-  1. Change the fallback on line 260 of `src/routes/api.ts` to `5` minutes (`state.config.gameSwitchBufferMins ?? 5`).
+- **Resolution Applied:** Standardized the `pendingGameSwitch` buffer fallback to `5` minutes across all backend and frontend modules.
 
-### Domain 5B: Dead Code Cleanup & Version Synchronization (`server.ts`, `src/routes/api.ts`, `package.json`, `src/App.tsx`)
+### Domain 5B: Dead Code Cleanup & Version Synchronization (`server.ts`, `src/routes/api.ts`, `src/services/*.ts`, `package.json`, `src/App.tsx`)
 
-#### 5.5 Remove Unused Imports and Dead Declarations
-- **Location:** `server.ts` (lines 6, 11, 32–33), `src/routes/api.ts` (lines 6–7)
-- **Implementation:**
-  1. Remove unused `fileURLToPath`, `__filename`, `__dirname`, and `checkStreamStatus` from `server.ts` (retaining `fs`, which is used by the `app.lock` single-instance mutex).
-  2. Remove unused `CONFIG_FILE`, `CONFIG_BAK_FILE`, `getMonitoringInterval`, `setMonitoringInterval`, and `finalizeLiveDownload` imports from `src/routes/api.ts`.
+#### 5.5 [COMPLETED in `v4.8.7` / `v4.9.0`] Remove Unused Imports and Dead Declarations
+- **Status:** ✅ Completed in `v4.9.0`.
+- **Location:** `server.ts`, `src/routes/api.ts`, `src/services/twitch.ts`, `src/services/chat.ts`, `src/services/download.ts`, `src/services/video.ts`
+- **Resolution Applied:** Removed unused `fileURLToPath`, `__filename`, `__dirname`, and `checkStreamStatus` from `server.ts`; removed unused `CONFIG_FILE`, `CONFIG_BAK_FILE`, `getMonitoringInterval`, `setMonitoringInterval`, and `finalizeLiveDownload` imports from `src/routes/api.ts`; removed unused `AxiosRequestConfig` from `src/services/twitch.ts`; removed unused `axios`, `Parser`, `getTwitchHeaders`, and `twitchAxios` from `src/services/chat.ts`; removed unused `getTwitchHeaders`, `downloadVodChat`, and shadowed `streamAgeMs`/`wasAlreadyLive` declarations from `src/services/download.ts`; and removed unused local variables (`runSucceeded`, `customStitchError`, `remainingVod`) from `src/services/video.ts`.
 
-#### 5.6 Synchronized Version Increment (`AGENTS.md` Rule 2)
-- **Location:** `package.json` (line 4) & `src/App.tsx` (line 656)
-- **Compliance:** Upholds `AGENTS.md` Rule 2.
-- **Implementation:**
-  1. Increment version from `4.8.4` to `4.8.5` (or `4.9.0` for the unified technical + UX release) in both `package.json` and the top-left header badge in `src/App.tsx`.
+#### 5.6 [COMPLETED in `v4.9.0`] Synchronized Version Increment (`AGENTS.md` Rule 2)
+- **Status:** ✅ Completed in `v4.9.0`.
+- **Location:** `package.json`, `src/App.tsx`, `README.md`
+- **Resolution Applied:** Incremented minor release version to `v4.9.0` across `package.json`, the sidebar header badge in `src/App.tsx`, and `README.md`.
+
+---
+
+## Repository & GitHub Readiness (`v4.8.5` — ✅ COMPLETED)
+
+- [x] **Comprehensive `README.md`:** Documented features, architecture, prerequisites (`ffmpeg`, `TwitchDownloaderCLI`), Windows background service installation (`install.bat`/`uninstall.bat`), OAuth configuration, and output file schemas.
+- [x] **Hardened `.gitignore` & Tracked State Cleanup:** Added `config.json` (protecting `browserOAuthToken`), `state.json`, `app.lock`, `system.log.*`, `daemon/`, `TwitchDownloader/`, and `bin/` to `.gitignore`; removed tracked `state.json` from git; created `config.example.json`.
+- [x] **MIT License & CI Pipeline:** Added `LICENSE` and `.github/workflows/ci.yml` (`npm run lint` + `npm run build` on Node 20.x & 22.x).
+- [x] **`package.json` Hygiene:** Added `description`, `license`, and `engines` metadata, and removed the unused `@google/genai` dependency.
+
+---
+
+## Verification & Acceptance Checklist
+
+- [x] **Type-Checking & Build Verification (Phases 1–5):** `npm run lint` (`tsc --noEmit`) and `npm run build` pass with zero errors (`v4.9.0`).
+- [x] **Phase 1 Acceptance (`v4.8.5`):**
+  - [x] Mid-stream resumption ("VOD Backfill Current Game") preserves the original `currentGame.startTimeOffset` when computing backfill range (`1.1`).
+  - [x] CMAF 10s VOD chunks and standard 2s VOD chunks both compute accurate durations and never log `NaN` (`1.2`).
+  - [x] Initial mid-stream VOD Backfill prompt (`prompt_backfill_${streamId}`) auto-selects `"Skip Backfill (Record Live Only)"` after 60 seconds if unanswered so `liveChatBuffer` never freezes in RAM (`1.3`).
+  - [x] Stopping a stream (`POST /api/stop`, `POST /api/force-stitch`, `POST /api/config`) awaits `stopActiveDownload` completion before `triggerFinalizeFlow` slices or renders chat (`1.4`).
+  - [x] Recovery auto-backfill (`shouldAutoBackfill`) stores its promise on `session.activeChatBackfillPromise` and is awaited on shutdown (`1.5`).
+- [x] **Phase 2 Acceptance (`v4.8.6`):**
+  - [x] No remaining occurrences of `* 2` chunk duration assumptions or unanchored `firstChunkInVideo * avgChunkDur` in `src/services/download.ts` or `src/services/video.ts`.
+  - [x] Custom splice actions (`append_previous`, `extract_clip`) and Game 1 slicing align chat offsets to real broadcast presentation time (`initialJoinOffsetSec` + relative chunk delta).
+- [x] **Phase 3 Acceptance (`v4.8.6`):**
+  - [x] All external HTTP calls (Twitch GQL, CDN segments, BTTV, FFZ, 7TV) enforce request timeouts and bounded retries.
+  - [x] `scheduleStateSave` guarantees trailing state changes are persisted even if triggered while a previous disk write is in flight.
+- [x] **Phase 4 Acceptance (`v4.8.7`):**
+  - [x] Completed recording tasks, active stream cards, and Settings provide working `"Open Folder"` actions (`4.1`) and completed VOD Backfill tasks offer a direct `"Render Chat"` button (`4.2`).
+  - [x] Settings modifications use an isolated draft state with an unsaved-changes guard on tab navigation (`4.4`), and empty channel slots render a dedicated `"Unassigned Stream Slot"` state (`4.5`).
+  - [x] Folder Video Recovery (`POST /api/recover-folder-video`) and recent recording folder selection (`GET /api/recent-folders`) are accessible directly from the UI (`4.6`).
+- [x] **Phase 5 Acceptance (`v4.9.0`):**
+  - [x] Zero `window.alert()` calls remain in `src/App.tsx`, and the global toast banner displays context-appropriate icons and titles (`5.1`).
+  - [x] Manual Splice modal resets `spliceAction` on open (`5.2`), System Log supports search/severity filtering (`5.3`), and `package.json` + `src/App.tsx` + `README.md` versions match `v4.9.0` (`5.6`).

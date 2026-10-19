@@ -3,8 +3,8 @@ import fs from "fs";
 import path from "path";
 import checkDiskSpace from "check-disk-space";
 import { spawn, exec, execFile } from "child_process";
-import { state, addLog, updateTask, removeTask, scheduleStateSave, flushStateSync, CONFIG_FILE, CONFIG_BAK_FILE, LOG_FILE, LOG_ROTATED_FILE, cleanChannelName, PROJECT_ROOT, saveConfigAtomic, getResolvedSavePath, normalizeConfigSavePath } from "../services/state";
-import { stopActiveDownload, handleStitchComplete, startMonitoring, getMonitoringInterval, setMonitoringInterval, stopMonitoringTimer, backfillVod, finalizeLiveDownload, triggerFinalizeFlow, manualSpliceGame, overrideGameSwitchBuffer, formatTimestamp, executeResumeStitchGap, executeResumeVodBackfill, refreshMediaPlaylist } from "../services/download";
+import { state, addLog, updateTask, removeTask, scheduleStateSave, flushStateSync, LOG_FILE, LOG_ROTATED_FILE, cleanChannelName, PROJECT_ROOT, saveConfigAtomic, getResolvedSavePath, normalizeConfigSavePath } from "../services/state";
+import { stopActiveDownload, startMonitoring, stopMonitoringTimer, backfillVod, triggerFinalizeFlow, manualSpliceGame, overrideGameSwitchBuffer, formatTimestamp, executeResumeStitchGap, executeResumeVodBackfill, refreshMediaPlaylist } from "../services/download";
 import { stitchVideoChunks, abortAllFfmpegProcesses } from "../services/video";
 import { downloadVodChat, startChatRenderMultiple, startManualChatRender, resolveLiveChatBackfill, abortAllChatProcesses, abortChatProcess } from "../services/chat";
 
@@ -257,7 +257,7 @@ export function setupRoutes(app: express.Application) {
             for (let i = 0; i < games.length - 1; i++) {
               if (!games[i].isExported) {
                 const nextGame = games[i + 1];
-                const bufferRequired = ((state.config as any).gameSwitchBufferMins ?? (state.config as any).gameSegmentBufferMinutes ?? 6) * 60;
+                const bufferRequired = ((state.config as any).gameSwitchBufferMins ?? (state.config as any).gameSegmentBufferMinutes ?? 5) * 60;
                 const bufferElapsed = (session.videoDurationSeconds || 0) - nextGame.startTimeOffset;
                 const remaining = Math.max(0, Math.ceil(bufferRequired - bufferElapsed));
                 pendingGameSwitch = {
@@ -361,28 +361,98 @@ export function setupRoutes(app: express.Application) {
     res.json({ success: true });
   });
 
+  app.get("/api/recent-folders", async (req, res) => {
+    try {
+      const baseSavePath = getResolvedSavePath();
+      if (!fs.existsSync(baseSavePath)) {
+        return res.json({ baseSavePath, folders: [] });
+      }
+      const entries = await fs.promises.readdir(baseSavePath, { withFileTypes: true });
+      const dirEntries = entries.filter(e => e.isDirectory());
+
+      const folderSummaries = await Promise.all(
+        dirEntries.map(async (dir) => {
+          const fullPath = path.join(baseSavePath, dir.name);
+          try {
+            const stat = await fs.promises.stat(fullPath);
+            const files = await fs.promises.readdir(fullPath);
+            const chatFiles = files.filter(
+              f => f.endsWith(".json") && !f.startsWith("session_") && !f.includes("_backup_")
+            );
+            const liveChunkCount = files.filter(f => /^seq_(\d+)\.ts$/.test(f)).length;
+            const vodChunkCount = files.filter(f => /^vod_seq_(\d+)\.ts$/.test(f)).length;
+            const mp4Files = files.filter(f => f.endsWith(".mp4") && f !== "init.mp4" && f !== "vod_init.mp4");
+            return {
+              name: dir.name,
+              folderPath: fullPath,
+              updatedAt: stat.mtimeMs,
+              chatFiles,
+              liveChunkCount,
+              vodChunkCount,
+              mp4Files
+            };
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      const validFolders = folderSummaries
+        .filter((f): f is NonNullable<typeof f> => f !== null)
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, 30);
+
+      return res.json({ baseSavePath, folders: validFolders });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || "Failed to scan recent folders" });
+    }
+  });
+
   app.post("/api/recover-folder-video", async (req, res) => {
     try {
       const { folderPath } = req.body || {};
       if (!folderPath) {
         return res.status(400).json({ error: "folderPath is required" });
       }
-      const resolved = path.resolve(folderPath);
+      const baseSavePath = getResolvedSavePath();
+      let resolved = path.isAbsolute(folderPath)
+        ? path.normalize(folderPath)
+        : path.resolve(baseSavePath, folderPath);
       if (!fs.existsSync(resolved)) {
-        return res.status(404).json({ error: `Folder not found: ${resolved}` });
+        const rootCandidate = path.resolve(PROJECT_ROOT, folderPath);
+        if (fs.existsSync(rootCandidate)) {
+          resolved = rootCandidate;
+        } else {
+          return res.status(404).json({ error: `Folder not found: ${resolved}` });
+        }
       }
 
       addLog(`[Recovery] Triggered manual folder video recovery for: ${resolved}`);
       const taskId = `recovery_${Date.now()}`;
       updateTask(taskId, `Recovering Video (${path.basename(resolved)})`, "Scanning and stitching valid chunks...", "running");
+      if (state.activeTasks[taskId]) {
+        state.activeTasks[taskId].folderPath = resolved;
+      }
 
       stitchVideoChunks(resolved, 'all', taskId)
         .then((outputs) => {
-          updateTask(taskId, `Recovery Complete (${path.basename(resolved)})`, "Successfully stitched video segments.", "success", false, [{ label: "Dismiss", value: "dismiss" }]);
+          updateTask(taskId, `Recovery Complete (${path.basename(resolved)})`, "Successfully stitched video segments.", "success", false, [
+            { label: "Open Folder", value: "open_folder" },
+            { label: "Dismiss", value: "dismiss" }
+          ]);
+          if (state.activeTasks[taskId]) {
+            state.activeTasks[taskId].folderPath = resolved;
+          }
           addLog(`[Recovery] Manual recovery successful for ${resolved}. Outputs: ${outputs.join(', ')}`);
         })
         .catch((err) => {
-          updateTask(taskId, `Recovery Failed (${path.basename(resolved)})`, err.message, "error", true, [{ label: "Close", value: "dismiss" }]);
+          updateTask(taskId, `Recovery Failed (${path.basename(resolved)})`, err.message, "error", true, [
+            { label: "Open Folder", value: "open_folder" },
+            { label: "Close", value: "dismiss" }
+          ]);
+          if (state.activeTasks[taskId]) {
+            state.activeTasks[taskId].folderPath = resolved;
+          }
           addLog(`[Recovery Error] Manual video recovery failed for ${resolved}: ${err.message}`);
         });
 
@@ -553,7 +623,10 @@ export function setupRoutes(app: express.Application) {
         state.activeTasks[newTaskId].channelLogin = task.channelLogin;
       }
       stitchVideoChunks(task.folderPath, 'live', newTaskId).then(() => {
-        updateTask(newTaskId, "Stitching Video", "Stitching Complete.", "success", false, [{ label: "Close", value: "dismiss" }]);
+        updateTask(newTaskId, "Stitching Video", "Stitching Complete.", "success", false, [
+          { label: "Open Folder", value: "open_folder" },
+          { label: "Close", value: "dismiss" }
+        ]);
       }).catch(err => {
         addLog(`[Stitch] Unhandled error during retry stitch: ${err.message}`);
       });
