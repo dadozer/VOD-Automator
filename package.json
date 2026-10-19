@@ -1,0 +1,43 @@
+{
+  "name": "vod-automator",
+  "private": true,
+  "version": "4.8.5",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=dist/server.js",
+    "start": "node dist/server.js",
+    "preview": "vite preview",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^1.29.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "@vitejs/plugin-react": "^5.0.4",
+    "axios": "^1.16.0",
+    "check-disk-space": "^3.4.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "lucide-react": "^0.546.0",
+    "m3u8-parser": "^7.2.0",
+    "motion": "^12.23.24",
+    "node-windows": "^1.0.0-beta.8",
+    "postcss": "^8.5.14",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "@types/ws": "^8.18.1",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.28.2",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2",
+    "vite": "^8.0.8"
+  }
+}

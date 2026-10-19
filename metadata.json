@@ -1,0 +1,6 @@
+{
+  "name": "VOD Automator",
+  "description": "Monitors Twitch channels and automatically downloads live broadcasts in chunks to prevent loss of content due to muting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

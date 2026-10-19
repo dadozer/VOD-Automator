@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VOD Automator</title>
+    <meta name="description" content="Monitors Twitch channels and automatically downloads live broadcasts in chunks to prevent loss of content due to muting." />
+    <meta property="og:title" content="VOD Automator" />
+    <meta property="og:description" content="Monitors Twitch channels and automatically downloads live broadcasts in chunks to prevent loss of content due to muting." />
+    <script>
+      // Suppress harmless Vite HMR WebSocket connection errors in sandbox/proxy environments
+      window.addEventListener('unhandledrejection', function (e) {
+        if (e && e.reason && (
+          (e.reason.message && e.reason.message.includes('WebSocket')) ||
+          (e.reason.stack && e.reason.stack.includes('createWebSocketModuleRunnerTransport'))
+        )) {
+          e.preventDefault();
+        }
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

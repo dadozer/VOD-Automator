@@ -1,0 +1,6 @@
+{
+  "summary": "Implementation plan for Phase 4 (Storage Safety & Multi-Instance Mutex) of docs/STABILITY_RELIABILITY_PLAN.md, covering disk capacity pre-flight & runtime safety valve (< 5 GB warning, < 2 GB graceful finalization), single-instance atomic PID lock file (app.lock) in server.ts, and the /api/health diagnostic endpoint in src/routes/api.ts.",
+  "updatedAt": "2026-10-16T20:47:51.561525261Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

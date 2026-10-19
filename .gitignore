@@ -1,0 +1,12 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+system.log
+downloads/
+*.tmp
+*.bak
+.env*
+!.env.example
