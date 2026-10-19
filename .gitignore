@@ -5,8 +5,17 @@ coverage/
 .DS_Store
 *.log
 system.log
+system.log.*
 downloads/
 *.tmp
 *.bak
+config.json
+state.json
+app.lock
+daemon/
+TwitchDownloader/
+bin/
 .env*
 !.env.example
+!config.example.json
+
