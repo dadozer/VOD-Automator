@@ -124,6 +124,61 @@ export function setupRoutes(app: express.Application) {
     state.config = { ...state.config, ...req.body };
     state.config.savePath = normalizeConfigSavePath(state.config.savePath);
 
+    // Ensure numeric top-level config fields are coerced cleanly to numbers
+    const toNum = (val: any, fallback: number, min?: number, max?: number) => {
+      const parsed = typeof val === 'number' ? val : parseFloat(String(val));
+      const num = Number.isFinite(parsed) ? parsed : fallback;
+      if (min !== undefined && num < min) return min;
+      if (max !== undefined && num > max) return max;
+      return num;
+    };
+    state.config.gameSwitchBufferMins = Math.round(toNum(state.config.gameSwitchBufferMins, 5, 0, 60));
+    state.config.offlineGracePeriodMins = Math.round(toNum(state.config.offlineGracePeriodMins, 5, 1, 60));
+    state.config.longGameAutospliceTriggerHours = toNum(state.config.longGameAutospliceTriggerHours, 9, 0.25, 72);
+    state.config.longGameAutospliceCutHours = toNum(
+      state.config.longGameAutospliceCutHours,
+      8,
+      0.25,
+      state.config.longGameAutospliceTriggerHours
+    );
+
+    if (state.config.chatRender) {
+      const cr = state.config.chatRender as any;
+      cr.width = Math.round(toNum(cr.width, 350, 100, 7680));
+      cr.height = Math.round(toNum(cr.height, 800, 100, 7680));
+      cr.fontSize = Math.round(toNum(cr.fontSize, 24, 6, 200));
+      cr.outlineSize = toNum(cr.outlineSize, 4, 0, 50);
+      cr.framerate = Math.round(toNum(cr.framerate, 60, 1, 240));
+      cr.updateRate = toNum(cr.updateRate, 0, 0, 60);
+      cr.jobs = Math.round(toNum(cr.jobs, 0, 0, 16));
+      cr.imageCacheMb = Math.round(toNum(cr.imageCacheMb, 256, 32, 8192));
+      cr.gifMaxHeightPercent = Math.round(toNum(cr.gifMaxHeightPercent, 33, 5, 100));
+      cr.syncOffset = toNum(cr.syncOffset, -2.5, -120, 120);
+      cr.syncOffsetHevc = toNum(cr.syncOffsetHevc, -7.5, -120, 120);
+      cr.badgeFilter = Math.round(toNum(cr.badgeFilter, 0, 0));
+      for (const scaleKey of [
+        'scaleUsername', 'scaleEmote', 'scaleBadge', 'scaleEmoji', 'scaleAvatar', 'scaleVertical',
+        'scaleSidePadding', 'scaleSectionHeight', 'scaleWordSpace', 'scaleEmoteSpace',
+        'scaleHighlightStroke', 'scaleHighlightIndent'
+      ]) {
+        const defScale = scaleKey === 'scaleVertical' ? 0.5 : 1.0;
+        cr[scaleKey] = toNum(cr[scaleKey], defScale, 0.05, 10);
+      }
+      if (cr.dispersion === true) cr.dispersion = 'on';
+      else if (cr.dispersion === false) cr.dispersion = 'off';
+      else if (cr.dispersion !== 'on' && cr.dispersion !== 'off' && cr.dispersion !== 'smart') {
+        cr.dispersion = 'smart';
+      }
+      const validOverlayModes = ['StickyTop', 'ChatScroll', 'Off'];
+      if (!validOverlayModes.includes(cr.predictionMode)) cr.predictionMode = 'StickyTop';
+      if (!validOverlayModes.includes(cr.pollMode)) cr.pollMode = 'StickyTop';
+      if (!validOverlayModes.includes(cr.pinnedChatMode)) cr.pinnedChatMode = 'StickyTop';
+      if (!validOverlayModes.includes(cr.hypeTrainMode)) cr.hypeTrainMode = 'ChatScroll';
+
+      const validModModes = ['Strikethrough', 'ReplaceDeleted', 'Hide', 'Off'];
+      if (!validModModes.includes(cr.moderationMode)) cr.moderationMode = 'Strikethrough';
+    }
+
     if (Array.isArray(state.config.channels)) {
       state.config.channels = Array.from(new Set(
         state.config.channels.map(cleanChannelName).filter(Boolean)
@@ -301,6 +356,7 @@ export function setupRoutes(app: express.Application) {
             previewImageUrl: session.previewImageUrl,
             autoRenderChat: session.autoRenderChat,
             commentsWritten: session.commentsWritten || 0,
+            eventsWritten: session.eventsWritten || 0,
             games: session.games || [],
             pendingGameSwitch
           };
@@ -464,9 +520,14 @@ export function setupRoutes(app: express.Application) {
 
   app.post("/api/channels/splice-game", async (req, res) => {
     try {
-      const { channel, action, clipScope, clipMinutes } = req.body;
+      const { channel, action, clipScope, clipMinutes, leadingBufferMinutes } = req.body;
       if (!channel) return res.status(400).json({ error: "Channel is required" });
-      const result = await manualSpliceGame(channel, { action, clipScope, clipMinutes: Number(clipMinutes) });
+      const result = await manualSpliceGame(channel, {
+        action,
+        clipScope,
+        clipMinutes: clipMinutes !== undefined ? Number(clipMinutes) : undefined,
+        leadingBufferMinutes: leadingBufferMinutes !== undefined ? Number(leadingBufferMinutes) : undefined
+      });
       return res.json(result);
     } catch (err: any) {
       return res.status(400).json({ error: err.message });

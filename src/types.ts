@@ -24,23 +24,29 @@ export interface Config {
     altBackgroundColor: string;
     alternateBackgrounds: boolean;
     messageColor: string;
+    highlightUsers?: string;
+    highlightUserColor?: string;
     font: string;
     fontSize: number;
     messageFontStyle: string;
     usernameFontStyle: string;
+    scaleUsername?: number;
     outline: boolean;
     outlineSize: number;
     framerate: number;
     updateRate: number;
+    jobs?: number;
+    imageCacheMb?: number;
     generateMask: boolean;
     bttv: boolean;
     ffz: boolean;
     stv: boolean;
     giphy?: boolean;
+    gifMaxHeightPercent?: number;
     allowUnlistedEmotes: boolean;
     badges: boolean;
     subMessages: boolean;
-    dispersion: boolean;
+    dispersion: 'off' | 'on' | 'smart' | boolean;
     offline: boolean;
     avatars: boolean;
     readableColors: boolean;
@@ -63,6 +69,25 @@ export interface Config {
     codec: string;
     badgeFilter: number;
     autoCompensateClockDrift?: boolean;
+    // v2.0-extended Overlay Widgets & Events (ChatRenderCLI)
+    predictionMode?: 'StickyTop' | 'ChatScroll' | 'Off';
+    pollMode?: 'StickyTop' | 'ChatScroll' | 'Off';
+    pinnedChatMode?: 'StickyTop' | 'ChatScroll' | 'Off';
+    hypeTrainMode?: 'StickyTop' | 'ChatScroll' | 'Off';
+    // v2.0-extended Moderation & Roomstate
+    moderationMode?: 'Strikethrough' | 'ReplaceDeleted' | 'Hide' | 'Off';
+    moderationNotices?: boolean;
+    clearAll?: boolean;
+    roomstateNotices?: boolean;
+    // v2.0-extended Enriched Chat Message Toggles
+    replies?: boolean;
+    firstChatter?: boolean;
+    announcements?: boolean;
+    raids?: boolean;
+    channelPoints?: boolean;
+    hypeChat?: boolean;
+    powerUps?: boolean;
+    sharedChatBadge?: boolean;
   };
 }
 
@@ -76,6 +101,8 @@ export interface SessionGame {
   isManualSplice?: boolean;
   overrideBuffer?: boolean;
   endChunk?: number;
+  isAwaitingNextGame?: boolean;
+  customLeadingBufferMins?: number;
 }
 
 export interface ActiveTask {
@@ -137,11 +164,16 @@ export interface ActiveDownloadSession {
   games?: SessionGame[];
   chatStream?: any; // fs.WriteStream
   chatFilePath?: string;
+  eventsFilePath?: string;
   chatWs?: any; // WebSocket
   chatReconnectTimer?: NodeJS.Timeout | null;
   chatHeartbeatInterval?: NodeJS.Timeout | null;
+  pubsubWs?: any; // WebSocket (wss://pubsub-edge.twitch.tv/v1)
+  pubsubReconnectTimer?: NodeJS.Timeout | null;
+  pubsubHeartbeatInterval?: NodeJS.Timeout | null;
   isStopped?: boolean;
   commentsWritten: number;
+  eventsWritten?: number;
   thirdPartyEmotes?: any[];
   mediaPlaylistUrl: string;
   playlistPollInterval: NodeJS.Timeout | null;
@@ -181,7 +213,31 @@ export interface ActiveDownloadSession {
   isAwaitingBackfillChoice?: boolean;
   liveChatBuffer?: any[];
   chatExistingIds?: Set<string>;
+  eventExistingIds?: Set<string>;
   activeChatBackfillPromise?: Promise<void> | null;
+}
+
+export interface ChatBroadcastEvent {
+  _id: string;
+  created_at: string;
+  content_offset_seconds: number;
+  source?: 'irc' | 'pubsub';
+  type?: string;
+  event_type:
+    | 'clearchat'
+    | 'clearmsg'
+    | 'roomstate'
+    | 'prediction'
+    | 'poll'
+    | 'pinned_chat'
+    | 'channel_points'
+    | 'hype_train'
+    | 'raid'
+    | 'notice';
+  category: string;
+  action?: string;
+  carried_over?: boolean;
+  data: Record<string, any>;
 }
 
 export interface Status {
@@ -204,6 +260,9 @@ export interface Status {
     chunksDownloaded: number;
     videoDurationSeconds: number;
     missingCount?: number;
+    offlineGraceRemainingSeconds?: number;
+    offlineGraceTotalSeconds?: number;
+    folderPath?: string;
     currentTitle?: string;
     currentGame?: string;
     viewersCount?: number;
@@ -211,6 +270,7 @@ export interface Status {
     autoRenderChat?: boolean;
     highestSeq?: number;
     commentsWritten?: number;
+    eventsWritten?: number;
     games?: SessionGame[];
     pendingGameSwitch?: {
       gameIndex: number;

@@ -7,40 +7,236 @@ import { postTwitchGql, fetchRecentVods } from "./twitch";
 import { fetchThirdPartyEmotes } from "./emotes";
 import { ensureFfmpeg, getVideoDurationSeconds, checkVideoIsHevc } from "./ffmpeg";
 
+import type { ChatBroadcastEvent } from "../types";
+
+export function unescapeIrcTagValue(val: string): string {
+  if (!val || !val.includes('\\')) return val || "";
+  let out = "";
+  for (let i = 0; i < val.length; i++) {
+    if (val[i] === '\\' && i + 1 < val.length) {
+      const next = val[i + 1];
+      if (next === ':') { out += ';'; i++; }
+      else if (next === 's') { out += ' '; i++; }
+      else if (next === '\\') { out += '\\'; i++; }
+      else if (next === 'r') { out += '\r'; i++; }
+      else if (next === 'n') { out += '\n'; i++; }
+      else { out += next; i++; }
+    } else if (val[i] !== '\\') {
+      out += val[i];
+    }
+  }
+  return out;
+}
+
 export function parseIrcMessage(raw: string) {
   if (!raw.startsWith('@')) return null;
-  
+
   const space1 = raw.indexOf(' ');
+  if (space1 === -1) return null;
   const tagsPart = raw.substring(1, space1);
-  const rest1 = raw.substring(space1 + 1);
-  
+  const rest1 = raw.substring(space1 + 1).trimStart();
+
+  if (!rest1.startsWith(':')) return null;
   const space2 = rest1.indexOf(' ');
+  if (space2 === -1) return null;
   const prefixPart = rest1.substring(1, space2);
-  const rest2 = rest1.substring(space2 + 1);
-  
+  const rest2 = rest1.substring(space2 + 1).trimStart();
+
   const space3 = rest2.indexOf(' ');
-  const command = rest2.substring(0, space3);
-  const rest3 = rest2.substring(space3 + 1);
-  
-  const space4 = rest3.indexOf(' :');
+  let command = "";
+  let rest3 = "";
+  if (space3 === -1) {
+    command = rest2.trim();
+  } else {
+    command = rest2.substring(0, space3);
+    rest3 = rest2.substring(space3 + 1);
+  }
+
   let channel = "";
   let message = "";
+  const space4 = rest3.indexOf(' :');
   if (space4 !== -1) {
-      channel = rest3.substring(0, space4);
-      message = rest3.substring(space4 + 2);
+    channel = rest3.substring(0, space4).trim();
+    message = rest3.substring(space4 + 2);
+  } else if (rest3.startsWith(':')) {
+    message = rest3.substring(1);
   } else {
-      channel = rest3;
+    channel = rest3.trim();
   }
-  
+
   const tags: Record<string, string> = {};
   tagsPart.split(';').forEach(t => {
-    const [k, v] = t.split('=');
-    tags[k] = v;
+    if (!t) return;
+    const eqIdx = t.indexOf('=');
+    if (eqIdx !== -1) {
+      const k = t.substring(0, eqIdx);
+      const v = unescapeIrcTagValue(t.substring(eqIdx + 1));
+      tags[k] = v;
+    } else {
+      tags[t] = "";
+    }
   });
-  
+
   const username = prefixPart.split('!')[0];
-  
+
   return { tags, username, command, channel, message };
+}
+
+export function getEventsSidecarPath(chatFilePath: string): string {
+  return chatFilePath.replace(/\.json$/i, '.events.jsonl');
+}
+
+export function readBroadcastEventsForChatFile(chatFilePath?: string, parsedChatObj?: any): ChatBroadcastEvent[] {
+  const events: ChatBroadcastEvent[] = [];
+  const seenIds = new Set<string>();
+
+  if (parsedChatObj && Array.isArray(parsedChatObj.events)) {
+    for (const evt of parsedChatObj.events) {
+      if (evt && evt._id && !seenIds.has(evt._id)) {
+        seenIds.add(evt._id);
+        events.push(evt);
+      }
+    }
+  }
+
+  if (chatFilePath) {
+    const sidecarPath = getEventsSidecarPath(chatFilePath);
+    if (fs.existsSync(sidecarPath)) {
+      try {
+        const rawLines = fs.readFileSync(sidecarPath, 'utf8').split(/\r?\n/);
+        for (const line of rawLines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const evt = JSON.parse(trimmed);
+            if (evt && evt._id && !seenIds.has(evt._id)) {
+              seenIds.add(evt._id);
+              events.push(evt);
+            }
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+  }
+
+  events.sort((a, b) => (a.content_offset_seconds || 0) - (b.content_offset_seconds || 0));
+  return events;
+}
+
+export function appendBroadcastEvent(channelLogin: string, event: ChatBroadcastEvent) {
+  const session = state.activeDownloadSessions[channelLogin];
+  if (!session || session.isStopped) return;
+
+  if (!event.type) {
+    event.type = event.event_type;
+  }
+  if (!event.source) {
+    event.source = ['clearchat', 'clearmsg', 'roomstate'].includes(event.event_type) ? 'irc' : 'pubsub';
+  }
+
+  if (!session.eventExistingIds) {
+    session.eventExistingIds = new Set<string>();
+  }
+  if (session.eventExistingIds.has(event._id)) return;
+  session.eventExistingIds.add(event._id);
+  session.eventsWritten = (session.eventsWritten || 0) + 1;
+
+  const sidecarPath = session.eventsFilePath || (session.chatFilePath ? getEventsSidecarPath(session.chatFilePath) : "");
+  if (sidecarPath) {
+    session.eventsFilePath = sidecarPath;
+    fs.promises.appendFile(sidecarPath, JSON.stringify(event) + "\n", "utf8").catch(() => {});
+  }
+}
+
+export function sliceAndCarryOverBroadcastEvents(
+  events: ChatBroadcastEvent[],
+  videoStartOffset: number,
+  videoEndOffset: number,
+  gapAdjustments: { atChunk: number; missingDurationSec: number }[],
+  baseOffsetSec: number,
+  baseSeq: number,
+  avgChunkDur: number
+): ChatBroadcastEvent[] {
+  if (!Array.isArray(events) || events.length === 0) return [];
+
+  const activePredictionsBeforeStart = new Map<string, ChatBroadcastEvent>();
+  const activePollsBeforeStart = new Map<string, ChatBroadcastEvent>();
+  const activePinsBeforeStart = new Map<string, ChatBroadcastEvent>();
+  const sliced: ChatBroadcastEvent[] = [];
+
+  for (const evt of events) {
+    if (!evt) continue;
+    const evtType = evt.event_type || (evt.type as any);
+    let streamTime = evt.content_offset_seconds || 0;
+    if (gapAdjustments && gapAdjustments.length > 0) {
+      for (const gap of gapAdjustments) {
+        const gapOffsetSec = baseOffsetSec + Math.max(0, gap.atChunk - baseSeq) * avgChunkDur;
+        if (streamTime > gapOffsetSec) {
+          streamTime -= gap.missingDurationSec;
+        }
+      }
+    }
+
+    if (streamTime < videoStartOffset) {
+      if (evtType === 'prediction' && evt.data?.prediction_id) {
+        const pid = String(evt.data.prediction_id);
+        const st = String(evt.data.status || '').toUpperCase();
+        if (st === 'RESOLVED' || st === 'CANCELED' || st === 'CANCELLED') {
+          activePredictionsBeforeStart.delete(pid);
+        } else {
+          activePredictionsBeforeStart.set(pid, evt);
+        }
+      } else if (evtType === 'poll' && evt.data?.poll_id) {
+        const pollId = String(evt.data.poll_id);
+        const st = String(evt.data.status || '').toUpperCase();
+        if (st === 'COMPLETED' || st === 'ARCHIVED' || st === 'TERMINATED') {
+          activePollsBeforeStart.delete(pollId);
+        } else {
+          activePollsBeforeStart.set(pollId, evt);
+        }
+      } else if (evtType === 'pinned_chat' && evt.data?.pin_id) {
+        const pinId = String(evt.data.pin_id);
+        if (evt.category === 'unpin_message' || evt.data?.action === 'unpin-message') {
+          activePinsBeforeStart.delete(pinId);
+        } else {
+          activePinsBeforeStart.set(pinId, evt);
+        }
+      }
+    } else if (streamTime >= videoStartOffset && streamTime <= videoEndOffset) {
+      const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(evt));
+      if (!cloned.type) cloned.type = cloned.event_type;
+      cloned.content_offset_seconds = parseFloat(Math.max(0, streamTime - videoStartOffset).toFixed(3));
+      sliced.push(cloned);
+    }
+  }
+
+  const carriedOver: ChatBroadcastEvent[] = [];
+  for (const [, predEvt] of activePredictionsBeforeStart) {
+    const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(predEvt));
+    cloned._id = `${cloned._id}_carryover_${Math.round(videoStartOffset)}`;
+    if (!cloned.type) cloned.type = cloned.event_type;
+    cloned.content_offset_seconds = 0;
+    cloned.carried_over = true;
+    carriedOver.push(cloned);
+  }
+  for (const [, pollEvt] of activePollsBeforeStart) {
+    const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(pollEvt));
+    cloned._id = `${cloned._id}_carryover_${Math.round(videoStartOffset)}`;
+    if (!cloned.type) cloned.type = cloned.event_type;
+    cloned.content_offset_seconds = 0;
+    cloned.carried_over = true;
+    carriedOver.push(cloned);
+  }
+  for (const [, pinEvt] of activePinsBeforeStart) {
+    const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(pinEvt));
+    cloned._id = `${cloned._id}_carryover_${Math.round(videoStartOffset)}`;
+    if (!cloned.type) cloned.type = cloned.event_type;
+    cloned.content_offset_seconds = 0;
+    cloned.carried_over = true;
+    carriedOver.push(cloned);
+  }
+
+  return [...carriedOver, ...sliced];
 }
 
 export function parseBadges(badgesTag: string) {
@@ -630,9 +826,11 @@ export function buildFragments(message: string, emotesTag: string) {
 
     return {
       FileInfo: fileInfo,
+      schemaVersion: "2.0-extended",
       streamer,
       video,
       comments,
+      events: [],
       embeddedData: {
         thirdParty,
         firstParty: [],
@@ -647,31 +845,49 @@ export function buildFragments(message: string, emotesTag: string) {
    * 2. Unclosed live stream JSON being actively written (seals cleanly after the last complete comment).
    * 3. Malformed/partially corrupted files with broken seams (extracts all individual valid comments).
    */
-  export function safeParseChatData(content: string): any {
+  export function safeParseChatData(content: string, chatFilePath?: string): any {
     if (!content || !content.trim()) return null;
+
+    let result: any = null;
 
     // 1. Direct parse attempt
     try {
       const parsed = JSON.parse(content);
       if (parsed && Array.isArray(parsed.comments)) {
-        return parsed;
+        result = parsed;
       }
     } catch (_) {}
 
     // 2. Clean truncation at last complete comment
-    const lastEnd = findLastCompleteCommentEnd(content);
-    if (lastEnd !== -1) {
-      const sealed = content.substring(0, lastEnd) + '\n  ],\n  "embeddedData": null\n}';
-      try {
-        const parsed = JSON.parse(sealed);
-        if (parsed && Array.isArray(parsed.comments)) {
-          return parsed;
-        }
-      } catch (_) {}
+    if (!result) {
+      const lastEnd = findLastCompleteCommentEnd(content);
+      if (lastEnd !== -1) {
+        const sealed = content.substring(0, lastEnd) + '\n  ],\n  "embeddedData": null\n}';
+        try {
+          const parsed = JSON.parse(sealed);
+          if (parsed && Array.isArray(parsed.comments)) {
+            result = parsed;
+          }
+        } catch (_) {}
+      }
     }
 
     // 3. Fallback extraction of individual comments
-    return extractChatCommentsFallback(content);
+    if (!result) {
+      result = extractChatCommentsFallback(content);
+    }
+
+    if (result) {
+      const mergedEvents = readBroadcastEventsForChatFile(chatFilePath, result);
+      if (mergedEvents.length > 0 || Array.isArray(result.events)) {
+        result.events = mergedEvents;
+      }
+      if (!result.schemaVersion) {
+        result.schemaVersion = "2.0-extended";
+      }
+    }
+
+    return result;
   }
 
   /**
@@ -709,6 +925,11 @@ export function buildFragments(message: string, emotesTag: string) {
           };
           needsResave = true;
         }
+        const mergedEvents = readBroadcastEventsForChatFile(filePath, parsed);
+        if (mergedEvents.length > 0 && (!Array.isArray(parsed.events) || parsed.events.length !== mergedEvents.length)) {
+          parsed.events = mergedEvents;
+          needsResave = true;
+        }
         if (!parsed.embeddedData) {
           parsed.embeddedData = {
             thirdParty: Array.isArray(parsed.emotes) ? parsed.emotes : [],
@@ -726,7 +947,7 @@ export function buildFragments(message: string, emotesTag: string) {
 
       addLog(`[Chat Repair] Malformed JSON detected in ${path.basename(filePath)}. Reconstructing valid chat structure...`);
 
-      const cleanChatObj = safeParseChatData(raw);
+      const cleanChatObj = safeParseChatData(raw, filePath);
       if (!cleanChatObj || !Array.isArray(cleanChatObj.comments)) {
         throw new Error("Unable to extract comments from file");
       }
@@ -770,7 +991,7 @@ export function buildFragments(message: string, emotesTag: string) {
     if (!fs.existsSync(filePath)) return;
     try {
       const raw = await fs.promises.readFile(filePath, 'utf8');
-      let data = safeParseChatData(raw);
+      let data = safeParseChatData(raw, filePath);
       if (!data) return;
       let modified = false;
 
@@ -809,6 +1030,57 @@ export function buildFragments(message: string, emotesTag: string) {
     } catch (err: any) {
       addLog(`[Render Sanitizer] Warning: Pre-flight sanitization check for ${path.basename(filePath)}: ${err.message}`);
     }
+  }
+
+  /**
+   * Detects whether a chat JSON file contains some or all messages originating from a Twitch VOD chat download
+   * (where timestamps are quantized to whole integer seconds) vs. purely live IRC WebSocket chat.
+   */
+  export function hasVodChatMessages(chatFile: string, chatData: any): boolean {
+    if (/vod_chat|vod_backfill|vod_broadcast/i.test(chatFile)) {
+      return true;
+    }
+    if (!chatData || !Array.isArray(chatData.comments)) {
+      return false;
+    }
+    const realComments = chatData.comments.filter((c: any) => c && c._id !== "dummy-end-message");
+    if (realComments.length === 0) {
+      return false;
+    }
+
+    const headerVideoId = chatData.video?.id ? String(chatData.video.id) : "";
+    let integerOffsetCount = 0;
+
+    for (const c of realComments) {
+      // 1. VOD GQL comments & TwitchDownloaderCLI VOD comments explicitly set `emoticon: null` on text fragments,
+      // whereas live IRC comments built via buildFragments() omit the `emoticon` key on plain-text fragments.
+      const frags = c?.message?.fragments;
+      if (Array.isArray(frags)) {
+        for (const f of frags) {
+          if (f && Object.prototype.hasOwnProperty.call(f, "emoticon") && f.emoticon === null) {
+            return true;
+          }
+        }
+      }
+
+      // 2. Backfilled VOD comments merged into a live stream chat file carry the VOD's content_id,
+      // which differs from the live broadcast's streamId stored in video.id.
+      if (headerVideoId && c.content_id && String(c.content_id) !== headerVideoId) {
+        return true;
+      }
+
+      // 3. Track whole-integer content_offset_seconds (before syncOffset or drift scaling is applied).
+      if (typeof c.content_offset_seconds === "number" && Number.isInteger(c.content_offset_seconds)) {
+        integerOffsetCount++;
+      }
+    }
+
+    // If a majority of comments have exact integer second offsets, it is a VOD chat log.
+    if (realComments.length >= 3 && integerOffsetCount / realComments.length > 0.5) {
+      return true;
+    }
+
+    return false;
   }
 
   const cancelledRenderTaskIds = new Set<string>();
@@ -1088,18 +1360,28 @@ export function buildFragments(message: string, emotesTag: string) {
 
       addLog(`[Render] Detected stream format for ${chatFile}: ${isHevcStream ? 'HEVC / 1440p (Enhanced)' : 'Standard H.264 (1080p)'}. Using sync offset: ${syncOffset}s.`);
 
+      // Inspect raw input chat file before syncOffset / drift scaling to detect VOD chat messages for Smart Dispersion
+      let containsVodChat = /vod_chat|vod_backfill|vod_broadcast/i.test(chatFile);
+      let parsedInputChatData: any = null;
+      try {
+        const chatDataRaw = await fs.promises.readFile(inputPath, 'utf8');
+        try {
+          parsedInputChatData = JSON.parse(chatDataRaw);
+        } catch (jsonErr) {
+          await repairChatJsonFile(inputPath);
+          const repairedRaw = await fs.promises.readFile(inputPath, 'utf8');
+          parsedInputChatData = JSON.parse(repairedRaw);
+        }
+        if (parsedInputChatData) {
+          containsVodChat = hasVodChatMessages(chatFile, parsedInputChatData);
+        }
+      } catch (e: any) {
+        addLog(`[Render] Warning reading chat data for pre-inspection: ${e.message}`);
+      }
+
       if (syncOffset !== 0) {
         try {
-          const chatDataRaw = await fs.promises.readFile(inputPath, 'utf8');
-          let chatData: any = null;
-          try {
-            chatData = JSON.parse(chatDataRaw);
-          } catch (jsonErr) {
-            // If there was trailing content or malformed JSON, try repair first
-            await repairChatJsonFile(inputPath);
-            const repairedRaw = await fs.promises.readFile(inputPath, 'utf8');
-            chatData = JSON.parse(repairedRaw);
-          }
+          const chatData = parsedInputChatData || JSON.parse(await fs.promises.readFile(inputPath, 'utf8'));
 
           if (chatData && chatData.comments && Array.isArray(chatData.comments)) {
             const filteredComments = [];
@@ -1112,6 +1394,18 @@ export function buildFragments(message: string, emotesTag: string) {
               }
             }
             chatData.comments = filteredComments;
+          }
+          if (chatData && Array.isArray(chatData.events)) {
+            const filteredEvents = [];
+            for (const evt of chatData.events) {
+              if (evt.content_offset_seconds !== undefined && !evt.carried_over) {
+                evt.content_offset_seconds += syncOffset;
+              }
+              if (evt.content_offset_seconds === undefined || evt.content_offset_seconds >= 0) {
+                filteredEvents.push(evt);
+              }
+            }
+            chatData.events = filteredEvents;
           }
           tempPath = path.join(folderPath, `temp_render_${Date.now()}_${Math.random().toString(36).substring(7)}.json`);
           await fs.promises.writeFile(tempPath, JSON.stringify(chatData), 'utf8');
@@ -1127,7 +1421,7 @@ export function buildFragments(message: string, emotesTag: string) {
       if (enableDriftCompensation && probedVideoDuration > 3600) {
         try {
           const rawChat = await fs.promises.readFile(renderInputPath, 'utf8');
-          const chatObj = safeParseChatData(rawChat);
+          const chatObj = safeParseChatData(rawChat, inputPath);
           if (chatObj && Array.isArray(chatObj.comments) && chatObj.comments.length > 0) {
             const maxCommentOffset = Math.max(...chatObj.comments.map((c: any) => c.content_offset_seconds || 0));
             const chatSpan = Math.max(chatObj.video?.length || 0, maxCommentOffset);
@@ -1142,6 +1436,13 @@ export function buildFragments(message: string, emotesTag: string) {
               for (const c of chatObj.comments) {
                 if (c.content_offset_seconds !== undefined && c.content_offset_seconds > 0) {
                   c.content_offset_seconds = parseFloat((c.content_offset_seconds * driftScale).toFixed(3));
+                }
+              }
+              if (Array.isArray(chatObj.events)) {
+                for (const evt of chatObj.events) {
+                  if (evt.content_offset_seconds !== undefined && evt.content_offset_seconds > 0) {
+                    evt.content_offset_seconds = parseFloat((evt.content_offset_seconds * driftScale).toFixed(3));
+                  }
                 }
               }
               if (chatObj.video) {
@@ -1163,14 +1464,17 @@ export function buildFragments(message: string, emotesTag: string) {
 
       updateTask(taskId, `Rendering Chat (${channelLogin})`, `Rendering segment ${i+1}/${segments.length}... (${chatFile})`, "running", true, [{ label: "Cancel", value: "cancel_render" }]);
 
-      // Pre-flight check & sanitize the JSON file that TwitchDownloaderCLI will actually read
+      // Pre-flight check & sanitize the JSON file that ChatRenderCLI / TwitchDownloaderCLI will actually read
       await sanitizeChatJsonForRendering(renderInputPath);
 
-      const segWidth = Math.max(100, Math.min(7680, parseInt(String(segment.width), 10) || 350));
-      const segHeight = Math.max(100, Math.min(7680, parseInt(String(segment.height), 10) || 800));
+      const rawWidth = Math.max(100, Math.min(7680, parseInt(String(segment.width), 10) || 350));
+      const rawHeight = Math.max(100, Math.min(7680, parseInt(String(segment.height), 10) || 800));
+      // Ensure even pixel dimensions required by yuv420p / yuva420p planar pipelines
+      const segWidth = rawWidth % 2 === 0 ? rawWidth : rawWidth + 1;
+      const segHeight = rawHeight % 2 === 0 ? rawHeight : rawHeight + 1;
 
       const messageColor = cr.messageColor || "#ffffff";
-      const args = [
+      const baseArgs = [
         "chatrender",
         "-i", renderInputPath,
         "-o", outputPath,
@@ -1185,65 +1489,83 @@ export function buildFragments(message: string, emotesTag: string) {
       ];
 
       if (probedVideoDuration > 0) {
-        args.push("-e", `${probedVideoDuration.toFixed(2)}s`);
+        baseArgs.push("-e", `${probedVideoDuration.toFixed(2)}s`);
         addLog(`[Render] Bound chat render ending to probed container duration: ${probedVideoDuration.toFixed(2)}s.`);
       }
 
-      if (cr.updateRate) args.push("--update-rate", cr.updateRate.toString());
+      if (cr.updateRate) baseArgs.push("--update-rate", cr.updateRate.toString());
       if (cr.alternateBackgrounds) {
-        args.push("--alternate-backgrounds");
-        if (cr.altBackgroundColor) { args.push("--alt-background-color", cr.altBackgroundColor); }
+        baseArgs.push("--alternate-backgrounds");
+        if (cr.altBackgroundColor) { baseArgs.push("--alt-background-color", cr.altBackgroundColor); }
       }
-      if (cr.messageFontStyle && cr.messageFontStyle !== "normal") args.push("--message-fontstyle", cr.messageFontStyle);
-      if (cr.usernameFontStyle && cr.usernameFontStyle !== "bold") args.push("--username-fontstyle", cr.usernameFontStyle);
+      if (cr.highlightUsers && String(cr.highlightUsers).trim()) {
+        baseArgs.push("--highlight-users", String(cr.highlightUsers).trim());
+        if (cr.highlightUserColor) {
+          baseArgs.push("--highlight-user-color", cr.highlightUserColor);
+        }
+      }
+      if (cr.messageFontStyle && cr.messageFontStyle !== "normal") baseArgs.push("--message-fontstyle", cr.messageFontStyle);
+      if (cr.usernameFontStyle && cr.usernameFontStyle !== "bold") baseArgs.push("--username-fontstyle", cr.usernameFontStyle);
+      if (cr.scaleUsername !== undefined && cr.scaleUsername !== 1.0) baseArgs.push("--scale-username", cr.scaleUsername.toString());
       if (cr.outline) {
-        args.push("--outline", "--outline-size", (cr.outlineSize || 4).toString());
+        baseArgs.push("--outline", "--outline-size", (cr.outlineSize || 4).toString());
       }
-      if (cr.generateMask) args.push("--generate-mask");
-      if (cr.bttv === false) args.push("--bttv=false");
-      if (cr.ffz === false) args.push("--ffz=false");
-      if (cr.stv === false) args.push("--stv=false");
-      args.push(cr.giphy === false ? "--giphy=false" : "--giphy=true");
-      if (cr.allowUnlistedEmotes === false) args.push("--allow-unlisted-emotes=false");
-      if (cr.badges === false) args.push("--badges=false");
-      if (cr.subMessages === false) args.push("--sub-messages=false");
-      if (cr.dispersion) args.push("--dispersion");
-      if (cr.offline) args.push("--offline");
-      if (cr.avatars) args.push("--avatars");
-      if (cr.readableColors === false) args.push("--readable-colors=false");
-      if (cr.sharpening) args.push("--sharpening");
-      if (cr.emojiVendor && cr.emojiVendor !== "notocolor") args.push("--emoji-vendor", cr.emojiVendor);
+      if (cr.generateMask) baseArgs.push("--generate-mask");
+      if (cr.bttv === false) baseArgs.push("--bttv=false");
+      if (cr.ffz === false) baseArgs.push("--ffz=false");
+      if (cr.stv === false) baseArgs.push("--stv=false");
+      if (cr.allowUnlistedEmotes === false) baseArgs.push("--allow-unlisted-emotes=false");
+      if (cr.badges === false) baseArgs.push("--badges=false");
+      if (cr.subMessages === false) baseArgs.push("--sub-messages=false");
+      const rawDispersion = cr.dispersion;
+      const dispersionMode: 'on' | 'off' | 'smart' =
+        rawDispersion === true || rawDispersion === 'on'
+          ? 'on'
+          : rawDispersion === 'smart'
+          ? 'smart'
+          : 'off';
+      const shouldUseDispersion =
+        dispersionMode === 'on' || (dispersionMode === 'smart' && containsVodChat);
+      if (dispersionMode === 'smart') {
+        addLog(`[Render] Smart Dispersion: ${shouldUseDispersion ? 'ENABLED (detected VOD chat messages)' : 'DISABLED (pure live sub-second chat)'} for ${chatFile}.`);
+      }
+      if (shouldUseDispersion) baseArgs.push("--dispersion");
+      if (cr.offline) baseArgs.push("--offline");
+      if (cr.avatars) baseArgs.push("--avatars");
+      if (cr.readableColors === false) baseArgs.push("--readable-colors=false");
+      if (cr.sharpening) baseArgs.push("--sharpening");
+      if (cr.emojiVendor && cr.emojiVendor !== "notocolor") baseArgs.push("--emoji-vendor", cr.emojiVendor);
       
-      if (cr.scaleEmote !== undefined && cr.scaleEmote !== 1.0) args.push("--scale-emote", cr.scaleEmote.toString());
-      if (cr.scaleBadge !== undefined && cr.scaleBadge !== 1.0) args.push("--scale-badge", cr.scaleBadge.toString());
-      if (cr.scaleEmoji !== undefined && cr.scaleEmoji !== 1.0) args.push("--scale-emoji", cr.scaleEmoji.toString());
-      if (cr.scaleAvatar !== undefined && cr.scaleAvatar !== 1.0) args.push("--scale-avatar", cr.scaleAvatar.toString());
-      if (cr.scaleVertical !== undefined) args.push("--scale-vertical", cr.scaleVertical.toString());
-      else args.push("--scale-vertical", "0.5");
-      if (cr.scaleSidePadding !== undefined && cr.scaleSidePadding !== 1.0) args.push("--scale-side-padding", cr.scaleSidePadding.toString());
-      if (cr.scaleSectionHeight !== undefined && cr.scaleSectionHeight !== 1.0) args.push("--scale-section-height", cr.scaleSectionHeight.toString());
-      if (cr.scaleWordSpace !== undefined && cr.scaleWordSpace !== 1.0) args.push("--scale-word-space", cr.scaleWordSpace.toString());
-      if (cr.scaleEmoteSpace !== undefined && cr.scaleEmoteSpace !== 1.0) args.push("--scale-emote-space", cr.scaleEmoteSpace.toString());
-      if (cr.scaleHighlightStroke !== undefined && cr.scaleHighlightStroke !== 1.0) args.push("--scale-highlight-stroke", cr.scaleHighlightStroke.toString());
-      if (cr.scaleHighlightIndent !== undefined && cr.scaleHighlightIndent !== 1.0) args.push("--scale-highlight-indent", cr.scaleHighlightIndent.toString());
+      if (cr.scaleEmote !== undefined && cr.scaleEmote !== 1.0) baseArgs.push("--scale-emote", cr.scaleEmote.toString());
+      if (cr.scaleBadge !== undefined && cr.scaleBadge !== 1.0) baseArgs.push("--scale-badge", cr.scaleBadge.toString());
+      if (cr.scaleEmoji !== undefined && cr.scaleEmoji !== 1.0) baseArgs.push("--scale-emoji", cr.scaleEmoji.toString());
+      if (cr.scaleAvatar !== undefined && cr.scaleAvatar !== 1.0) baseArgs.push("--scale-avatar", cr.scaleAvatar.toString());
+      if (cr.scaleVertical !== undefined) baseArgs.push("--scale-vertical", cr.scaleVertical.toString());
+      else baseArgs.push("--scale-vertical", "0.5");
+      if (cr.scaleSidePadding !== undefined && cr.scaleSidePadding !== 1.0) baseArgs.push("--scale-side-padding", cr.scaleSidePadding.toString());
+      if (cr.scaleSectionHeight !== undefined && cr.scaleSectionHeight !== 1.0) baseArgs.push("--scale-section-height", cr.scaleSectionHeight.toString());
+      if (cr.scaleWordSpace !== undefined && cr.scaleWordSpace !== 1.0) baseArgs.push("--scale-word-space", cr.scaleWordSpace.toString());
+      if (cr.scaleEmoteSpace !== undefined && cr.scaleEmoteSpace !== 1.0) baseArgs.push("--scale-emote-space", cr.scaleEmoteSpace.toString());
+      if (cr.scaleHighlightStroke !== undefined && cr.scaleHighlightStroke !== 1.0) baseArgs.push("--scale-highlight-stroke", cr.scaleHighlightStroke.toString());
+      if (cr.scaleHighlightIndent !== undefined && cr.scaleHighlightIndent !== 1.0) baseArgs.push("--scale-highlight-indent", cr.scaleHighlightIndent.toString());
 
-      if (cr.ignoreUsers) args.push("--ignore-users", cr.ignoreUsers);
-      if (cr.bannedWords) args.push("--ban-words", cr.bannedWords);
-      if (cr.badgeFilter !== undefined && cr.badgeFilter !== 0) args.push("--badge-filter", cr.badgeFilter.toString());
+      if (cr.ignoreUsers) baseArgs.push("--ignore-users", cr.ignoreUsers);
+      if (cr.bannedWords) baseArgs.push("--ban-words", cr.bannedWords);
+      if (cr.badgeFilter !== undefined && cr.badgeFilter !== 0) baseArgs.push("--badge-filter", cr.badgeFilter.toString());
 
       if (cr.codec) {
         let outputArgs = "";
         switch (cr.codec) {
           case "hevc": outputArgs = `-c:v libx265 -preset:v veryfast -crf 18 -pix_fmt yuv420p "{save_path}"`; break;
           case "vp8": outputArgs = `-c:v libvpx -pix_fmt yuva420p -auto-alt-ref 0 -crf 18 -b:v 0 -deadline realtime -quality realtime -cpu-used 4 -threads 0 "{save_path}"`; break;
-          case "vp9": outputArgs = `-c:v libvpx-vp9 -pix_fmt yuva420p -auto-alt-ref 0 -crf 24 -b:v 0 -deadline realtime -quality realtime -cpu-used 4 -row-mt 1 -threads 0 "{save_path}"`; break;
-          case "prores": outputArgs = `-c:v prores_ks -profile:v 4 -qscale:v 20 -pix_fmt yuva444p10le -threads 0 -slices 8 "{save_path}"`; break;
+          case "vp9": outputArgs = `-c:v libvpx-vp9 -crf 18 -b:v 0 -pix_fmt yuva420p "{save_path}"`; break;
+          case "prores": outputArgs = `-c:v prores_ks -profile:v 4 -pix_fmt yuva444p10le "{save_path}"`; break;
           default: outputArgs = `-c:v libx264 -preset:v veryfast -crf 18 -pix_fmt yuv420p "{save_path}"`; break;
         }
-        args.push(`--output-args=${outputArgs}`);
+        baseArgs.push(`--output-args=${outputArgs}`);
       }
 
-      args.push("--skip-drive-waiting");
+      baseArgs.push("--skip-drive-waiting");
 
       const tdPath = resolveTdPath(state.config.tdPath);
       const tdDir = path.dirname(tdPath);
@@ -1252,14 +1574,53 @@ export function buildFragments(message: string, emotesTag: string) {
         updateTask(taskId, `Rendering Chat (${chatFile})`, msg, "running", false, [{ label: "Cancel", value: "cancel_render" }]);
       });
       
-      args.push("--ffmpeg-path", actualFfmpegPath);
+      baseArgs.push("--ffmpeg-path", actualFfmpegPath);
+
+      // ChatRenderCLI extended options (v2.0-extended overlays, parallel jobs, Giphy, moderation & enriched chat flags)
+      const extendedArgs: string[] = [];
+      const jobsCount = cr.jobs !== undefined ? parseInt(String(cr.jobs), 10) : 0;
+      if (Number.isFinite(jobsCount) && jobsCount >= 0) {
+        extendedArgs.push("-j", jobsCount.toString());
+      }
+      const cacheMb = cr.imageCacheMb !== undefined ? parseInt(String(cr.imageCacheMb), 10) : 256;
+      if (Number.isFinite(cacheMb) && cacheMb > 0 && cacheMb !== 256) {
+        extendedArgs.push("--image-cache-mb", cacheMb.toString());
+      }
+      extendedArgs.push(cr.giphy === false ? "--giphy=false" : "--giphy=true");
+      const gifMaxPct = cr.gifMaxHeightPercent !== undefined ? parseInt(String(cr.gifMaxHeightPercent), 10) : 33;
+      if (Number.isFinite(gifMaxPct) && gifMaxPct >= 5 && gifMaxPct <= 100 && gifMaxPct !== 33) {
+        extendedArgs.push("--gif-max-height-percent", gifMaxPct.toString());
+      }
+
+      // Overlay Widget Modes
+      extendedArgs.push("--prediction-mode", cr.predictionMode || "StickyTop");
+      extendedArgs.push("--poll-mode", cr.pollMode || "StickyTop");
+      extendedArgs.push("--pinned-chat-mode", cr.pinnedChatMode || "StickyTop");
+      extendedArgs.push("--hype-train-mode", cr.hypeTrainMode || "ChatScroll");
+
+      // Moderation & Roomstate
+      extendedArgs.push("--moderation-mode", cr.moderationMode || "Strikethrough");
+      if (cr.moderationNotices === false) extendedArgs.push("--moderation-notices=false");
+      if (cr.clearAll === true) extendedArgs.push("--clear-all");
+      if (cr.roomstateNotices === false) extendedArgs.push("--roomstate-notices=false");
+
+      // Enriched Message Features
+      if (cr.replies === false) extendedArgs.push("--replies=false");
+      if (cr.firstChatter === false) extendedArgs.push("--first-chatter=false");
+      if (cr.announcements === false) extendedArgs.push("--announcements=false");
+      if (cr.raids === false) extendedArgs.push("--raids=false");
+      if (cr.channelPoints === false) extendedArgs.push("--channel-points=false");
+      if (cr.hypeChat === false) extendedArgs.push("--hype-chat=false");
+      if (cr.powerUps === false) extendedArgs.push("--power-ups=false");
+      if (cr.sharedChatBadge === false) extendedArgs.push("--shared-chat-badge=false");
       
       let success = false;
       let renderAttempt = 1;
+      let stripExtendedFlags = false;
 
       while (renderAttempt <= 3 && !success && !isTaskCancelled()) {
-        let currentArgs = [...args];
-        addLog(`[Render] Starting TwitchDownloaderCLI for ${chatFile} (Attempt ${renderAttempt}/3)...`);
+        let currentArgs = stripExtendedFlags ? [...baseArgs] : [...baseArgs, ...extendedArgs];
+        addLog(`[Render] Starting ${path.basename(tdPath)} for ${chatFile} (Attempt ${renderAttempt}/3)...`);
         addLog(`[Render CLI Command] ${tdPath} ${currentArgs.join(" ")}`);
 
         success = await new Promise((resolveRender) => {
@@ -1387,8 +1748,12 @@ export function buildFragments(message: string, emotesTag: string) {
               addLog(`[Render] Chat rendering command failed with exit code ${code} for ${chatFile}.`);
               const completeOutput = fullRenderOutput.trim();
               if (completeOutput) {
-                // Ensure complete error and debug output is preserved without truncation
                 addLog(`[Render Complete Output]\n${completeOutput}`);
+                const lowerOut = completeOutput.toLowerCase();
+                if (!stripExtendedFlags && (lowerOut.includes('unrecognized') || lowerOut.includes('unknown option') || lowerOut.includes('is unknown'))) {
+                  stripExtendedFlags = true;
+                  addLog(`[Render] Detected legacy TwitchDownloaderCLI without ChatRenderCLI flags. Retrying with standard compatibility flags...`);
+                }
               }
               if (renderAttempt >= 3) {
                 updateTask(taskId, `Render Failed (${chatFile})`, `Exited with code ${code}`, "error", true, [{ label: "Close", value: "dismiss" }]);
@@ -1640,11 +2005,32 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
     }
 
     let chatStream = fs.createWriteStream(chatFilePath, { flags: isRecovery ? 'a' : 'w' });
-    
+    const eventsFilePath = getEventsSidecarPath(chatFilePath);
+    const eventExistingIds = new Set<string>();
+    let recoveredEventsCount = 0;
+    if (fs.existsSync(eventsFilePath)) {
+      try {
+        const existingEvtLines = fs.readFileSync(eventsFilePath, 'utf8').split(/\r?\n/);
+        for (const line of existingEvtLines) {
+          if (!line.trim()) continue;
+          try {
+            const parsedEvt = JSON.parse(line);
+            if (parsedEvt && parsedEvt._id && !eventExistingIds.has(parsedEvt._id)) {
+              eventExistingIds.add(parsedEvt._id);
+              recoveredEventsCount++;
+            }
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+
     if (state.activeDownloadSessions[channelLogin]) {
       state.activeDownloadSessions[channelLogin].chatStream = chatStream;
       state.activeDownloadSessions[channelLogin].chatFilePath = chatFilePath;
+      state.activeDownloadSessions[channelLogin].eventsFilePath = eventsFilePath;
+      state.activeDownloadSessions[channelLogin].eventExistingIds = eventExistingIds;
       state.activeDownloadSessions[channelLogin].commentsWritten = isRecovery ? recoveredCommentsWritten : 0;
+      state.activeDownloadSessions[channelLogin].eventsWritten = recoveredEventsCount;
     }
 
     let thirdPartyEmotes: any[] = [];
@@ -1660,6 +2046,7 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
         CreatedAt: new Date().toISOString(),
         UpdatedAt: new Date().toISOString()
       },
+      schemaVersion: "2.0-extended",
       streamer: { name: channelLogin, id: parseInt(twitchId, 10) || 0 },
       video: {
         title: state.activeDownloadSessions[channelLogin]?.currentTitle || "",
@@ -1804,6 +2191,38 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
       }
     }
 
+    const enqueueComment = (tdComment: any) => {
+      if (isBackfilling || state.activeDownloadSessions[channelLogin]?.isAwaitingBackfillChoice) {
+        liveBuffer.push(tdComment);
+      } else if (state.activeDownloadSessions[channelLogin]) {
+        const curSession = state.activeDownloadSessions[channelLogin];
+        if (existingIds.has(tdComment._id)) {
+          return;
+        }
+        existingIds.add(tdComment._id);
+
+        if (!curSession.pendingChatWrites) {
+          curSession.pendingChatWrites = [];
+        }
+        curSession.pendingChatWrites.push(tdComment);
+
+        if (curSession.pendingChatWrites.length >= 25) {
+          flushPendingChatWrites(curSession);
+        } else if (!curSession.chatFlushTimer) {
+          curSession.chatFlushTimer = setTimeout(() => {
+            curSession.chatFlushTimer = null;
+            flushPendingChatWrites(curSession);
+          }, 1500);
+        }
+      }
+    };
+
+    const computeOffsetSec = (eventTsMs: number): number => {
+      const curSession = state.activeDownloadSessions[channelLogin];
+      const startMs = (curSession && curSession.videoStartTimeMs) ? curSession.videoStartTimeMs : startTimestamp;
+      return Math.max(0, parseFloat(((eventTsMs - startMs) / 1000.0).toFixed(3)));
+    };
+
     function connectWebSocket() {
       const activeSession = state.activeDownloadSessions[channelLogin];
       if (!activeSession || activeSession.isStopped) {
@@ -1842,7 +2261,7 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
         ws.send('PASS SCHMOOPIIE');
         ws.send('NICK justinfan' + Math.floor(Math.random() * 100000));
         ws.send(`JOIN #${channelLogin}`);
-        addLog(`[Chat] Connected to live chat for ${channelLogin}`);
+        addLog(`[Chat] Connected to live IRCv3 chat for ${channelLogin} (capturing PRIVMSG, USERNOTICE, CLEARCHAT, CLEARMSG, ROOMSTATE).`);
 
         clearHeartbeat();
         heartbeatInterval = setInterval(() => {
@@ -1885,18 +2304,15 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
             continue;
           }
 
-          if (msg.includes(' PRIVMSG ')) {
-            const parsed = parseIrcMessage(msg);
-            if (!parsed) continue;
+          if (!msg.startsWith('@')) continue;
+          const parsed = parseIrcMessage(msg);
+          if (!parsed) continue;
 
-            const chatSentTs = parseInt(parsed.tags['tmi-sent-ts'] || Date.now().toString());
-            const session = state.activeDownloadSessions[channelLogin];
-            const startMs = (session && session.videoStartTimeMs) ? session.videoStartTimeMs : startTimestamp;
-            let contentOffsetSeconds = (chatSentTs - startMs) / 1000.0;
-            // Never have negative timestamps for chat unless it was sent before video start (which is possible if chat connects first)
-            // But twitch ignores negative timestamps.
-            if (contentOffsetSeconds < 0) contentOffsetSeconds = 0;
+          const chatSentTs = parseInt(parsed.tags['tmi-sent-ts'] || Date.now().toString(), 10) || Date.now();
+          const contentOffsetSeconds = computeOffsetSec(chatSentTs);
 
+          // 1. Standard & Enriched Chat Messages (PRIVMSG)
+          if (parsed.command === 'PRIVMSG') {
             let msgBody = parsed.message;
             let isAction = false;
             let emotesTag = parsed.tags.emotes || "";
@@ -1904,24 +2320,123 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
             if (msgBody.startsWith('\x01ACTION ') && msgBody.endsWith('\x01')) {
               msgBody = msgBody.substring(8, msgBody.length - 1);
               isAction = true;
-              
+
               if (emotesTag) {
-                 const shiftedEmotes = [];
-                 for (const group of emotesTag.split('/')) {
-                   const [id, positions] = group.split(':');
-                   if (!positions) continue;
-                   const shiftedPositions = positions.split(',').map(pos => {
-                     const [start, end] = pos.split('-');
-                     return `${Math.max(0, parseInt(start) - 8)}-${Math.max(0, parseInt(end) - 8)}`;
-                   }).join(',');
-                   shiftedEmotes.push(`${id}:${shiftedPositions}`);
-                 }
-                 emotesTag = shiftedEmotes.join('/');
+                const shiftedEmotes = [];
+                for (const group of emotesTag.split('/')) {
+                  const [id, positions] = group.split(':');
+                  if (!positions) continue;
+                  const shiftedPositions = positions.split(',').map(pos => {
+                    const [start, end] = pos.split('-');
+                    return `${Math.max(0, parseInt(start, 10) - 8)}-${Math.max(0, parseInt(end, 10) - 8)}`;
+                  }).join(',');
+                  shiftedEmotes.push(`${id}:${shiftedPositions}`);
+                }
+                emotesTag = shiftedEmotes.join('/');
               }
             }
 
-            const tdComment = {
-              _id: parsed.tags.id || `msg-${Date.now()}-${Math.random()}`,
+            const isFirstMsg = parsed.tags['first-msg'] === '1';
+            const isReturningChatter = parsed.tags['returning-chatter'] === '1';
+            const isSubscriber = parsed.tags['subscriber'] === '1';
+            const isMod = parsed.tags['mod'] === '1';
+            const isVip = parsed.tags['vip'] === '1' || (parsed.tags.badges || '').includes('vip/');
+            const msgIdType = parsed.tags['msg-id'] || "";
+            const isHighlighted = msgIdType === 'highlighted-message';
+            const customRewardId = parsed.tags['custom-reward-id'] || "";
+            const bitsSpent = parseInt(parsed.tags['bits'] || '0', 10) || 0;
+
+            const userNoticeParams: Record<string, string> = {};
+            for (const key of [
+              'first-msg', 'returning-chatter', 'msg-id', 'custom-reward-id', 'animation-id',
+              'msg-param-emote-id',
+              'reply-parent-msg-id', 'reply-parent-user-id', 'reply-parent-user-login',
+              'reply-parent-display-name', 'reply-parent-msg-body',
+              'reply-thread-parent-msg-id', 'reply-thread-parent-user-login',
+              'pinned-chat-paid-amount', 'pinned-chat-paid-currency',
+              'pinned-chat-paid-exponent', 'pinned-chat-paid-level', 'pinned-chat-paid-is-system-message',
+              'source-room-id', 'source-id', 'source-badges'
+            ]) {
+              if (parsed.tags[key] !== undefined && parsed.tags[key] !== "") {
+                userNoticeParams[key] = parsed.tags[key];
+              }
+            }
+
+            const eventData: Record<string, any> = {
+              msg_id: msgIdType || null,
+              msg_id_type: msgIdType || null,
+              is_first_message: isFirstMsg,
+              first_msg: isFirstMsg,
+              is_returning_chatter: isReturningChatter,
+              returning_chatter: isReturningChatter,
+              is_highlighted: isHighlighted,
+              is_subscriber: isSubscriber,
+              is_mod: isMod,
+              is_vip: isVip,
+              bits_spent: bitsSpent,
+              custom_reward_id: customRewardId || null
+            };
+
+            if (customRewardId && rewardMetadataCache.has(customRewardId)) {
+              const cachedReward = rewardMetadataCache.get(customRewardId)!;
+              eventData.reward_title = cachedReward.title;
+              eventData.reward_cost = cachedReward.cost;
+              eventData.reward_prompt = cachedReward.prompt;
+              eventData.reward_background_color = cachedReward.background_color;
+            }
+
+            if (parsed.tags['reply-parent-msg-id']) {
+              eventData.reply = {
+                parent_msg_id: parsed.tags['reply-parent-msg-id'],
+                parent_user_id: parsed.tags['reply-parent-user-id'] || "",
+                parent_user_login: parsed.tags['reply-parent-user-login'] || "",
+                parent_display_name: parsed.tags['reply-parent-display-name'] || "",
+                parent_msg_body: parsed.tags['reply-parent-msg-body'] || "",
+                thread_parent_msg_id: parsed.tags['reply-thread-parent-msg-id'] || "",
+                thread_user_login: parsed.tags['reply-thread-parent-user-login'] || ""
+              };
+            }
+
+            if (msgIdType === 'gigantified-emote-message' || msgIdType === 'animated-message' || msgIdType === 'message-effect' || parsed.tags['animation-id']) {
+              let powerUpEmoteId = parsed.tags['msg-param-emote-id'] || null;
+              if (!powerUpEmoteId && emotesTag) {
+                const groups = emotesTag.split('/').filter(Boolean);
+                if (groups.length > 0) {
+                  powerUpEmoteId = groups[groups.length - 1].split(':')[0] || null;
+                }
+              }
+              eventData.power_up = {
+                type: msgIdType || 'message-effect',
+                emote_id: powerUpEmoteId,
+                animation_id: parsed.tags['animation-id'] || null
+              };
+            }
+
+            if (parsed.tags['pinned-chat-paid-amount']) {
+              const rawAmt = parseInt(parsed.tags['pinned-chat-paid-amount'], 10) || 0;
+              const exp = parseInt(parsed.tags['pinned-chat-paid-exponent'] || '2', 10);
+              const decAmt = parseFloat((rawAmt / Math.pow(10, exp)).toFixed(Math.max(0, exp)));
+              eventData.hype_chat = {
+                amount: rawAmt,
+                exponent: exp,
+                DecimalAmount: decAmt,
+                decimal_amount: decAmt,
+                currency: parsed.tags['pinned-chat-paid-currency'] || "USD",
+                level: parsed.tags['pinned-chat-paid-level'] || "ONE",
+                is_system_message: parsed.tags['pinned-chat-paid-is-system-message'] === '1'
+              };
+            }
+
+            if (parsed.tags['source-room-id']) {
+              eventData.shared_chat = {
+                source_room_id: parsed.tags['source-room-id'],
+                source_msg_id: parsed.tags['source-id'] || "",
+                source_badges: parsed.tags['source-badges'] || ""
+              };
+            }
+
+            const tdComment: any = {
+              _id: parsed.tags.id || `msg-${chatSentTs}-${Math.random().toString(36).slice(2, 8)}`,
               created_at: new Date(chatSentTs).toISOString(),
               updated_at: new Date(chatSentTs).toISOString(),
               channel_id: twitchId,
@@ -1934,45 +2449,247 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
                 name: parsed.username,
                 type: "user",
                 bio: "",
-                created_at: new Date().toISOString(),
-                updated_at: new Date().toISOString(),
+                created_at: new Date(chatSentTs).toISOString(),
+                updated_at: new Date(chatSentTs).toISOString(),
                 logo: ""
               },
               source: "chat",
               state: "published",
+              bits_spent: bitsSpent,
+              user_notice_params: userNoticeParams,
+              first_msg: isFirstMsg,
+              returning_chatter: isReturningChatter,
               message: {
                 body: msgBody,
                 fragments: buildFragments(msgBody, emotesTag),
                 is_action: isAction,
                 user_badges: parseBadges(parsed.tags.badges || ""),
                 user_color: parsed.tags.color || "#FFFFFF",
-                user_notice_params: {}
+                bits_spent: bitsSpent,
+                user_notice_params: userNoticeParams
+              },
+              event_type: customRewardId ? "channel_points_custom_reward_redemption" : "chat_message",
+              event_data: eventData
+            };
+
+            enqueueComment(tdComment);
+            continue;
+          }
+
+          // 2. Subscriptions, Gift Subs, Raids, Announcements, Watch Streaks (USERNOTICE)
+          if (parsed.command === 'USERNOTICE') {
+            const msgId = parsed.tags['msg-id'] || 'usernotice';
+            const systemMsg = parsed.tags['system-msg'] || "";
+            const userMsg = parsed.message || "";
+            const emotesTag = parsed.tags.emotes || "";
+            const displayBody = userMsg || systemMsg;
+            const fragments = userMsg
+              ? buildFragments(userMsg, emotesTag)
+              : [{ text: systemMsg }];
+
+            const userNoticeParams: Record<string, string> = {};
+            for (const [k, v] of Object.entries(parsed.tags)) {
+              if (k === 'msg-id' || k === 'system-msg' || k.startsWith('msg-param-') || k === 'login' || k === 'display-name') {
+                userNoticeParams[k] = v;
+              }
+            }
+
+            const loginName = parsed.tags['login'] || parsed.username || "twitch";
+            const displayName = parsed.tags['display-name'] || loginName || "Twitch";
+            const commentEventType = msgId === 'announcement'
+              ? 'announcement'
+              : msgId === 'raid'
+              ? 'raid'
+              : 'usernotice';
+
+            const tdNoticeComment: any = {
+              _id: parsed.tags.id || `usernotice-${chatSentTs}-${Math.random().toString(36).slice(2, 8)}`,
+              created_at: new Date(chatSentTs).toISOString(),
+              updated_at: new Date(chatSentTs).toISOString(),
+              channel_id: twitchId,
+              content_type: "video",
+              content_id: streamId,
+              content_offset_seconds: contentOffsetSeconds,
+              commenter: {
+                display_name: displayName,
+                _id: parsed.tags['user-id'] || "0",
+                name: loginName,
+                type: "user",
+                bio: "",
+                created_at: new Date(chatSentTs).toISOString(),
+                updated_at: new Date(chatSentTs).toISOString(),
+                logo: ""
+              },
+              source: "chat",
+              state: "published",
+              bits_spent: 0,
+              user_notice_params: userNoticeParams,
+              message: {
+                body: displayBody,
+                fragments,
+                is_action: false,
+                user_badges: parseBadges(parsed.tags.badges || ""),
+                user_color: parsed.tags.color || "#9146FF",
+                bits_spent: 0,
+                user_notice_params: userNoticeParams
+              },
+              event_type: commentEventType,
+              event_data: {
+                notice_type: msgId,
+                category: msgId,
+                system_message: systemMsg,
+                user_message: userMsg,
+                announcement_color: parsed.tags['msg-param-color'] || null,
+                cumulative_months: parsed.tags['msg-param-cumulative-months'] ? parseInt(parsed.tags['msg-param-cumulative-months'], 10) : null,
+                streak_months: parsed.tags['msg-param-streak-months'] ? parseInt(parsed.tags['msg-param-streak-months'], 10) : null,
+                sub_plan: parsed.tags['msg-param-sub-plan'] || null,
+                sub_plan_name: parsed.tags['msg-param-sub-plan-name'] || null,
+                recipient_id: parsed.tags['msg-param-recipient-id'] || null,
+                recipient_user_id: parsed.tags['msg-param-recipient-id'] || null,
+                recipient_user_name: parsed.tags['msg-param-recipient-user-name'] || null,
+                recipient_user_login: parsed.tags['msg-param-recipient-user-name'] || null,
+                recipient_display_name: parsed.tags['msg-param-recipient-display-name'] || null,
+                mass_gift_count: parsed.tags['msg-param-mass-gift-count'] ? parseInt(parsed.tags['msg-param-mass-gift-count'], 10) : null,
+                sender_total_gifts: parsed.tags['msg-param-sender-count'] ? parseInt(parsed.tags['msg-param-sender-count'], 10) : null,
+                raid_viewer_count: parsed.tags['msg-param-viewerCount'] ? parseInt(parsed.tags['msg-param-viewerCount'], 10) : null,
+                raid_display_name: parsed.tags['msg-param-displayName'] || null,
+                milestone_category: parsed.tags['msg-param-category'] || null,
+                milestone_value: parsed.tags['msg-param-value'] ? parseInt(parsed.tags['msg-param-value'], 10) : null,
+                milestone_reward: parsed.tags['msg-param-copoReward'] ? parseInt(parsed.tags['msg-param-copoReward'], 10) : null,
+                params: userNoticeParams
               }
             };
 
-            if (isBackfilling || state.activeDownloadSessions[channelLogin]?.isAwaitingBackfillChoice) {
-              liveBuffer.push(tdComment);
-            } else if (state.activeDownloadSessions[channelLogin]) {
-              const currentSession = state.activeDownloadSessions[channelLogin];
-              if (existingIds.has(tdComment._id)) {
-                continue;
-              }
-              existingIds.add(tdComment._id);
+            enqueueComment(tdNoticeComment);
+            currentSession.eventsWritten = (currentSession.eventsWritten || 0) + 1;
+            continue;
+          }
 
-              if (!currentSession.pendingChatWrites) {
-                currentSession.pendingChatWrites = [];
-              }
-              currentSession.pendingChatWrites.push(tdComment);
+          // 3. Moderator Timeouts, Permanent Bans & Chat Clears (CLEARCHAT)
+          if (parsed.command === 'CLEARCHAT') {
+            const targetUserLogin = (parsed.message || "").trim();
+            const targetUserId = parsed.tags['target-user-id'] || "";
+            const banDurationRaw = parsed.tags['ban-duration'];
+            const banDurationSeconds = banDurationRaw !== undefined && banDurationRaw !== "" ? parseInt(banDurationRaw, 10) : null;
+            const action = !targetUserLogin
+              ? 'clear_all'
+              : banDurationSeconds !== null
+              ? 'timeout'
+              : 'ban';
 
-              if (currentSession.pendingChatWrites.length >= 25) {
-                flushPendingChatWrites(currentSession);
-              } else if (!currentSession.chatFlushTimer) {
-                currentSession.chatFlushTimer = setTimeout(() => {
-                  currentSession.chatFlushTimer = null;
-                  flushPendingChatWrites(currentSession);
-                }, 1500);
+            appendBroadcastEvent(channelLogin, {
+              _id: parsed.tags.id || `clearchat-${chatSentTs}-${targetUserLogin || 'all'}-${Math.random().toString(36).slice(2, 6)}`,
+              created_at: new Date(chatSentTs).toISOString(),
+              content_offset_seconds: contentOffsetSeconds,
+              source: 'irc',
+              type: 'clearchat',
+              event_type: 'clearchat',
+              category: action === 'clear_all' ? 'clear_chat' : action,
+              action,
+              data: {
+                action,
+                target_user_id: targetUserId || null,
+                target_user_login: targetUserLogin || null,
+                ban_duration_seconds: banDurationSeconds,
+                room_id: parsed.tags['room-id'] || twitchId
+              }
+            });
+            continue;
+          }
+
+          // 4. Single Message Deletion by Moderator (CLEARMSG)
+          if (parsed.command === 'CLEARMSG') {
+            const targetMsgId = parsed.tags['target-msg-id'] || "";
+            const targetUserLogin = parsed.tags['login'] || "";
+            const deletedBody = parsed.message || "";
+
+            appendBroadcastEvent(channelLogin, {
+              _id: `clearmsg-${chatSentTs}-${targetMsgId || Math.random().toString(36).slice(2, 7)}`,
+              created_at: new Date(chatSentTs).toISOString(),
+              content_offset_seconds: contentOffsetSeconds,
+              source: 'irc',
+              type: 'clearmsg',
+              event_type: 'clearmsg',
+              category: 'delete_message',
+              data: {
+                target_msg_id: targetMsgId,
+                target_user_login: targetUserLogin,
+                deleted_body: deletedBody,
+                deleted_message_body: deletedBody,
+                room_id: parsed.tags['room-id'] || twitchId
+              }
+            });
+            continue;
+          }
+
+          // 5. Chat Room Mode Changes (ROOMSTATE)
+          if (parsed.command === 'ROOMSTATE') {
+            const stateChanges: Record<string, any> = {
+              emote_only: null,
+              subs_only: null,
+              slow_seconds: null,
+              followers_only_minutes: null,
+              r9k: null
+            };
+            let hasDelta = false;
+
+            if (parsed.tags['emote-only'] !== undefined) {
+              const val = parsed.tags['emote-only'] === '1';
+              if (lastRoomState.emote_only !== val) {
+                lastRoomState.emote_only = val;
+                stateChanges.emote_only = val;
+                hasDelta = true;
               }
             }
+            if (parsed.tags['subs-only'] !== undefined) {
+              const val = parsed.tags['subs-only'] === '1';
+              if (lastRoomState.subs_only !== val) {
+                lastRoomState.subs_only = val;
+                stateChanges.subs_only = val;
+                hasDelta = true;
+              }
+            }
+            if (parsed.tags['slow'] !== undefined) {
+              const val = parseInt(parsed.tags['slow'], 10) || 0;
+              if (lastRoomState.slow_seconds !== val) {
+                lastRoomState.slow_seconds = val;
+                stateChanges.slow_seconds = val;
+                stateChanges.slow_mode_seconds = val;
+                hasDelta = true;
+              }
+            }
+            if (parsed.tags['followers-only'] !== undefined) {
+              const val = parseInt(parsed.tags['followers-only'], 10);
+              const normVal = Number.isFinite(val) ? val : -1;
+              if (lastRoomState.followers_only_minutes !== normVal) {
+                lastRoomState.followers_only_minutes = normVal;
+                stateChanges.followers_only_minutes = normVal;
+                hasDelta = true;
+              }
+            }
+            if (parsed.tags['r9k'] !== undefined) {
+              const val = parsed.tags['r9k'] === '1';
+              if (lastRoomState.r9k !== val) {
+                lastRoomState.r9k = val;
+                stateChanges.r9k = val;
+                stateChanges.r9k_unique_chat = val;
+                hasDelta = true;
+              }
+            }
+
+            if (hasDelta) {
+              appendBroadcastEvent(channelLogin, {
+                _id: `roomstate-${chatSentTs}-${Math.random().toString(36).slice(2, 7)}`,
+                created_at: new Date(chatSentTs).toISOString(),
+                content_offset_seconds: contentOffsetSeconds,
+                source: 'irc',
+                type: 'roomstate',
+                event_type: 'roomstate',
+                category: 'roomstate_updated',
+                data: stateChanges
+              });
+            }
+            continue;
           }
         }
       };
@@ -2019,7 +2736,484 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
       ws.on('error', handleError);
     }
 
+    // Companion Twitch PubSub WebSocket Client for Predictions, Polls, Pinned Messages, Channel Points, Hype Trains & Raids
+    const lastPredictionTracker = new Map<string, { sig: string; ts: number; status: string }>();
+    const lastPollTracker = new Map<string, { sig: string; ts: number; status: string }>();
+    const rewardMetadataCache = new Map<string, { title: string; cost: number; prompt: string; background_color: string }>();
+    const lastRoomState: {
+      emote_only?: boolean;
+      subs_only?: boolean;
+      slow_seconds?: number;
+      followers_only_minutes?: number;
+      r9k?: boolean;
+    } = {};
+
+    function connectPubSubWebSocket() {
+      const activeSession = state.activeDownloadSessions[channelLogin];
+      if (!activeSession || activeSession.isStopped || !twitchId) {
+        return;
+      }
+
+      if (activeSession.pubsubWs) {
+        try {
+          activeSession.pubsubWs.removeAllListeners();
+          activeSession.pubsubWs.terminate();
+        } catch (_) {}
+        activeSession.pubsubWs = null;
+      }
+
+      let pubsubHeartbeat: NodeJS.Timeout | null = null;
+      const clearPubsubHeartbeat = () => {
+        if (pubsubHeartbeat) {
+          clearInterval(pubsubHeartbeat);
+          pubsubHeartbeat = null;
+        }
+        if (activeSession.pubsubHeartbeatInterval) {
+          clearInterval(activeSession.pubsubHeartbeatInterval);
+          activeSession.pubsubHeartbeatInterval = null;
+        }
+      };
+
+      const pubWs = new WebSocket('wss://pubsub-edge.twitch.tv/v1');
+      activeSession.pubsubWs = pubWs;
+
+      const handlePubOpen = () => {
+        const curSession = state.activeDownloadSessions[channelLogin];
+        if (!curSession || curSession.isStopped) {
+          clearPubsubHeartbeat();
+          try { pubWs.terminate(); } catch (_) {}
+          return;
+        }
+
+        const topics = [
+          `predictions-channel-v1.${twitchId}`,
+          `polls.${twitchId}`,
+          `pinned-chat-updates-v1.${twitchId}`,
+          `community-points-channel-v1.${twitchId}`,
+          `hype-train-events-v1.${twitchId}`,
+          `raid.${twitchId}`
+        ];
+
+        try {
+          pubWs.send(JSON.stringify({
+            type: "LISTEN",
+            nonce: `vod_auto_${channelLogin}_${Date.now()}`,
+            data: { topics }
+          }));
+          addLog(`[PubSub] Subscribed to live broadcast overlay events for @${channelLogin} (Predictions, Polls, Pinned Messages, Channel Points, Hype Trains, Raids).`);
+        } catch (err: any) {
+          addLog(`[PubSub] Failed to send LISTEN packet for @${channelLogin}: ${err.message}`);
+        }
+
+        clearPubsubHeartbeat();
+        pubsubHeartbeat = setInterval(() => {
+          const s = state.activeDownloadSessions[channelLogin];
+          if (!s || s.isStopped || pubWs.readyState !== WebSocket.OPEN) {
+            clearPubsubHeartbeat();
+            return;
+          }
+          try {
+            pubWs.send(JSON.stringify({ type: "PING" }));
+          } catch (_) {}
+        }, 210_000 + Math.floor(Math.random() * 15_000)); // ~3.5m keepalive
+        activeSession.pubsubHeartbeatInterval = pubsubHeartbeat;
+      };
+
+      const handlePubMessage = (rawData: WebSocket.Data) => {
+        const curSession = state.activeDownloadSessions[channelLogin];
+        if (!curSession || curSession.isStopped) return;
+
+        let packet: any;
+        try {
+          packet = JSON.parse(rawData.toString());
+        } catch (_) {
+          return;
+        }
+
+        if (packet.type === "RECONNECT") {
+          addLog(`[PubSub] Server requested RECONNECT for @${channelLogin}. Cycling PubSub connection...`);
+          try { pubWs.close(); } catch (_) {}
+          return;
+        }
+
+        if (packet.type !== "MESSAGE" || !packet.data?.topic || !packet.data?.message) {
+          return;
+        }
+
+        const topic: string = packet.data.topic;
+        let inner: any;
+        try {
+          inner = JSON.parse(packet.data.message);
+        } catch (_) {
+          return;
+        }
+
+        const nowMs = Date.now();
+        const offsetSec = computeOffsetSec(nowMs);
+
+        // Topic 1: Predictions (predictions-channel-v1)
+        if (topic.startsWith('predictions-channel-v1.')) {
+          const ev = inner?.data?.event;
+          if (!ev || !ev.id) return;
+
+          const predId = String(ev.id);
+          const status = String(ev.status || 'ACTIVE').toUpperCase();
+          const outcomes = Array.isArray(ev.outcomes) ? ev.outcomes.map((o: any) => ({
+            id: o.id,
+            title: o.title,
+            color: o.color,
+            total_points: o.total_points || 0,
+            total_users: o.total_users || 0,
+            top_predictors: Array.isArray(o.top_predictors) ? o.top_predictors.slice(0, 5).map((tp: any) => ({
+              user_id: tp.user_id,
+              user_display_name: tp.user_display_name,
+              points: tp.points
+            })) : []
+          })) : [];
+
+          const sig = `${status}|${outcomes.map((o: any) => `${o.id}:${o.total_points}:${o.total_users}`).join(',')}`;
+          const prev = lastPredictionTracker.get(predId);
+
+          if (inner.type === 'event-updated' && status === 'ACTIVE' && prev) {
+            if (prev.sig === sig || (nowMs - prev.ts) < 900) {
+              return;
+            }
+          }
+
+          let category = 'prediction_updated';
+          if (inner.type === 'event-created' || !prev) {
+            category = 'prediction_created';
+            addLog(`[PubSub] Prediction started on @${channelLogin}: "${ev.title}" (${outcomes.map((o: any) => o.title).join(' vs ')})`);
+          } else if (inner.type === 'event-locked' || (status === 'LOCKED' && prev.status !== 'LOCKED')) {
+            category = 'prediction_locked';
+            addLog(`[PubSub] Prediction locked on @${channelLogin}: "${ev.title}"`);
+          } else if (status === 'RESOLVED' && prev.status !== 'RESOLVED') {
+            category = 'prediction_resolved';
+            const winner = outcomes.find((o: any) => o.id === ev.winning_outcome_id);
+            addLog(`[PubSub] Prediction resolved on @${channelLogin}: "${ev.title}" -> Winner: "${winner?.title || ev.winning_outcome_id}"`);
+          } else if ((status === 'CANCELED' || status === 'CANCELLED') && prev.status !== status) {
+            category = 'prediction_canceled';
+            addLog(`[PubSub] Prediction canceled on @${channelLogin}: "${ev.title}"`);
+          }
+
+          lastPredictionTracker.set(predId, { sig, ts: nowMs, status });
+
+          appendBroadcastEvent(channelLogin, {
+            _id: `pred-${predId}-${category}-${nowMs}`,
+            created_at: new Date(nowMs).toISOString(),
+            content_offset_seconds: offsetSec,
+            source: 'pubsub',
+            type: 'prediction',
+            event_type: 'prediction',
+            category,
+            data: {
+              pubsub_type: inner.type || 'event-updated',
+              prediction_id: predId,
+              title: ev.title || "",
+              status,
+              prediction_window_seconds: ev.prediction_window_seconds || 0,
+              created_at: ev.created_at || new Date(nowMs).toISOString(),
+              locked_at: ev.locked_at || null,
+              ended_at: ev.ended_at || null,
+              winning_outcome_id: ev.winning_outcome_id || null,
+              outcomes
+            }
+          });
+          return;
+        }
+
+        // Topic 2: Polls (polls.<twitchId>)
+        if (topic.startsWith('polls.')) {
+          const poll = inner?.data?.poll;
+          if (!poll || !poll.poll_id) return;
+
+          const pollId = String(poll.poll_id);
+          const status = String(poll.status || 'ACTIVE').toUpperCase();
+          const choices = Array.isArray(poll.choices) ? poll.choices.map((c: any) => ({
+            choice_id: c.choice_id,
+            title: c.title,
+            total_voters: c.votes?.total ?? c.total_voters ?? 0,
+            bits_votes: c.votes?.bits ?? 0,
+            channel_points_votes: c.votes?.channel_points ?? 0
+          })) : [];
+          const totalVoters = choices.reduce((sum: number, c: any) => sum + (c.total_voters || 0), 0);
+
+          const sig = `${status}|${choices.map((c: any) => `${c.choice_id}:${c.total_voters}`).join(',')}`;
+          const prev = lastPollTracker.get(pollId);
+
+          if (inner.type === 'POLL_UPDATE' && status === 'ACTIVE' && prev) {
+            if (prev.sig === sig || (nowMs - prev.ts) < 900) {
+              return;
+            }
+          }
+
+          let category = 'poll_updated';
+          if (inner.type === 'POLL_CREATE' || !prev) {
+            category = 'poll_created';
+            addLog(`[PubSub] Poll started on @${channelLogin}: "${poll.title}"`);
+          } else if (inner.type === 'POLL_COMPLETE' || status === 'COMPLETED') {
+            category = 'poll_completed';
+            addLog(`[PubSub] Poll completed on @${channelLogin}: "${poll.title}"`);
+          } else if (inner.type === 'POLL_ARCHIVE' || status === 'ARCHIVED') {
+            category = 'poll_archived';
+          } else if (inner.type === 'POLL_TERMINATE' || status === 'TERMINATED') {
+            category = 'poll_terminated';
+          }
+
+          lastPollTracker.set(pollId, { sig, ts: nowMs, status });
+
+          appendBroadcastEvent(channelLogin, {
+            _id: `poll-${pollId}-${category}-${nowMs}`,
+            created_at: new Date(nowMs).toISOString(),
+            content_offset_seconds: offsetSec,
+            source: 'pubsub',
+            type: 'poll',
+            event_type: 'poll',
+            category,
+            data: {
+              pubsub_type: inner.type || 'POLL_UPDATE',
+              poll_id: pollId,
+              title: poll.title || "",
+              status,
+              duration_seconds: poll.duration_seconds || 0,
+              started_at: poll.started_at || new Date(nowMs).toISOString(),
+              ended_at: poll.ended_at || null,
+              total_voters: totalVoters,
+              choices
+            }
+          });
+          return;
+        }
+
+        // Topic 3: Moderator / Streamer Pinned Messages (pinned-chat-updates-v1.<twitchId>)
+        if (topic.startsWith('pinned-chat-updates-v1.')) {
+          const d = inner?.data;
+          if (!d) return;
+          const pinId = String(d.id || d.pin_id || `pin-${nowMs}`);
+          const rawAction = inner.type === 'unpin-message'
+            ? 'unpin-message'
+            : inner.type === 'update-message'
+            ? 'update-message'
+            : 'pin-message';
+          const category = rawAction === 'unpin-message'
+            ? 'unpin_message'
+            : rawAction === 'update-message'
+            ? 'update_pinned_message'
+            : 'pin_message';
+
+          const msgObj = d.message || {};
+          if (category === 'pin_message') {
+            addLog(`[PubSub] Message pinned on @${channelLogin} by ${d.pinned_by?.display_name || 'Moderator'}: "${msgObj.content?.text || ''}"`);
+          }
+
+          const pinType = d.type || msgObj.type || 'MOD_PIN';
+          const senderBadges = Array.isArray(msgObj.sender?.badges) ? msgObj.sender.badges.map((b: any) => ({
+            _id: b.id || b._id || b.setID || "",
+            version: String(b.version || "1")
+          })) : [];
+
+          appendBroadcastEvent(channelLogin, {
+            _id: `pin-${pinId}-${category}-${nowMs}`,
+            created_at: new Date(nowMs).toISOString(),
+            content_offset_seconds: offsetSec,
+            source: 'pubsub',
+            type: 'pinned_chat',
+            event_type: 'pinned_chat',
+            category,
+            action: rawAction,
+            data: {
+              action: rawAction,
+              pin_id: pinId,
+              type: pinType,
+              pin_type: pinType,
+              message_id: msgObj.id || null,
+              message_text: msgObj.content?.text || "",
+              sender_id: msgObj.sender?.id || null,
+              sender_display_name: msgObj.sender?.display_name || null,
+              sender_color: msgObj.sender?.chat_color || "#FFFFFF",
+              sender_badges: senderBadges,
+              pinned_by_id: d.pinned_by?.id || null,
+              pinned_by_display_name: d.pinned_by?.display_name || null,
+              starts_at: msgObj.starts_at || Math.floor(nowMs / 1000),
+              ends_at: msgObj.ends_at || null,
+              updated_at: msgObj.updated_at || Math.floor(nowMs / 1000),
+              pinned_by: d.pinned_by ? {
+                id: d.pinned_by.id,
+                display_name: d.pinned_by.display_name
+              } : null,
+              unpinned_by: d.unpinned_by ? {
+                id: d.unpinned_by.id,
+                display_name: d.unpinned_by.display_name
+              } : null,
+              message: msgObj.id ? {
+                id: msgObj.id,
+                text: msgObj.content?.text || "",
+                sender: msgObj.sender ? {
+                  id: msgObj.sender.id,
+                  display_name: msgObj.sender.display_name,
+                  chat_color: msgObj.sender.chat_color || "#FFFFFF",
+                  badges: senderBadges
+                } : null,
+                starts_at: msgObj.starts_at || nowMs,
+                ends_at: msgObj.ends_at || null,
+                updated_at: msgObj.updated_at || nowMs
+              } : null
+            }
+          });
+          return;
+        }
+
+        // Topic 4: Channel Points Redemptions (community-points-channel-v1.<twitchId>)
+        if (topic.startsWith('community-points-channel-v1.')) {
+          const redemption = inner?.data?.redemption;
+          if (!redemption || !redemption.id) return;
+
+          const rewardId = redemption.reward?.id || "";
+          const rewardTitle = redemption.reward?.title || "";
+          const rewardCost = redemption.reward?.cost || 0;
+          const rewardPrompt = redemption.reward?.prompt || "";
+          const rewardBgColor = redemption.reward?.background_color || "#9146FF";
+
+          if (rewardId) {
+            rewardMetadataCache.set(rewardId, {
+              title: rewardTitle,
+              cost: rewardCost,
+              prompt: rewardPrompt,
+              background_color: rewardBgColor
+            });
+          }
+
+          appendBroadcastEvent(channelLogin, {
+            _id: `cp-${redemption.id}`,
+            created_at: redemption.redeemed_at || new Date(nowMs).toISOString(),
+            content_offset_seconds: offsetSec,
+            source: 'pubsub',
+            type: 'channel_points',
+            event_type: 'channel_points',
+            category: 'channel_points_custom_reward_redemption',
+            data: {
+              redemption_id: redemption.id,
+              user_id: redemption.user?.id || "",
+              user_login: redemption.user?.login || "",
+              user_display_name: redemption.user?.display_name || "",
+              reward_id: rewardId,
+              reward_title: rewardTitle,
+              reward_cost: rewardCost,
+              reward_prompt: rewardPrompt,
+              reward_background_color: rewardBgColor,
+              user_input: redemption.user_input || null,
+              status: redemption.status || "FULFILLED",
+              user: {
+                id: redemption.user?.id || "",
+                login: redemption.user?.login || "",
+                display_name: redemption.user?.display_name || ""
+              },
+              reward: {
+                id: rewardId,
+                title: rewardTitle,
+                prompt: rewardPrompt,
+                cost: rewardCost,
+                background_color: rewardBgColor
+              }
+            }
+          });
+          return;
+        }
+
+        // Topic 5: Hype Trains (hype-train-events-v1.<twitchId>)
+        if (topic.startsWith('hype-train-events-v1.')) {
+          const d = inner?.data || {};
+          const rawType = String(inner?.type || 'hype-train-progression');
+          const category = rawType.replace(/-/g, '_');
+
+          appendBroadcastEvent(channelLogin, {
+            _id: `hypetrain-${d.id || d.channel_id || twitchId}-${category}-${nowMs}`,
+            created_at: new Date(nowMs).toISOString(),
+            content_offset_seconds: offsetSec,
+            source: 'pubsub',
+            type: 'hype_train',
+            event_type: 'hype_train',
+            category,
+            data: {
+              pubsub_type: rawType,
+              train_id: d.id || d.progression?.id || "",
+              level: d.progress?.level?.value ?? d.level ?? 1,
+              goal: d.progress?.level?.goal ?? d.goal ?? 0,
+              progress: d.progress?.value ?? d.value ?? 0,
+              total: d.progress?.total ?? d.total ?? 0,
+              started_at: d.started_at || null,
+              expires_at: d.expires_at || null,
+              ends_at: d.expires_at || d.ended_at || null,
+              ended_at: d.ended_at || null,
+              is_golden_kappa: Boolean(d.is_golden_kappa_train)
+            }
+          });
+          return;
+        }
+
+        // Topic 6: Outgoing / Incoming Raid Updates (raid.<twitchId>)
+        if (topic.startsWith('raid.')) {
+          const r = inner?.raid;
+          if (!r) return;
+          const rawType = String(inner.type || 'raid_update_v2');
+
+          appendBroadcastEvent(channelLogin, {
+            _id: `raid-${r.id || nowMs}-${rawType}`,
+            created_at: new Date(nowMs).toISOString(),
+            content_offset_seconds: offsetSec,
+            source: 'pubsub',
+            type: 'raid',
+            event_type: 'raid',
+            category: rawType,
+            data: {
+              pubsub_type: rawType,
+              raid_id: r.id || "",
+              source_id: r.source_id || twitchId,
+              target_id: r.target_id || "",
+              target_login: r.target_login || "",
+              target_display_name: r.target_display_name || "",
+              viewer_count: r.viewer_count || 0
+            }
+          });
+          return;
+        }
+      };
+
+      const cleanupPubListeners = () => {
+        clearPubsubHeartbeat();
+        pubWs.removeListener('open', handlePubOpen);
+        pubWs.removeListener('message', handlePubMessage);
+        pubWs.removeListener('close', handlePubClose);
+        pubWs.removeListener('error', handlePubError);
+      };
+
+      const handlePubClose = () => {
+        cleanupPubListeners();
+        const curSession = state.activeDownloadSessions[channelLogin];
+        if (curSession && !curSession.isStopped) {
+          if (curSession.pubsubReconnectTimer) {
+            clearTimeout(curSession.pubsubReconnectTimer);
+          }
+          curSession.pubsubReconnectTimer = setTimeout(() => {
+            if (state.activeDownloadSessions[channelLogin] && !state.activeDownloadSessions[channelLogin].isStopped) {
+              connectPubSubWebSocket();
+            }
+          }, 5000);
+        }
+      };
+
+      const handlePubError = (err: any) => {
+        addLog(`[PubSub] WebSocket notice for @${channelLogin}: ${err.message}`);
+      };
+
+      pubWs.on('open', handlePubOpen);
+      pubWs.on('message', handlePubMessage);
+      pubWs.on('close', handlePubClose);
+      pubWs.on('error', handlePubError);
+    }
+
     connectWebSocket();
+    connectPubSubWebSocket();
   }
 
   /**

@@ -3,7 +3,7 @@ import path from "path";
 import { spawn, ChildProcess } from "child_process";
 import { Parser } from "m3u8-parser";
 import { state, addLog, updateTask, removeTask, resolveTdPath } from "./state";
-import { startChatRenderMultiple, safeParseChatData, repairChatJsonFile } from "./chat";
+import { startChatRenderMultiple, safeParseChatData, repairChatJsonFile, sliceAndCarryOverBroadcastEvents, getEventsSidecarPath } from "./chat";
 import { ensureFfmpeg, getVideoDurationSeconds } from "./ffmpeg";
 import { twitchAxios, getSourceMediaPlaylistUrl, fetchRecentVods, fetchInitSegmentFromTwitch, inspectMp4InitBuffer } from "./twitch";
 
@@ -908,7 +908,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
       if (chatFilePath && fs.existsSync(chatFilePath)) {
         try {
           const chatDataRaw = await fs.promises.readFile(chatFilePath, 'utf8');
-          const chatData = safeParseChatData(chatDataRaw);
+          const chatData = safeParseChatData(chatDataRaw, chatFilePath);
           if (chatData && Array.isArray(chatData.comments)) {
             const firstChunkInVideo = getChunkIndex(customChunks[0]);
             const actualVideoDurationSec = customDuration > 0 ? customDuration : Math.max(1, Math.round(customChunks.length * 2));
@@ -953,7 +953,17 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
               }
             }
 
-            const newChatData = { ...chatData, comments: filteredComments };
+            const filteredEvents = sliceAndCarryOverBroadcastEvents(
+              Array.isArray(chatData.events) ? chatData.events : [],
+              videoStartOffset,
+              videoEndOffset,
+              gapAdjustments,
+              baseOffsetSec,
+              baseSeq,
+              avgChunkDur
+            );
+
+            const newChatData = { ...chatData, comments: filteredComments, events: filteredEvents };
             if (newChatData.video) {
               newChatData.video.start = 0;
               newChatData.video.end = actualVideoDurationSec;
@@ -1036,7 +1046,10 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
         
         const videoOutputName = `${i + 1}_${cleanName}_${dateStr}.ts`;
         
-        let startIdx = i === 0 ? 0 : Math.max(0, game.startChunk - CHUNK_BUFFER);
+        const gameLeadingBufferChunks = (game.customLeadingBufferMins !== undefined && Number.isFinite(game.customLeadingBufferMins) && game.customLeadingBufferMins >= 0)
+          ? Math.floor((game.customLeadingBufferMins * 60) / 2)
+          : CHUNK_BUFFER;
+        let startIdx = i === 0 ? 0 : Math.max(0, game.startChunk - gameLeadingBufferChunks);
         let endIdx = nextGame 
           ? Math.min(getChunkIndex(activeChunkList[activeChunkList.length - 1]), nextGame.startChunk + CHUNK_BUFFER)
           : Infinity;
@@ -1067,8 +1080,11 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
             const obsoleteChunks: string[] = [];
 
             if (nextGame) {
-              // Next game will need chunks starting from (nextGame.startChunk - CHUNK_BUFFER)
-              const nextBufferStartIdx = Math.max(0, nextGame.startChunk - CHUNK_BUFFER);
+              // Next game will need chunks starting from (nextGame.startChunk - nextLeadingBufferChunks)
+              const nextLeadingBufferChunks = (nextGame.customLeadingBufferMins !== undefined && Number.isFinite(nextGame.customLeadingBufferMins) && nextGame.customLeadingBufferMins >= 0)
+                ? Math.floor((nextGame.customLeadingBufferMins * 60) / 2)
+                : CHUNK_BUFFER;
+              const nextBufferStartIdx = Math.max(0, nextGame.startChunk - nextLeadingBufferChunks);
               for (const file of currentDirFiles) {
                 if (file.startsWith('seq_') && file.endsWith('.ts')) {
                   const idx = getChunkIndex(file);
@@ -1123,7 +1139,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
         if (chatFilePath && fs.existsSync(chatFilePath)) {
           try {
             const chatDataRaw = await fs.promises.readFile(chatFilePath, 'utf8');
-            const chatData = safeParseChatData(chatDataRaw);
+            const chatData = safeParseChatData(chatDataRaw, chatFilePath);
             if (!chatData || !Array.isArray(chatData.comments)) {
               throw new Error("Unable to parse valid comments from chat file");
             }
@@ -1175,7 +1191,17 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
               }
             }
 
-            const newChatData = { ...chatData, comments: filteredComments };
+            const filteredEvents = sliceAndCarryOverBroadcastEvents(
+              Array.isArray(chatData.events) ? chatData.events : [],
+              videoStartOffset,
+              videoEndOffset,
+              gapAdjustments,
+              baseOffsetSec,
+              baseSeq,
+              avgChunkDur
+            );
+
+            const newChatData = { ...chatData, comments: filteredComments, events: filteredEvents };
             if (newChatData.video) {
               newChatData.video.start = 0;
               newChatData.video.end = actualVideoDurationSec;
@@ -1243,6 +1269,10 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
           addLog(`[Video] Cleaning up original full broadcast chat file...`);
           try {
             await fs.promises.unlink(chatFilePath);
+            const sidecarPath = getEventsSidecarPath(chatFilePath);
+            if (sidecarPath && fs.existsSync(sidecarPath)) {
+              await fs.promises.unlink(sidecarPath).catch(() => {});
+            }
           } catch (e) {}
         } else {
           addLog(`[Video] Retaining original broadcast chat file due to chat processing errors so data is not lost.`);

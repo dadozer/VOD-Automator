@@ -40,7 +40,7 @@
     "allowUnlistedEmotes": true,
     "badges": true,
     "subMessages": true,
-    "dispersion": false,
+    "dispersion": "smart",
     "offline": false,
     "avatars": false,
     "readableColors": true,

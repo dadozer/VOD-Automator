@@ -16,7 +16,7 @@ import {
   fetchVodChapters,
   inspectMp4InitBuffer
 } from "./twitch";
-import { startLiveChatDownload, startChatRenderMultiple, repairChatJsonFile, resolveLiveChatBackfill, flushPendingChatWrites } from "./chat";
+import { startLiveChatDownload, startChatRenderMultiple, repairChatJsonFile, resolveLiveChatBackfill, flushPendingChatWrites, readBroadcastEventsForChatFile, getEventsSidecarPath } from "./chat";
 import { stitchVideoChunks } from "./video";
 
 export const DISK_WARNING_THRESHOLD_BYTES = 20 * 1024 * 1024 * 1024; // 20 GB
@@ -345,28 +345,46 @@ export async function checkStreamStatus() {
             
             const lastGame = activeSession.games[activeSession.games.length - 1];
             
-            // Maintain max sequence number in memory during active session
-            let maxChunk = activeSession.highestSeq > 0 ? activeSession.highestSeq : 0;
-            if (maxChunk === 0 && fs.existsSync(activeSession.folderPath)) {
-              try {
-                const entries = await fs.promises.readdir(activeSession.folderPath, { withFileTypes: true });
-                const chunkFiles = entries.filter(e => e.isFile() && e.name.startsWith('seq_') && e.name.endsWith('.ts')).map(e => e.name);
-                if (chunkFiles.length > 0) {
-                  maxChunk = Math.max(...chunkFiles.map(f => parseInt(f.replace('seq_', '').replace('.ts', ''))).filter(n => !isNaN(n)));
+            if (lastGame && lastGame.isAwaitingNextGame) {
+              const prevFallbackName = lastGame.gameName;
+              lastGame.gameName = newGame;
+              lastGame.isAwaitingNextGame = false;
+              activeSession.currentGame = newGame;
+              addLog(`[Game Change] Broadcaster updated category to "${newGame}". Assigned pending segment (started at chunk ${lastGame.startChunk}, fallback "${prevFallbackName}", ${lastGame.customLeadingBufferMins ?? (state.config.gameSwitchBufferMins ?? 5) * 2}m leading buffer) to "${newGame}".`);
+              scheduleStateSave();
+            } else {
+              // Maintain max sequence number in memory during active session
+              let maxChunk = activeSession.highestSeq > 0 ? activeSession.highestSeq : 0;
+              if (maxChunk === 0 && fs.existsSync(activeSession.folderPath)) {
+                try {
+                  const entries = await fs.promises.readdir(activeSession.folderPath, { withFileTypes: true });
+                  const chunkFiles = entries.filter(e => e.isFile() && e.name.startsWith('seq_') && e.name.endsWith('.ts')).map(e => e.name);
+                  if (chunkFiles.length > 0) {
+                    maxChunk = Math.max(...chunkFiles.map(f => parseInt(f.replace('seq_', '').replace('.ts', ''))).filter(n => !isNaN(n)));
+                  }
+                } catch (e) {}
+              }
+              
+              // Lock the chat's time offset directly to the exact accumulated video duration to prevent drift
+              const timeOffsetSeconds = Math.floor(activeSession.videoDurationSeconds || 0);
+
+              if (lastGame && !lastGame.isTimeSplice && (now - lastGame.startTimeMs) < 3 * 60 * 1000) {
+                // Current game lasted < 3 mins. Absorb it.
+                addLog(`[Game Change] "${lastGame.gameName}" lasted less than 3 mins. Absorbing into previous game...`);
+                activeSession.games.pop();
+
+                const previousGame = activeSession.games[activeSession.games.length - 1];
+                if (!previousGame || previousGame.gameName !== newGame) {
+                  activeSession.games.push({
+                    gameName: newGame,
+                    startChunk: maxChunk,
+                    startTimeOffset: timeOffsetSeconds,
+                    startTimeMs: now
+                  });
                 }
-              } catch (e) {}
-            }
-            
-            // Lock the chat's time offset directly to the exact accumulated video duration to prevent drift
-            const timeOffsetSeconds = Math.floor(activeSession.videoDurationSeconds || 0);
-
-            if (lastGame && !lastGame.isTimeSplice && (now - lastGame.startTimeMs) < 3 * 60 * 1000) {
-              // Current game lasted < 3 mins. Absorb it.
-              addLog(`[Game Change] "${lastGame.gameName}" lasted less than 3 mins. Absorbing into previous game...`);
-              activeSession.games.pop();
-
-              const previousGame = activeSession.games[activeSession.games.length - 1];
-              if (!previousGame || previousGame.gameName !== newGame) {
+              } else {
+                // Valid game change
+                addLog(`[Game Change] Detected switch to "${newGame}". Logging boundary for Video/Chat split.`);
                 activeSession.games.push({
                   gameName: newGame,
                   startChunk: maxChunk,
@@ -374,18 +392,9 @@ export async function checkStreamStatus() {
                   startTimeMs: now
                 });
               }
-            } else {
-              // Valid game change
-              addLog(`[Game Change] Detected switch to "${newGame}". Logging boundary for Video/Chat split.`);
-              activeSession.games.push({
-                gameName: newGame,
-                startChunk: maxChunk,
-                startTimeOffset: timeOffsetSeconds,
-                startTimeMs: now
-              });
+              activeSession.currentGame = newGame;
+              scheduleStateSave();
             }
-            activeSession.currentGame = newGame;
-            scheduleStateSave();
           }
 
           // Update rich metadata
@@ -1382,9 +1391,10 @@ export async function executeResumeVodBackfill(
   }
 
   export interface ManualSpliceOptions {
-    action?: 'append_previous' | 'extract_clip' | 'split_new_part';
+    action?: 'append_previous' | 'extract_clip' | 'split_new_part' | 'await_next_game';
     clipScope?: 'whole_game' | 'custom_duration';
     clipMinutes?: number;
+    leadingBufferMinutes?: number;
   }
 
   export async function manualSpliceGame(channelLogin: string, options?: ManualSpliceOptions) {
@@ -1571,6 +1581,60 @@ export async function executeResumeVodBackfill(
       return { success: true, mode: 'extract_clip', gameName: currentGame.gameName, outputBase };
     }
 
+    // Option 4: End current game & await next Twitch category switch
+    if (action === 'await_next_game') {
+      const lastIndex = session.games.length - 1;
+      const lastGame = session.games[lastIndex];
+
+      const currentChunk = session.highestSeq > 0 ? session.highestSeq : 0;
+      const timeOffsetSeconds = Math.floor(session.videoDurationSeconds || 0);
+
+      const defaultBufferMins = state.config.gameSwitchBufferMins ?? 5;
+      const customLeadingBufferMins = (
+        options?.leadingBufferMinutes !== undefined &&
+        Number.isFinite(options.leadingBufferMinutes) &&
+        options.leadingBufferMinutes >= 0
+      )
+        ? Number(options.leadingBufferMinutes)
+        : (defaultBufferMins * 2);
+
+      // Finalize outgoing segment immediately
+      lastGame.overrideBuffer = true;
+      lastGame.isManualSplice = true;
+      lastGame.isExported = true;
+      lastGame.endChunk = currentChunk;
+
+      // Fallback name: "<Previous Game> Part 2" (or increment Part N if already Part N)
+      const partMatch = lastGame.gameName.match(/^(.*?)\s+Part\s+(\d+)$/i);
+      const fallbackName = partMatch
+        ? `${partMatch[1]} Part ${parseInt(partMatch[2], 10) + 1}`
+        : `${lastGame.gameName} Part 2`;
+
+      const pendingNextGame: SessionGame = {
+        gameName: fallbackName,
+        startChunk: currentChunk,
+        startTimeOffset: timeOffsetSeconds,
+        startTimeMs: Date.now(),
+        isManualSplice: true,
+        isAwaitingNextGame: true,
+        customLeadingBufferMins
+      };
+      session.games.push(pendingNextGame);
+      scheduleStateSave();
+
+      addLog(`[Manual Splice] Ended "${lastGame.gameName}" on @${channelLogin} at chunk ${currentChunk} (${timeOffsetSeconds}s) and awaiting next Twitch category switch (fallback label: "${fallbackName}", ${customLeadingBufferMins}m leading buffer). Splicing outgoing game immediately...`);
+      triggerMidStreamGameExport(session, lastIndex, session.channel);
+
+      return {
+        success: true,
+        mode: 'await_next_game',
+        gameIndex: lastIndex,
+        gameName: lastGame.gameName,
+        fallbackNextGameName: fallbackName,
+        leadingBufferMinutes: customLeadingBufferMins
+      };
+    }
+
     // Option 3: Split into new segment / part
     const lastIndex = session.games.length - 1;
     const lastGame = session.games[lastIndex];
@@ -1665,6 +1729,23 @@ export async function executeResumeVodBackfill(
         }
         session.chatWs = null;
       }
+      if (session.pubsubReconnectTimer) {
+        clearTimeout(session.pubsubReconnectTimer);
+        session.pubsubReconnectTimer = null;
+      }
+      if (session.pubsubHeartbeatInterval) {
+        clearInterval(session.pubsubHeartbeatInterval);
+        session.pubsubHeartbeatInterval = null;
+      }
+      if (session.pubsubWs) {
+        try {
+          session.pubsubWs.removeAllListeners();
+          session.pubsubWs.terminate();
+        } catch (e) {
+          try { session.pubsubWs.close(); } catch (err) {}
+        }
+        session.pubsubWs = null;
+      }
       if (session.chatStream) {
         if (session.activeChatBackfillPromise) {
           addLog(`[Chat] Waiting for active chat backfill to finish before sealing chat stream for ${channelLogin}...`);
@@ -1727,7 +1808,8 @@ export async function executeResumeVodBackfill(
           firstParty: [],
           twitchBadges: []
         };
-        session.chatStream.write('\n  ],\n  "embeddedData": ' + JSON.stringify(embeddedData) + '\n}\n');
+        const capturedEvents = session.chatFilePath ? readBroadcastEventsForChatFile(session.chatFilePath) : [];
+        session.chatStream.write('\n  ],\n  "events": ' + JSON.stringify(capturedEvents) + ',\n  "embeddedData": ' + JSON.stringify(embeddedData) + '\n}\n');
         await new Promise<void>((resolve) => {
           session.chatStream!.end(async () => {
             try {
@@ -1754,6 +1836,10 @@ export async function executeResumeVodBackfill(
                 
                 addLog(`[Chat] Updated chat file header with video length: ${duration}s.`);
                 await repairChatJsonFile(session.chatFilePath);
+                const sidecarPath = getEventsSidecarPath(session.chatFilePath);
+                if (sidecarPath && fs.existsSync(sidecarPath)) {
+                  await fs.promises.unlink(sidecarPath).catch(() => {});
+                }
               }
             } catch (err: any) {
               addLog(`[Chat] Failed to update chat file header: ${err.message}`);
@@ -1761,7 +1847,7 @@ export async function executeResumeVodBackfill(
             resolve();
           });
         });
-        addLog(`[Chat] Live chat recording saved (${session.commentsWritten} messages) for ${channelLogin}.`);
+        addLog(`[Chat] Live chat recording saved (${session.commentsWritten} messages, ${session.eventsWritten || 0} broadcast events) for ${channelLogin}.`);
       }
       if (state.activeTasks[`prompt_backfill_${session.streamId}`]) {
         delete state.activeTasks[`prompt_backfill_${session.streamId}`];

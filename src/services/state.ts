@@ -95,15 +95,27 @@ export function resolveTdPath(configuredTdPath?: string): string {
   if (raw) {
     const candidate = path.isAbsolute(raw) ? raw : path.resolve(PROJECT_ROOT, raw);
     if (fs.existsSync(candidate)) return candidate;
+    // If configured path points to TwitchDownloaderCLI.exe but ChatRenderCLI.exe exists in the same folder, use it
+    const dir = path.dirname(candidate);
+    const altChatRender = path.join(dir, process.platform === "win32" ? "ChatRenderCLI.exe" : "ChatRenderCLI");
+    if (fs.existsSync(altChatRender)) return altChatRender;
   }
-  // Check relative candidates in PROJECT_ROOT
-  const rootCandidates = [
-    path.join(PROJECT_ROOT, "TwitchDownloader", process.platform === "win32" ? "TwitchDownloaderCLI.exe" : "TwitchDownloaderCLI"),
-    path.join(PROJECT_ROOT, process.platform === "win32" ? "TwitchDownloaderCLI.exe" : "TwitchDownloaderCLI"),
-    path.join(PROJECT_ROOT, "bin", process.platform === "win32" ? "TwitchDownloaderCLI.exe" : "TwitchDownloaderCLI")
+  // Check relative and common candidates in PROJECT_ROOT and C:\TwitchDownloader
+  const isWin = process.platform === "win32";
+  const binNames = isWin ? ["ChatRenderCLI.exe", "TwitchDownloaderCLI.exe"] : ["ChatRenderCLI", "TwitchDownloaderCLI"];
+  const searchDirs = [
+    path.join(PROJECT_ROOT, "TwitchDownloader"),
+    path.join(PROJECT_ROOT, "ChatRenderCLI"),
+    PROJECT_ROOT,
+    path.join(PROJECT_ROOT, "bin"),
+    "C:\\TwitchDownloader",
+    "C:\\ChatRenderCLI"
   ];
-  for (const cand of rootCandidates) {
-    if (fs.existsSync(cand)) return cand;
+  for (const dir of searchDirs) {
+    for (const bin of binNames) {
+      const cand = path.join(dir, bin);
+      if (fs.existsSync(cand)) return cand;
+    }
   }
   if (raw && !path.isAbsolute(raw)) {
     return path.resolve(PROJECT_ROOT, raw);
@@ -137,23 +149,29 @@ export const defaultConfig: Config = {
     altBackgroundColor: "#191919",
     alternateBackgrounds: false,
     messageColor: "#ffffff",
+    highlightUsers: "",
+    highlightUserColor: "#C8FF0059",
     font: "Inter",
     fontSize: 24,
     messageFontStyle: "normal",
     usernameFontStyle: "bold",
+    scaleUsername: 1.0,
     outline: false,
     outlineSize: 4,
     framerate: 60,
     updateRate: 0,
+    jobs: 0,
+    imageCacheMb: 256,
     generateMask: false,
     bttv: true,
     ffz: true,
     stv: true,
     giphy: true,
+    gifMaxHeightPercent: 33,
     allowUnlistedEmotes: true,
     badges: true,
     subMessages: true,
-    dispersion: false,
+    dispersion: "smart",
     offline: false,
     avatars: false,
     readableColors: true,
@@ -174,7 +192,24 @@ export const defaultConfig: Config = {
     bannedWords: "",
     format: "mp4",
     codec: "h264",
-    badgeFilter: 0
+    badgeFilter: 0,
+    autoCompensateClockDrift: true,
+    predictionMode: "StickyTop",
+    pollMode: "StickyTop",
+    pinnedChatMode: "StickyTop",
+    hypeTrainMode: "ChatScroll",
+    moderationMode: "Strikethrough",
+    moderationNotices: true,
+    clearAll: false,
+    roomstateNotices: true,
+    replies: true,
+    firstChatter: true,
+    announcements: true,
+    raids: true,
+    channelPoints: true,
+    hypeChat: true,
+    powerUps: true,
+    sharedChatBadge: true
   }
 };
 
@@ -585,6 +620,13 @@ export function loadState(onOrphanedSession?: (session: any) => void) {
           }
           if (state.config.chatRender.giphy === undefined) {
             state.config.chatRender.giphy = true;
+          }
+          if (state.config.chatRender.dispersion === true) {
+            state.config.chatRender.dispersion = "on";
+          } else if (state.config.chatRender.dispersion === false) {
+            state.config.chatRender.dispersion = "off";
+          } else if (state.config.chatRender.dispersion !== "on" && state.config.chatRender.dispersion !== "off" && state.config.chatRender.dispersion !== "smart") {
+            state.config.chatRender.dispersion = "smart";
           }
           loadedConfig = true;
           // If we restored from a backup or alternate path, or healed a hardcoded/legacy savePath, synchronize to primary CONFIG_FILE

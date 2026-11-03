@@ -52,7 +52,7 @@ export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<"dashboard" | "settings" | "logs">("dashboard");
-  const [settingsTab, setSettingsTab] = useState<"general" | "render">("general");
+  const [settingsTab, setSettingsTab] = useState<"general" | "render" | "render_appearance">("general");
   const [channelsInput, setChannelsInput] = useState<string>("");
   const [isConfigDirty, setIsConfigDirty] = useState<boolean>(false);
   const [pendingTabSwitch, setPendingTabSwitch] = useState<"dashboard" | "settings" | "logs" | null>(null);
@@ -251,9 +251,10 @@ export default function App() {
   const [stopConfirmChannel, setStopConfirmChannel] = useState<string | null>(null);
   const [showRebootConfirm, setShowRebootConfirm] = useState<boolean>(false);
   const [manualSpliceChannel, setManualSpliceChannel] = useState<string | null>(null);
-  const [spliceAction, setSpliceAction] = useState<'append_previous' | 'extract_clip' | 'split_new_part'>('split_new_part');
+  const [spliceAction, setSpliceAction] = useState<'append_previous' | 'extract_clip' | 'split_new_part' | 'await_next_game'>('split_new_part');
   const [clipScope, setClipScope] = useState<'whole_game' | 'custom_duration'>('custom_duration');
   const [clipMinutes, setClipMinutes] = useState<number>(5.0);
+  const [awaitLeadingBufferInput, setAwaitLeadingBufferInput] = useState<string>("10");
   const [isManualSplicing, setIsManualSplicing] = useState<Record<string, boolean>>({});
   const [isOverridingBuffer, setIsOverridingBuffer] = useState<Record<string, boolean>>({});
   const [editingChannelIndex, setEditingChannelIndex] = useState<number | null>(null);
@@ -324,9 +325,10 @@ export default function App() {
 
   const executeManualSplice = async (
     channel: string,
-    action: 'append_previous' | 'extract_clip' | 'split_new_part' = 'split_new_part',
+    action: 'append_previous' | 'extract_clip' | 'split_new_part' | 'await_next_game' = 'split_new_part',
     scope?: 'whole_game' | 'custom_duration',
-    mins?: number
+    mins?: number,
+    leadingBufferMinutes?: number
   ) => {
     setIsManualSplicing(prev => ({ ...prev, [channel]: true }));
     try {
@@ -334,10 +336,17 @@ export default function App() {
         channel,
         action,
         clipScope: scope,
-        clipMinutes: mins
+        clipMinutes: mins,
+        leadingBufferMinutes
       });
       if (res.data?.success) {
-        showToast(`Manual splice initiated for @${channel}.`, "success", "Video Splice");
+        showToast(
+          action === 'await_next_game'
+            ? `Outgoing game ended for @${channel}. Recording into next game while awaiting Twitch category update.`
+            : `Manual splice initiated for @${channel}.`,
+          "success",
+          "Video Splice"
+        );
         await fetchStatus();
       }
     } catch (err: any) {
@@ -663,11 +672,19 @@ export default function App() {
     }
     setIsSubmittingRender(true);
     try {
-      const activeSegments = renderDialog.files ? renderDialog.files.filter(f => f.enabled !== false) : undefined;
+      const activeSegments = renderDialog.files
+        ? renderDialog.files
+            .filter(f => f.enabled !== false)
+            .map(f => ({
+              ...f,
+              width: parseInt(String(f.width), 10) || 350,
+              height: parseInt(String(f.height), 10) || 800,
+            }))
+        : undefined;
       await axios.post(`/api/tasks/${renderDialog.taskId}/action`, { 
         action: 'render_chat', 
-        width: renderDialog.width, 
-        height: renderDialog.height,
+        width: parseInt(String(renderDialog.width), 10) || 350, 
+        height: parseInt(String(renderDialog.height), 10) || 800,
         segments: activeSegments
       });
       setRenderDialog(null);
@@ -714,8 +731,8 @@ export default function App() {
     try {
       const res = await axios.post('/api/render/manual', {
         filePath: manualRenderPath.trim(),
-        width: manualRenderWidth,
-        height: manualRenderHeight
+        width: parseInt(String(manualRenderWidth), 10) || 350,
+        height: parseInt(String(manualRenderHeight), 10) || 800
       });
       if (res.data && res.data.success) {
         setManualRenderMsg({ type: 'success', text: res.data.message || 'Render initiated!' });
@@ -807,7 +824,7 @@ export default function App() {
             </div>
             <div>
               <h1 className="font-bold text-base tracking-tight text-white leading-tight">VOD Automator</h1>
-              <p className="text-xs text-purple-400 font-mono font-medium">v4.9.0</p>
+              <p className="text-xs text-purple-400 font-mono font-medium">v5.1.0</p>
             </div>
           </div>
         </div>
@@ -1219,14 +1236,24 @@ export default function App() {
                               <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold">Duration</span>
                               <span className="text-sm sm:text-base font-bold text-white font-mono">{formatDuration(activeSession.videoDurationSeconds || 0)}</span>
                             </div>
-                            <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between">
+                            <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between gap-2">
                               <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold flex items-center gap-1.5">
                                 <MessageSquare className="w-3.5 h-3.5 text-purple-400" />
-                                Chat Messages
+                                Chat & Events
                               </span>
-                              <span className="text-sm sm:text-base font-bold text-white font-mono">
-                                {(activeSession.commentsWritten || 0).toLocaleString()}
-                              </span>
+                              <div className="flex items-center gap-1.5 font-mono">
+                                <span className="text-sm sm:text-base font-bold text-white" title="Chat Messages & Notices">
+                                  {(activeSession.commentsWritten || 0).toLocaleString()}
+                                </span>
+                                {(activeSession.eventsWritten || 0) > 0 && (
+                                  <span
+                                    className="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/30"
+                                    title="Captured Broadcast & Moderation Events (Predictions, Polls, Pins, Redemptions, Timeouts, Mode Changes)"
+                                  >
+                                    +{(activeSession.eventsWritten || 0).toLocaleString()}
+                                  </span>
+                                )}
+                              </div>
                             </div>
                           </div>
 
@@ -1290,6 +1317,38 @@ export default function App() {
                             </div>
                           )}
 
+                          {/* Awaiting Twitch Category Update Indicator Banner */}
+                          {(() => {
+                            const latestGame = activeSession.games && activeSession.games.length > 0
+                              ? activeSession.games[activeSession.games.length - 1]
+                              : null;
+                            if (!latestGame?.isAwaitingNextGame) return null;
+                            const effectiveLeadMins = latestGame.customLeadingBufferMins ?? (((config as any)?.gameSwitchBufferMins ?? 5) * 2);
+                            return (
+                              <div className="p-3 bg-cyan-500/10 border border-cyan-500/30 rounded-lg flex flex-wrap items-center justify-between gap-3 text-sm">
+                                <div className="flex items-center gap-2.5">
+                                  <div className="w-8 h-8 rounded-lg bg-cyan-500/20 border border-cyan-500/30 flex items-center justify-center shrink-0">
+                                    <Clock className="w-4 h-4 text-cyan-400 animate-pulse" />
+                                  </div>
+                                  <div>
+                                    <div className="font-semibold text-white flex items-center gap-2 flex-wrap">
+                                      <span>Awaiting Twitch Category Update</span>
+                                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                                        Fallback: {latestGame.gameName}
+                                      </span>
+                                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-white/5 text-gray-300 border border-white/10">
+                                        {effectiveLeadMins}m lead buffer
+                                      </span>
+                                    </div>
+                                    <p className="text-xs text-cyan-200/80 mt-0.5">
+                                      Recording into next game segment. Will automatically adopt the new game name as soon as the broadcaster updates their Twitch category.
+                                    </p>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })()}
+
                           {/* Stream Options & Actions Footer */}
                           <div className="pt-2.5 flex flex-wrap items-center justify-between gap-3 text-sm border-t border-white/5">
                             <label className="flex items-center gap-2.5 cursor-pointer text-gray-400 hover:text-gray-300">
@@ -1307,6 +1366,8 @@ export default function App() {
                                 type="button"
                                 disabled={Boolean(isManualSplicing[activeSession.channel])}
                                 onClick={() => {
+                                  const defaultBuf = (config as any)?.gameSwitchBufferMins ?? 5;
+                                  setAwaitLeadingBufferInput(String(defaultBuf * 2));
                                   setSpliceAction('split_new_part');
                                   setManualSpliceChannel(activeSession.channel);
                                 }}
@@ -1584,8 +1645,9 @@ export default function App() {
                           <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Width</label>
                           <input
                             type="number"
-                            value={renderDialog.width}
-                            onChange={e => setRenderDialog({...renderDialog, width: parseInt(e.target.value) || 0})}
+                            value={renderDialog.width ?? ""}
+                            onChange={e => setRenderDialog({...renderDialog, width: e.target.value as any})}
+                            onBlur={e => setRenderDialog({...renderDialog, width: parseInt(e.target.value, 10) || ((config as any)?.chatRender?.width || 350)})}
                             className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                           />
                         </div>
@@ -1593,8 +1655,9 @@ export default function App() {
                           <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Height</label>
                           <input
                             type="number"
-                            value={renderDialog.height}
-                            onChange={e => setRenderDialog({...renderDialog, height: parseInt(e.target.value) || 0})}
+                            value={renderDialog.height ?? ""}
+                            onChange={e => setRenderDialog({...renderDialog, height: e.target.value as any})}
+                            onBlur={e => setRenderDialog({...renderDialog, height: parseInt(e.target.value, 10) || ((config as any)?.chatRender?.height || 800)})}
                             className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                           />
                         </div>
@@ -1621,10 +1684,15 @@ export default function App() {
                                 <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Width</label>
                                 <input
                                   type="number"
-                                  value={file.width}
+                                  value={file.width ?? ""}
                                   onChange={e => {
                                     const newFiles = [...renderDialog.files!];
-                                    newFiles[idx].width = parseInt(e.target.value) || 0;
+                                    newFiles[idx].width = e.target.value as any;
+                                    setRenderDialog({...renderDialog, files: newFiles});
+                                  }}
+                                  onBlur={e => {
+                                    const newFiles = [...renderDialog.files!];
+                                    newFiles[idx].width = parseInt(e.target.value, 10) || ((config as any)?.chatRender?.width || 350);
                                     setRenderDialog({...renderDialog, files: newFiles});
                                   }}
                                   className="w-full bg-[#242428] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
@@ -1634,10 +1702,15 @@ export default function App() {
                                 <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Height</label>
                                 <input
                                   type="number"
-                                  value={file.height}
+                                  value={file.height ?? ""}
                                   onChange={e => {
                                     const newFiles = [...renderDialog.files!];
-                                    newFiles[idx].height = parseInt(e.target.value) || 0;
+                                    newFiles[idx].height = e.target.value as any;
+                                    setRenderDialog({...renderDialog, files: newFiles});
+                                  }}
+                                  onBlur={e => {
+                                    const newFiles = [...renderDialog.files!];
+                                    newFiles[idx].height = parseInt(e.target.value, 10) || ((config as any)?.chatRender?.height || 800);
                                     setRenderDialog({...renderDialog, files: newFiles});
                                   }}
                                   className="w-full bg-[#242428] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
@@ -1680,9 +1753,10 @@ export default function App() {
                 <p className="text-sm text-gray-400 mt-0.5">Configure your browser tokens and download preferences.</p>
               </div>
 
-              <div className="flex space-x-4 border-b border-white/10 pb-2">
+              <div className="flex flex-wrap gap-x-6 gap-y-2 border-b border-white/10 pb-2">
                 <button onClick={() => setSettingsTab('general')} className={`pb-1.5 text-sm font-semibold uppercase tracking-wider transition-colors cursor-pointer ${settingsTab === 'general' ? 'border-b-2 border-purple-500 text-purple-400' : 'text-gray-400 hover:text-white border-b-2 border-transparent'}`}>General</button>
-                <button onClick={() => setSettingsTab('render')} className={`pb-1.5 text-sm font-semibold uppercase tracking-wider transition-colors cursor-pointer ${settingsTab === 'render' ? 'border-b-2 border-purple-500 text-purple-400' : 'text-gray-400 hover:text-white border-b-2 border-transparent'}`}>Chat Render</button>
+                <button onClick={() => setSettingsTab('render')} className={`pb-1.5 text-sm font-semibold uppercase tracking-wider transition-colors cursor-pointer ${settingsTab === 'render' ? 'border-b-2 border-purple-500 text-purple-400' : 'text-gray-400 hover:text-white border-b-2 border-transparent'}`}>Render: Video &amp; Output</button>
+                <button onClick={() => setSettingsTab('render_appearance')} className={`pb-1.5 text-sm font-semibold uppercase tracking-wider transition-colors cursor-pointer ${settingsTab === 'render_appearance' ? 'border-b-2 border-purple-500 text-purple-400' : 'text-gray-400 hover:text-white border-b-2 border-transparent'}`}>Render: Chat &amp; Events</button>
               </div>
 
               <form onSubmit={handleSaveConfig} className="space-y-5">
@@ -1813,7 +1887,12 @@ export default function App() {
                             min="0"
                             max="60"
                             value={(config as any)?.gameSwitchBufferMins ?? 5}
-                            onChange={(e) => updateDraftConfig({ ...config!, gameSwitchBufferMins: parseInt(e.target.value) || 0 } as any)}
+                            onChange={(e) => updateDraftConfig({ ...config!, gameSwitchBufferMins: e.target.value } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10);
+                              const cleanVal = Number.isFinite(parsed) ? Math.max(0, Math.min(60, parsed)) : 5;
+                              updateDraftConfig({ ...config!, gameSwitchBufferMins: cleanVal } as any);
+                            }}
                             className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                          />
                       </div>
@@ -1827,7 +1906,12 @@ export default function App() {
                             min="1"
                             max="60"
                             value={(config as any)?.offlineGracePeriodMins ?? 5}
-                            onChange={(e) => updateDraftConfig({ ...config!, offlineGracePeriodMins: Math.max(1, parseInt(e.target.value) || 1) } as any)}
+                            onChange={(e) => updateDraftConfig({ ...config!, offlineGracePeriodMins: e.target.value } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10);
+                              const cleanVal = Number.isFinite(parsed) ? Math.max(1, Math.min(60, parsed)) : 5;
+                              updateDraftConfig({ ...config!, offlineGracePeriodMins: cleanVal } as any);
+                            }}
                             className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                          />
                       </div>
@@ -1871,9 +1955,11 @@ export default function App() {
                                 min="0.25"
                                 max="72"
                                 value={(config as any)?.longGameAutospliceTriggerHours ?? 9}
-                                onChange={(e) => {
-                                  const val = Math.max(0.25, parseFloat(e.target.value) || 0.25);
-                                  const curCut = (config as any)?.longGameAutospliceCutHours ?? 8;
+                                onChange={(e) => updateDraftConfig({ ...config!, longGameAutospliceTriggerHours: e.target.value } as any)}
+                                onBlur={(e) => {
+                                  const parsed = parseFloat(e.target.value);
+                                  const val = Number.isFinite(parsed) ? Math.max(0.25, Math.min(72, parsed)) : 9;
+                                  const curCut = parseFloat(String((config as any)?.longGameAutospliceCutHours ?? 8)) || 8;
                                   updateDraftConfig({
                                     ...config!,
                                     longGameAutospliceTriggerHours: val,
@@ -1894,9 +1980,11 @@ export default function App() {
                                 min="0.25"
                                 max={(config as any)?.longGameAutospliceTriggerHours ?? 9}
                                 value={(config as any)?.longGameAutospliceCutHours ?? 8}
-                                onChange={(e) => {
-                                  const trigger = (config as any)?.longGameAutospliceTriggerHours ?? 9;
-                                  const rawVal = Math.max(0.25, parseFloat(e.target.value) || 0.25);
+                                onChange={(e) => updateDraftConfig({ ...config!, longGameAutospliceCutHours: e.target.value } as any)}
+                                onBlur={(e) => {
+                                  const trigger = parseFloat(String((config as any)?.longGameAutospliceTriggerHours ?? 9)) || 9;
+                                  const parsed = parseFloat(e.target.value);
+                                  const rawVal = Number.isFinite(parsed) ? Math.max(0.25, parsed) : 8;
                                   const val = Math.min(trigger, rawVal);
                                   updateDraftConfig({
                                     ...config!,
@@ -1921,322 +2009,702 @@ export default function App() {
                 )}
 
                 {settingsTab === 'render' && (
-                  <div className="space-y-5">
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">TwitchDownloaderCLI Path</label>
-                      <input
-                        type="text"
-                        value={(config as any)?.tdPath || ""}
-                        onChange={(e) => updateDraftConfig({ ...config!, tdPath: e.target.value } as any)}
-                        className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        placeholder="TwitchDownloader\TwitchDownloaderCLI.exe (or absolute path)"
-                      />
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Default Width</label>
-                        <input
-                          type="number"
-                          value={(config as any)?.chatRender?.width || 350}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, width: parseInt(e.target.value) || 0 } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Default Height</label>
-                        <input
-                          type="number"
-                          value={(config as any)?.chatRender?.height || 800}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, height: parseInt(e.target.value) || 0 } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Background Color (Hex)</label>
-                        <input
-                          type="text"
-                          value={(config as any)?.chatRender?.backgroundColor || "#111111"}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, backgroundColor: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          placeholder="#111111 or #FF111111"
-                        />
-                        <p className="text-xs text-gray-500">Format: #RRGGBB or #AARRGGBB (A = Alpha/Transparency)</p>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Alt Background Color (Hex)</label>
-                        <input
-                          type="text"
-                          value={(config as any)?.chatRender?.altBackgroundColor || "#191919"}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, altBackgroundColor: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          placeholder="#191919 or #FF191919"
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Message Color (Hex)</label>
-                        <input
-                          type="text"
-                          value={(config as any)?.chatRender?.messageColor || "#ffffff"}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, messageColor: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          placeholder="#ffffff or #ffffffff"
-                        />
-                        <p className="text-xs text-gray-500">Format: #RRGGBB or #AARRGGBB</p>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Font</label>
-                        <input
-                          type="text"
-                          value={(config as any)?.chatRender?.font || "Inter"}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, font: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat Sync - H.264 / 1080p (seconds)</label>
-                        <input
-                          type="number"
-                          step="0.5"
-                          value={(config as any)?.chatRender?.syncOffset ?? -2.5}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffset: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                        <p className="text-xs text-gray-500">Offset for standard H.264 streams (default: -2.5s). Negative values advance chat earlier.</p>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat Sync - HEVC / 1440p (seconds)</label>
-                        <input
-                          type="number"
-                          step="0.5"
-                          value={(config as any)?.chatRender?.syncOffsetHevc ?? -7.5}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffsetHevc: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                        <p className="text-xs text-gray-500">Offset for HEVC/1440p Enhanced Broadcasts (default: -7.5s). Compensates for broadcaster encoder lag.</p>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Font Size</label>
-                        <input
-                          type="number"
-                          value={(config as any)?.chatRender?.fontSize || 24}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, fontSize: parseInt(e.target.value) || 0 } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Message Font Style</label>
-                        <select
-                          value={(config as any)?.chatRender?.messageFontStyle || "normal"}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, messageFontStyle: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                        >
-                          <option value="normal">Normal</option>
-                          <option value="bold">Bold</option>
-                          <option value="italic">Italic</option>
-                          <option value="bolditalic">Bold Italic</option>
-                        </select>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Username Font Style</label>
-                        <select
-                          value={(config as any)?.chatRender?.usernameFontStyle || "bold"}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, usernameFontStyle: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                        >
-                          <option value="normal">Normal</option>
-                          <option value="bold">Bold</option>
-                          <option value="italic">Italic</option>
-                          <option value="bolditalic">Bold Italic</option>
-                        </select>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Emoji Vendor</label>
-                        <select
-                          value={(config as any)?.chatRender?.emojiVendor || "notocolor"}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, emojiVendor: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                        >
-                          <option value="notocolor">Google (notocolor)</option>
-                          <option value="twemoji">Twitter (twemoji)</option>
-                          <option value="none">None</option>
-                        </select>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Outline Size</label>
-                        <input
-                          type="number"
-                          value={(config as any)?.chatRender?.outlineSize || 4}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, outlineSize: parseInt(e.target.value) || 0 } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Framerate</label>
-                        <input
-                          type="number"
-                          value={(config as any)?.chatRender?.framerate || 60}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, framerate: parseInt(e.target.value) || 0 } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Update Rate</label>
-                        <input
-                          type="number"
-                          value={(config as any)?.chatRender?.updateRate || 0}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, updateRate: parseFloat(e.target.value) || 0 } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 pt-3.5 border-t border-white/10">
-                      {[
-                        { key: 'outline', label: 'Text Outline' },
-                        { key: 'generateMask', label: 'Generate Mask' },
-                        { key: 'alternateBackgrounds', label: 'Alternate Backgrounds' },
-                        { key: 'bttv', label: 'BTTV Emotes' },
-                        { key: 'ffz', label: 'FFZ Emotes' },
-                        { key: 'stv', label: '7TV Emotes' },
-                        { key: 'giphy', label: 'Giphy GIFs' },
-                        { key: 'allowUnlistedEmotes', label: 'Allow Unlisted Emotes' },
-                        { key: 'badges', label: 'Badges' },
-                        { key: 'subMessages', label: 'Sub Messages' },
-                        { key: 'dispersion', label: 'Dispersion' },
-                        { key: 'offline', label: 'Offline Mode' },
-                        { key: 'avatars', label: 'Show Avatars' },
-                        { key: 'readableColors', label: 'Readable Colors' },
-                        { key: 'sharpening', label: 'Sharpening' },
-                        { key: 'autoCompensateClockDrift', label: 'Auto-Compensate Clock Drift (10+ hr streams)' },
-                      ].map(opt => (
-                        <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
-                          <input
-                            type="checkbox"
-                            checked={(config as any)?.chatRender?.[opt.key] ?? (['bttv', 'ffz', 'stv', 'giphy', 'allowUnlistedEmotes', 'badges', 'subMessages', 'readableColors', 'autoCompensateClockDrift'].includes(opt.key))}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
-                            className="w-4.5 h-4.5 rounded border-white/20 bg-[#141416] text-purple-600 focus:ring-0 focus:ring-offset-0"
-                          />
-                          <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
-                        </label>
-                      ))}
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-3.5 border-t border-white/10">
-                      {[
-                        { key: 'scaleEmote', label: 'Scale Emote' },
-                        { key: 'scaleBadge', label: 'Scale Badge' },
-                        { key: 'scaleEmoji', label: 'Scale Emoji' },
-                        { key: 'scaleAvatar', label: 'Scale Avatar' },
-                        { key: 'scaleVertical', label: 'Scale Vertical' },
-                        { key: 'scaleSidePadding', label: 'Scale Side Padding' },
-                        { key: 'scaleSectionHeight', label: 'Scale Section Height' },
-                        { key: 'scaleWordSpace', label: 'Scale Word Space' },
-                        { key: 'scaleEmoteSpace', label: 'Scale Emote Space' },
-                        { key: 'scaleHighlightStroke', label: 'Scale Highlight Stroke' },
-                        { key: 'scaleHighlightIndent', label: 'Scale Highlight Indent' },
-                      ].map(opt => (
-                        <div key={opt.key} className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{opt.label}</label>
-                          <input
-                            type="number"
-                            step="0.1"
-                            value={(config as any)?.chatRender?.[opt.key] ?? (opt.key === 'scaleVertical' ? 0.5 : 1.0)}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: parseFloat(e.target.value) || 0 } } as any)}
-                            className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3.5 border-t border-white/10">
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">File Format</label>
-                        <select
-                          value={(config as any)?.chatRender?.format || "mp4"}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, format: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                        >
-                          <option value="mp4">MP4 (.mp4)</option>
-                          <option value="webm">WEBM (.webm) - Transparent for VP9</option>
-                          <option value="mov">MOV (.mov) - Transparent for ProRes</option>
-                          <option value="mkv">MKV (.mkv)</option>
-                        </select>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Codec</label>
-                        <select
-                          value={(config as any)?.chatRender?.codec || "h264"}
-                          onChange={(e) => {
-                            const newCodec = e.target.value;
-                            let newFormat = (config as any)?.chatRender?.format || "mp4";
-                            if ((newCodec === "vp9" || newCodec === "vp8") && newFormat !== "webm" && newFormat !== "mkv") {
-                              newFormat = "webm";
-                            } else if (newCodec === "prores" && newFormat !== "mov" && newFormat !== "mkv") {
-                              newFormat = "mov";
-                            }
-                            updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, codec: newCodec, format: newFormat } } as any);
-                          }}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                        >
-                          <option value="vp9">VP9 (Transparent, ~98% Smaller WebM)</option>
-                          <option value="prores">ProRes (Transparent, Master MOV)</option>
-                          <option value="h264">H264 (Standard)</option>
-                          <option value="hevc">HEVC / H265</option>
-                          <option value="vp8">VP8</option>
-                        </select>
-                      </div>
-                      <div className="space-y-1.5 md:col-span-2">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat Badge Filter (Bitmask)</label>
-                        <input
-                          type="number"
-                          value={(config as any)?.chatRender?.badgeFilter || 0}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, badgeFilter: parseInt(e.target.value) || 0 } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                        <p className="text-xs text-gray-500">
-                          0 = All (Default), 1 = Broadcaster, 2 = Moderator, 4 = VIP, 8 = Subscriber, 16 = Predictions, 32 = NoAudioVisual, 64 = PrimeGaming. Add values together to combine.
+                  <div className="space-y-6">
+                    {/* Binary Path */}
+                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-3">
+                      <div>
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Renderer Binary Path</h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Supports both <code className="text-purple-300">ChatRenderCLI.exe</code> (high-speed v2.0-extended renderer) and legacy <code className="text-gray-300">TwitchDownloaderCLI.exe</code>. If both exist in the same folder, <code className="text-purple-300">ChatRenderCLI.exe</code> is preferred automatically.
                         </p>
                       </div>
                       <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Ignore Users (comma separated)</label>
+                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">ChatRenderCLI / TwitchDownloaderCLI Path</label>
                         <input
                           type="text"
-                          value={(config as any)?.chatRender?.ignoreUsers || ""}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, ignoreUsers: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Banned Words (comma separated)</label>
-                        <input
-                          type="text"
-                          value={(config as any)?.chatRender?.bannedWords || ""}
-                          onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, bannedWords: e.target.value } } as any)}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          value={(config as any)?.tdPath || ""}
+                          onChange={(e) => updateDraftConfig({ ...config!, tdPath: e.target.value } as any)}
+                          className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          placeholder="TwitchDownloader\ChatRenderCLI.exe (or absolute path)"
                         />
                       </div>
                     </div>
 
-                    <div className="pt-4 border-t border-white/10">
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-purple-950/20 border border-purple-500/20 rounded-xl p-4">
-                        <div>
-                          <h4 className="text-sm font-semibold text-white flex items-center gap-2">
-                            <Film className="w-4 h-4 text-purple-400" />
-                            Manual Chat Render
-                          </h4>
-                          <p className="text-xs text-gray-400 mt-0.5">
-                            Select or provide any downloaded chat JSON to test your rendering pipeline and output settings.
+                    {/* Video Dimensions & Encoding */}
+                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
+                      <div>
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Video Dimensions &amp; Encoding</h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Canvas dimensions are automatically rounded to even pixel multiples for planar YUV420p / YUVA420p encoding compatibility.
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Default Width (px)</label>
+                          <input
+                            type="number"
+                            min="100"
+                            max="7680"
+                            step="2"
+                            value={(config as any)?.chatRender?.width ?? 350}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, width: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10);
+                              const rawVal = Number.isFinite(parsed) && parsed > 0 ? Math.max(100, Math.min(7680, parsed)) : 350;
+                              const cleanVal = rawVal % 2 !== 0 ? rawVal + 1 : rawVal;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, width: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Default Height (px)</label>
+                          <input
+                            type="number"
+                            min="100"
+                            max="7680"
+                            step="2"
+                            value={(config as any)?.chatRender?.height ?? 800}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, height: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10);
+                              const rawVal = Number.isFinite(parsed) && parsed > 0 ? Math.max(100, Math.min(7680, parsed)) : 800;
+                              const cleanVal = rawVal % 2 !== 0 ? rawVal + 1 : rawVal;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, height: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Framerate (FPS)</label>
+                          <input
+                            type="number"
+                            min="1"
+                            max="240"
+                            value={(config as any)?.chatRender?.framerate ?? 60}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, framerate: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10);
+                              const cleanVal = Number.isFinite(parsed) && parsed > 0 ? Math.max(1, Math.min(240, parsed)) : 60;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, framerate: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">File Format</label>
+                          <select
+                            value={(config as any)?.chatRender?.format || "mp4"}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, format: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
+                          >
+                            <option value="mp4">MP4 (.mp4)</option>
+                            <option value="webm">WEBM (.webm) - Transparent for VP9</option>
+                            <option value="mov">MOV (.mov) - Transparent for ProRes</option>
+                            <option value="mkv">MKV (.mkv)</option>
+                          </select>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Codec</label>
+                          <select
+                            value={(config as any)?.chatRender?.codec || "h264"}
+                            onChange={(e) => {
+                              const newCodec = e.target.value;
+                              let newFormat = (config as any)?.chatRender?.format || "mp4";
+                              if ((newCodec === "vp9" || newCodec === "vp8") && newFormat !== "webm" && newFormat !== "mkv") {
+                                newFormat = "webm";
+                              } else if (newCodec === "prores" && newFormat !== "mov" && newFormat !== "mkv") {
+                                newFormat = "mov";
+                              }
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, codec: newCodec, format: newFormat } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
+                          >
+                            <option value="vp9">VP9 (Transparent, ~98% Smaller WebM)</option>
+                            <option value="prores">ProRes (Transparent, Master MOV)</option>
+                            <option value="h264">H264 (Standard)</option>
+                            <option value="hevc">HEVC / H265</option>
+                            <option value="vp8">VP8</option>
+                          </select>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Update Rate (seconds)</label>
+                          <input
+                            type="number"
+                            step="0.05"
+                            min="0"
+                            value={(config as any)?.chatRender?.updateRate ?? 0.2}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, updateRate: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseFloat(e.target.value);
+                              const cleanVal = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0.2;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, updateRate: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                          <p className="text-xs text-gray-500">Time in seconds between chat scroll frame updates (`0` = every frame).</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Hardware Acceleration & Memory (ChatRenderCLI) */}
+                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
+                      <div>
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Parallel Pipeline &amp; Memory (`ChatRenderCLI`)</h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Controls multi-FFmpeg segmented rendering (`-j / --jobs`) and decoded sprite/GIF frame memory budget (`--image-cache-mb`).
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Parallel Render Jobs (-j / --jobs)</label>
+                          <input
+                            type="number"
+                            min="0"
+                            max="16"
+                            value={(config as any)?.chatRender?.jobs ?? 0}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, jobs: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10);
+                              const cleanVal = Number.isFinite(parsed) ? Math.max(0, Math.min(16, parsed)) : 0;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, jobs: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                          <p className="text-xs text-gray-500">`0` = Auto-scale by CPU core count (`1`–`4` parallel FFmpeg workers). Set `1`–`16` to override.</p>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Image &amp; GIF Cache Budget (MB)</label>
+                          <input
+                            type="number"
+                            min="64"
+                            max="8192"
+                            step="64"
+                            value={(config as any)?.chatRender?.imageCacheMb ?? 256}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, imageCacheMb: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10);
+                              const cleanVal = Number.isFinite(parsed) ? Math.max(64, Math.min(8192, parsed)) : 256;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, imageCacheMb: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                          <p className="text-xs text-gray-500">Memory cap (`64`–`8192` MB, default: `256` MB) for decoded animated emotes &amp; Giphy GIFs before LRU eviction.</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Timeline Sync, Smoothing & Output Flags */}
+                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
+                      <div>
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Timeline Sync, Smoothing &amp; Output Flags</h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Compensates for broadcaster encoder latency, integer VOD timestamp clumping, and multi-hour subathon clock drift.
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat Sync - H.264 / 1080p (s)</label>
+                          <input
+                            type="number"
+                            step="0.5"
+                            value={(config as any)?.chatRender?.syncOffset ?? -2.5}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffset: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseFloat(e.target.value);
+                              const cleanVal = Number.isFinite(parsed) ? parsed : -2.5;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffset: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                          <p className="text-xs text-gray-500">Default: `-2.5s`. Negative shifts chat earlier.</p>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat Sync - HEVC / 1440p (s)</label>
+                          <input
+                            type="number"
+                            step="0.5"
+                            value={(config as any)?.chatRender?.syncOffsetHevc ?? -7.5}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffsetHevc: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseFloat(e.target.value);
+                              const cleanVal = Number.isFinite(parsed) ? parsed : -7.5;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffsetHevc: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                          <p className="text-xs text-gray-500">Default: `-7.5s` for Enhanced Broadcasts.</p>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Dispersion (Message Smoothing)</label>
+                          <select
+                            value={
+                              (config as any)?.chatRender?.dispersion === true || (config as any)?.chatRender?.dispersion === "on"
+                                ? "on"
+                                : (config as any)?.chatRender?.dispersion === false || (config as any)?.chatRender?.dispersion === "off"
+                                ? "off"
+                                : "smart"
+                            }
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, dispersion: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
+                          >
+                            <option value="smart">Smart (VOD Chat Only)</option>
+                            <option value="on">On (Always)</option>
+                            <option value="off">Off (Never)</option>
+                          </select>
+                          <p className="text-xs text-gray-500">Spreads out whole-second VOD chat timestamps.</p>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-3 border-t border-white/10">
+                        {[
+                          { key: 'autoCompensateClockDrift', label: 'Auto-Compensate Clock Drift (10+ hr streams)', def: true },
+                          { key: 'generateMask', label: 'Generate Separate Alpha Mask (--generate-mask)', def: false },
+                          { key: 'sharpening', label: 'Sub-Pixel Text Sharpening (--sharpening)', def: false },
+                          { key: 'offline', label: 'Offline Mode - Never Fetch Missing Assets (--offline)', def: false },
+                        ].map(opt => (
+                          <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
+                            <input
+                              type="checkbox"
+                              checked={(config as any)?.chatRender?.[opt.key] ?? opt.def}
+                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
+                              className="w-4.5 h-4.5 rounded border-white/20 bg-[#0a0a0c] text-purple-600 focus:ring-0 focus:ring-offset-0"
+                            />
+                            <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Manual Chat Render Launcher */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-purple-950/20 border border-purple-500/20 rounded-xl p-4">
+                      <div>
+                        <h4 className="text-sm font-semibold text-white flex items-center gap-2">
+                          <Film className="w-4 h-4 text-purple-400" />
+                          Manual Chat Render
+                        </h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Select or provide any downloaded chat JSON to test your rendering pipeline and output settings.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={openManualRenderModal}
+                        className="flex items-center justify-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-semibold transition-colors cursor-pointer shrink-0 shadow-sm"
+                      >
+                        <Play className="w-3.5 h-3.5 fill-current" />
+                        Manual Render...
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {settingsTab === 'render_appearance' && (
+                  <div className="space-y-6">
+                    {/* Live Broadcast Overlays (v2.0-extended StickyTop / ChatScroll / Off) */}
+                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
+                      <div>
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Live Broadcast Overlays (`v2.0-extended`)</h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Choose how real-time PubSub channel overlays are rendered by <code className="text-purple-300">ChatRenderCLI</code>: pinned at the top of the video canvas (<code className="text-purple-300">StickyTop</code>), inline in the scrolling chat (<code className="text-gray-300">ChatScroll</code>), or disabled (<code className="text-gray-300">Off</code>).
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                        {[
+                          { key: 'predictionMode', label: 'Predictions (--prediction-mode)', desc: 'Live odds, points & winning outcome' },
+                          { key: 'pollMode', label: 'Polls (--poll-mode)', desc: 'Vote bars, percentages & winner' },
+                          { key: 'pinnedChatMode', label: 'Pinned Chat (--pinned-chat-mode)', desc: 'Mod-pinned messages & Hype pins' },
+                          { key: 'hypeTrainMode', label: 'Hype Train (--hype-train-mode)', desc: 'Level progress bar & goal %' },
+                        ].map(item => (
+                          <div key={item.key} className="space-y-1.5">
+                            <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{item.label}</label>
+                            <select
+                              value={(config as any)?.chatRender?.[item.key] || "StickyTop"}
+                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [item.key]: e.target.value } } as any)}
+                              className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
+                            >
+                              <option value="StickyTop">StickyTop (Pinned Card)</option>
+                              <option value="ChatScroll">ChatScroll (Inline Notice)</option>
+                              <option value="Off">Off (Hidden)</option>
+                            </select>
+                            <p className="text-xs text-gray-500">{item.desc}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Enriched Chat & Broadcast Events */}
+                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
+                      <div>
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Enriched Chat &amp; Broadcast Events (`v2.0-extended`)</h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Toggle rich visual cards, reply headers, highlights, and Bits Power-Ups captured from Twitch IRCv3 and PubSub.
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                        {[
+                          { key: 'subMessages', label: 'Sub, Resub & Gift Notices (--sub-messages)' },
+                          { key: 'replies', label: 'Threaded Reply Headers (--replies)' },
+                          { key: 'firstChatter', label: 'First-Time / Returning Chatter (--first-chatter)' },
+                          { key: 'announcements', label: 'Moderator Announcements (--announcements)' },
+                          { key: 'raids', label: 'Incoming & Outgoing Raids (--raids)' },
+                          { key: 'channelPoints', label: 'Channel Point Redemptions (--channel-points)' },
+                          { key: 'hypeChat', label: 'Paid Hype Chat Currency Pills (--hype-chat)' },
+                          { key: 'powerUps', label: 'Bits Power-Ups & Giant Emotes (--power-ups)' },
+                          { key: 'sharedChatBadge', label: 'Shared Chat Source Badges (--shared-chat-badge)' },
+                        ].map(opt => (
+                          <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
+                            <input
+                              type="checkbox"
+                              checked={(config as any)?.chatRender?.[opt.key] ?? true}
+                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
+                              className="w-4.5 h-4.5 rounded border-white/20 bg-[#0a0a0c] text-purple-600 focus:ring-0 focus:ring-offset-0"
+                            />
+                            <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Moderation, Roomstate & User Filtering */}
+                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
+                      <div>
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Moderation, Roomstate &amp; User Highlighting</h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Configure how timeouts, bans, deleted messages (`CLEARMSG`), `/clear`, room mode changes, and highlighted chatters are displayed.
+                        </p>
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Moderated Message Mode (--moderation-mode)</label>
+                          <select
+                            value={(config as any)?.chatRender?.moderationMode || "Strikethrough"}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, moderationMode: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
+                          >
+                            <option value="Strikethrough">Strikethrough (Dim + Red Strikethrough after ban/delete)</option>
+                            <option value="ReplaceDeleted">ReplaceDeleted (&lt;message deleted&gt;)</option>
+                            <option value="Hide">Hide (Remove from scroll when moderated)</option>
+                            <option value="Off">Off (Leave messages untouched)</option>
+                          </select>
+                          <p className="text-xs text-gray-500">Messages appear normally until the exact timestamp the moderator times out, bans, or deletes them.</p>
+                        </div>
+
+                        <div className="space-y-2.5 flex flex-col justify-center pt-1">
+                          {[
+                            { key: 'moderationNotices', label: 'Show Timeout / Ban System Lines in Scroll (--moderation-notices)' },
+                            { key: 'roomstateNotices', label: 'Show Roomstate Mode Notices (Sub/Emote/Slow) (--roomstate-notices)' },
+                            { key: 'clearAll', label: 'Wipe Active Screen on Mod /clear (--clear-all)' },
+                          ].map(opt => (
+                            <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
+                              <input
+                                type="checkbox"
+                                checked={(config as any)?.chatRender?.[opt.key] ?? true}
+                                onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
+                                className="w-4.5 h-4.5 rounded border-white/20 bg-[#0a0a0c] text-purple-600 focus:ring-0 focus:ring-offset-0"
+                              />
+                              <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-white/10">
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Highlight Users (comma separated)</label>
+                          <input
+                            type="text"
+                            value={(config as any)?.chatRender?.highlightUsers || ""}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, highlightUsers: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            placeholder="moderator1, vip_friend, streamer_alt"
+                          />
+                          <p className="text-xs text-gray-500">Case-insensitive list of usernames to highlight with a colored background and left border (`--highlight-users`).</p>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Highlight User Color (Hex)</label>
+                          <input
+                            type="text"
+                            value={(config as any)?.chatRender?.highlightUserColor || "#3D1A52"}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, highlightUserColor: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            placeholder="#3D1A52"
+                          />
+                          <p className="text-xs text-gray-500">Background tint for highlighted users (`--highlight-user-color`, default: `#3D1A52`).</p>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Ignore Users (comma separated)</label>
+                          <input
+                            type="text"
+                            value={(config as any)?.chatRender?.ignoreUsers || ""}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, ignoreUsers: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            placeholder="nightbot, streamelements, fossabot"
+                          />
+                          <p className="text-xs text-gray-500">Excludes messages sent by these accounts (`--ignore-users`).</p>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Banned Words (comma separated)</label>
+                          <input
+                            type="text"
+                            value={(config as any)?.chatRender?.bannedWords || ""}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, bannedWords: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            placeholder="spoiler1, word2"
+                          />
+                          <p className="text-xs text-gray-500">Hides any message containing these substrings (`--banned-words`).</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Colors & Typography */}
+                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
+                      <div>
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Colors &amp; Typography</h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Customize background colors (supports `#RRGGBB` or `#AARRGGBB` alpha), font family, font weights, and outline rendering.
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Background Color (Hex)</label>
+                          <input
+                            type="text"
+                            value={(config as any)?.chatRender?.backgroundColor || "#111111"}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, backgroundColor: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            placeholder="#111111 or #00000000"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Alt Background Color (Hex)</label>
+                          <input
+                            type="text"
+                            value={(config as any)?.chatRender?.altBackgroundColor || "#191919"}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, altBackgroundColor: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            placeholder="#191919"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Message Color (Hex)</label>
+                          <input
+                            type="text"
+                            value={(config as any)?.chatRender?.messageColor || "#ffffff"}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, messageColor: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            placeholder="#ffffff"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Font Family</label>
+                          <input
+                            type="text"
+                            value={(config as any)?.chatRender?.font || "Inter Embedded"}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, font: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            placeholder="Inter Embedded"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Font Size</label>
+                          <input
+                            type="number"
+                            value={(config as any)?.chatRender?.fontSize ?? 24}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, fontSize: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10);
+                              const cleanVal = Number.isFinite(parsed) && parsed > 0 ? parsed : 24;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, fontSize: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Outline Size</label>
+                          <input
+                            type="number"
+                            value={(config as any)?.chatRender?.outlineSize ?? 4}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, outlineSize: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseFloat(e.target.value);
+                              const cleanVal = Number.isFinite(parsed) && parsed >= 0 ? parsed : 4;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, outlineSize: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Username Font Style</label>
+                          <select
+                            value={(config as any)?.chatRender?.usernameFontStyle || "bold"}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, usernameFontStyle: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
+                          >
+                            <option value="normal">Normal</option>
+                            <option value="bold">Bold</option>
+                            <option value="italic">Italic</option>
+                            <option value="bolditalic">Bold Italic</option>
+                          </select>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Message Font Style</label>
+                          <select
+                            value={(config as any)?.chatRender?.messageFontStyle || "normal"}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, messageFontStyle: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
+                          >
+                            <option value="normal">Normal</option>
+                            <option value="bold">Bold</option>
+                            <option value="italic">Italic</option>
+                            <option value="bolditalic">Bold Italic</option>
+                          </select>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Emoji Vendor</label>
+                          <select
+                            value={(config as any)?.chatRender?.emojiVendor || "notocolor"}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, emojiVendor: e.target.value } } as any)}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
+                          >
+                            <option value="notocolor">Google Noto Color (notocolor)</option>
+                            <option value="twemoji">Twitter Twemoji (twemoji)</option>
+                            <option value="system">OS System Font (system)</option>
+                            <option value="none">None (none)</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-3 border-t border-white/10">
+                        {[
+                          { key: 'readableColors', label: 'Readable Username Colors (--readable-colors)', def: true },
+                          { key: 'alternateBackgrounds', label: 'Alternating Row Backgrounds (--alternate-backgrounds)', def: false },
+                          { key: 'outline', label: 'Text Drop-Shadow / Outline (--outline)', def: false },
+                        ].map(opt => (
+                          <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
+                            <input
+                              type="checkbox"
+                              checked={(config as any)?.chatRender?.[opt.key] ?? opt.def}
+                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
+                              className="w-4.5 h-4.5 rounded border-white/20 bg-[#0a0a0c] text-purple-600 focus:ring-0 focus:ring-offset-0"
+                            />
+                            <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Emotes, Badges, Avatars & Giphy GIFs */}
+                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
+                      <div>
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Emotes, Badges, Avatars &amp; Giphy GIFs</h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Control 3rd-party emote providers, Giphy GIF scaling, profile avatars, and badge bitmask filtering.
+                        </p>
+                      </div>
+
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        {[
+                          { key: 'stv', label: '7TV Emotes', def: true },
+                          { key: 'bttv', label: 'BTTV Emotes', def: true },
+                          { key: 'ffz', label: 'FFZ Emotes', def: true },
+                          { key: 'allowUnlistedEmotes', label: 'Allow Unlisted Emotes', def: true },
+                          { key: 'giphy', label: 'Giphy GIFs (--giphy)', def: true },
+                          { key: 'badges', label: 'Chat Badges (--badges)', def: true },
+                          { key: 'avatars', label: 'User Avatars (--avatars)', def: false },
+                        ].map(opt => (
+                          <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
+                            <input
+                              type="checkbox"
+                              checked={(config as any)?.chatRender?.[opt.key] ?? opt.def}
+                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
+                              className="w-4.5 h-4.5 rounded border-white/20 bg-[#0a0a0c] text-purple-600 focus:ring-0 focus:ring-offset-0"
+                            />
+                            <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
+                          </label>
+                        ))}
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-3 border-t border-white/10">
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Max GIF Height (% of Chat Height)</label>
+                          <input
+                            type="number"
+                            min="5"
+                            max="100"
+                            value={(config as any)?.chatRender?.gifMaxHeightPercent ?? 33}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gifMaxHeightPercent: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10);
+                              const cleanVal = Number.isFinite(parsed) ? Math.max(5, Math.min(100, parsed)) : 33;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gifMaxHeightPercent: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                          <p className="text-xs text-gray-500">Caps Giphy GIF height (`5`–`100%`, default: `33%`).</p>
+                        </div>
+                        <div className="space-y-1.5 md:col-span-2">
+                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat Badge Filter Bitmask (--badge-filter)</label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={(config as any)?.chatRender?.badgeFilter ?? 0}
+                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, badgeFilter: e.target.value } } as any)}
+                            onBlur={(e) => {
+                              const parsed = parseInt(e.target.value, 10);
+                              const cleanVal = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, badgeFilter: cleanVal } } as any);
+                            }}
+                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                          />
+                          <p className="text-xs text-gray-500">
+                            Bitmask of badge types to HIDE (`0` = Show All, `1` = Other, `2` = Broadcaster, `4` = Moderator, `8` = VIP, `16` = Subscriber, `32` = Predictions, `64` = NoAudio/NoVideo, `128` = Prime Gaming). Sum values to combine.
                           </p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={openManualRenderModal}
-                          className="flex items-center justify-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-semibold transition-colors cursor-pointer shrink-0 shadow-sm"
-                        >
-                          <Play className="w-3.5 h-3.5 fill-current" />
-                          Manual Render...
-                        </button>
+                      </div>
+                    </div>
+
+                    {/* Fine-Grained Layout & Element Scaling */}
+                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
+                      <div>
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Fine-Grained Layout &amp; Element Scaling</h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          Multipliers applied relative to Font Size (`1.0` = 100%). Includes `--scale-username` for independent username sizing.
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+                        {[
+                          { key: 'scaleUsername', label: 'Scale Username' },
+                          { key: 'scaleEmote', label: 'Scale Emote' },
+                          { key: 'scaleBadge', label: 'Scale Badge' },
+                          { key: 'scaleEmoji', label: 'Scale Emoji' },
+                          { key: 'scaleAvatar', label: 'Scale Avatar' },
+                          { key: 'scaleVertical', label: 'Scale Vertical' },
+                          { key: 'scaleSidePadding', label: 'Scale Side Padding' },
+                          { key: 'scaleSectionHeight', label: 'Scale Section Height' },
+                          { key: 'scaleWordSpace', label: 'Scale Word Space' },
+                          { key: 'scaleEmoteSpace', label: 'Scale Emote Space' },
+                          { key: 'scaleHighlightStroke', label: 'Scale Highlight Stroke' },
+                          { key: 'scaleHighlightIndent', label: 'Scale Highlight Indent' },
+                        ].map(opt => (
+                          <div key={opt.key} className="space-y-1.5">
+                            <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{opt.label}</label>
+                            <input
+                              type="number"
+                              step="0.05"
+                              value={(config as any)?.chatRender?.[opt.key] ?? (opt.key === 'scaleVertical' ? 0.5 : 1.0)}
+                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.value } } as any)}
+                              onBlur={(e) => {
+                                const defVal = opt.key === 'scaleVertical' ? 0.5 : 1.0;
+                                const parsed = parseFloat(e.target.value);
+                                const cleanVal = Number.isFinite(parsed) && parsed > 0 ? parsed : defVal;
+                                updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: cleanVal } } as any);
+                              }}
+                              className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                            />
+                          </div>
+                        ))}
                       </div>
                     </div>
                   </div>
@@ -2524,8 +2992,9 @@ export default function App() {
                     <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Width (px)</label>
                     <input
                       type="number"
-                      value={manualRenderWidth}
-                      onChange={(e) => setManualRenderWidth(parseInt(e.target.value) || 0)}
+                      value={manualRenderWidth ?? ""}
+                      onChange={(e) => setManualRenderWidth(e.target.value as any)}
+                      onBlur={(e) => setManualRenderWidth(parseInt(e.target.value, 10) || ((config as any)?.chatRender?.width || 350))}
                       className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                     />
                   </div>
@@ -2533,8 +3002,9 @@ export default function App() {
                     <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Height (px)</label>
                     <input
                       type="number"
-                      value={manualRenderHeight}
-                      onChange={(e) => setManualRenderHeight(parseInt(e.target.value) || 0)}
+                      value={manualRenderHeight ?? ""}
+                      onChange={(e) => setManualRenderHeight(e.target.value as any)}
+                      onBlur={(e) => setManualRenderHeight(parseInt(e.target.value, 10) || ((config as any)?.chatRender?.height || 800))}
                       className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                     />
                   </div>
@@ -3035,6 +3505,79 @@ export default function App() {
                       </div>
                     </div>
                   </label>
+
+                  {/* Option 4: End Current Game & Await Next Twitch Category Switch */}
+                  {(() => {
+                    const lastSegmentName = games.length > 0 ? games[games.length - 1].gameName : currentGameName;
+                    const partMatch = lastSegmentName.match(/^(.*?)\s+Part\s+(\d+)$/i);
+                    const fallbackNextName = partMatch
+                      ? `${partMatch[1]} Part ${parseInt(partMatch[2], 10) + 1}`
+                      : `${lastSegmentName} Part 2`;
+                    const defaultBufMins = (config as any)?.gameSwitchBufferMins ?? 5;
+                    const parsedLeadMins = parseFloat(awaitLeadingBufferInput);
+                    const effectiveLeadMins = Number.isFinite(parsedLeadMins) && parsedLeadMins >= 0 ? parsedLeadMins : defaultBufMins * 2;
+
+                    return (
+                      <label
+                        className={`block p-3.5 rounded-xl border transition-all cursor-pointer ${
+                          spliceAction === 'await_next_game'
+                            ? "border-purple-500/70 bg-purple-950/25 shadow-sm shadow-purple-500/10"
+                            : "border-white/10 bg-white/[0.03] hover:border-white/20"
+                        }`}
+                      >
+                        <div className="flex items-start gap-3">
+                          <input
+                            type="radio"
+                            name="splice_action"
+                            value="await_next_game"
+                            checked={spliceAction === 'await_next_game'}
+                            onChange={() => setSpliceAction('await_next_game')}
+                            className="mt-1 text-purple-600 focus:ring-0 cursor-pointer"
+                          />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-sm font-semibold text-white">End Current Game &amp; Await Next Category Switch</span>
+                              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                                Late category update
+                              </span>
+                            </div>
+                            <p className="text-xs text-gray-400 mt-1 leading-relaxed">
+                              Immediately ends and stitches <strong>{lastSegmentName}</strong>, then records upcoming footage into the next game VOD (temporarily labeled <strong>{fallbackNextName}</strong> until the broadcaster updates their Twitch category).
+                            </p>
+
+                            {spliceAction === 'await_next_game' && (
+                              <div className="mt-3 pt-3 border-t border-white/10 space-y-2">
+                                <div className="flex flex-wrap items-center gap-2.5">
+                                  <span className="text-xs text-gray-300 font-medium">Leading Buffer Override (minutes):</span>
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    max="120"
+                                    step="0.5"
+                                    value={awaitLeadingBufferInput}
+                                    onClick={(e) => e.stopPropagation()}
+                                    onChange={(e) => setAwaitLeadingBufferInput(e.target.value)}
+                                    onBlur={(e) => {
+                                      const v = parseFloat(e.target.value);
+                                      const clamped = Number.isFinite(v) ? Math.max(0, Math.min(120, v)) : defaultBufMins * 2;
+                                      setAwaitLeadingBufferInput(String(clamped));
+                                    }}
+                                    className="w-24 px-2.5 py-1 text-xs text-center rounded bg-black/40 border border-white/20 text-white font-mono focus:outline-none focus:border-purple-500"
+                                  />
+                                  <span className="text-[11px] text-gray-400 font-mono">
+                                    (Default: {defaultBufMins * 2}m = 2x {defaultBufMins}m buffer • {Math.round(effectiveLeadMins * 30)} chunks)
+                                  </span>
+                                </div>
+                                <p className="text-[11px] text-gray-400 leading-relaxed">
+                                  Includes the last <strong>{effectiveLeadMins} minutes</strong> before now as leading footage for the new game so early gameplay before you clicked splice is retained.
+                                </p>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </label>
+                    );
+                  })()}
                 </div>
 
                 {/* Live Preview Summary */}
@@ -3061,6 +3604,21 @@ export default function App() {
                         Will finalize <strong>{currentGameName}</strong> (Segment {games.length || 1}) and immediately begin Part {games.length + 1} with leading buffer preserved.
                       </span>
                     )}
+                    {spliceAction === 'await_next_game' && (() => {
+                      const lastSegmentName = games.length > 0 ? games[games.length - 1].gameName : currentGameName;
+                      const partMatch = lastSegmentName.match(/^(.*?)\s+Part\s+(\d+)$/i);
+                      const fallbackNextName = partMatch
+                        ? `${partMatch[1]} Part ${parseInt(partMatch[2], 10) + 1}`
+                        : `${lastSegmentName} Part 2`;
+                      const defaultBufMins = (config as any)?.gameSwitchBufferMins ?? 5;
+                      const parsedLeadMins = parseFloat(awaitLeadingBufferInput);
+                      const effectiveLeadMins = Number.isFinite(parsedLeadMins) && parsedLeadMins >= 0 ? parsedLeadMins : defaultBufMins * 2;
+                      return (
+                        <span>
+                          Will finalize and stitch <strong>{lastSegmentName}</strong> now, retain a <strong>{effectiveLeadMins}m</strong> leading buffer for the new segment (labeled <strong>{fallbackNextName}</strong>), and automatically rename it when the Twitch game category updates.
+                        </span>
+                      );
+                    })()}
                   </div>
                 </div>
 
@@ -3080,8 +3638,11 @@ export default function App() {
                       const act = spliceAction;
                       const sc = clipScope;
                       const mins = clipMinutes;
+                      const defaultBufMins = (config as any)?.gameSwitchBufferMins ?? 5;
+                      const parsedLead = parseFloat(awaitLeadingBufferInput);
+                      const leadMins = Number.isFinite(parsedLead) && parsedLead >= 0 ? parsedLead : defaultBufMins * 2;
                       setManualSpliceChannel(null);
-                      executeManualSplice(ch, act, sc, mins);
+                      executeManualSplice(ch, act, sc, mins, leadMins);
                     }}
                     className="px-4 py-2 rounded-lg text-sm font-semibold text-white bg-purple-600 hover:bg-purple-500 transition-colors shadow-md shadow-purple-900/30 cursor-pointer"
                   >

@@ -1,14 +1,17 @@
 # VOD Automator
 
-**VOD Automator** (`v4.9.0`) is a local, self-hosted Twitch livestream & chat recording appliance built with Node.js, TypeScript, and React. It monitors up to two Twitch channels simultaneously, captures source-quality video segments (including **1440p60 HEVC / Enhanced Broadcasting CMAF** and **1080p60 H.264 MPEG-TS**) alongside real-time IRC chat (with BTTV, FFZ, 7TV, and Giphy emotes), automatically slices broadcasts by game category, backfills missed VOD footage when joining mid-stream, and renders synchronized chat overlay videos via `TwitchDownloaderCLI`.
+**VOD Automator** (`v5.1.0`) is a local, self-hosted Twitch livestream & chat recording appliance built with Node.js, TypeScript, and React. It monitors up to two Twitch channels simultaneously, captures source-quality video segments (including **1440p60 HEVC / Enhanced Broadcasting CMAF** and **1080p60 H.264 MPEG-TS**) alongside full-spectrum IRCv3 + PubSub broadcast events (with BTTV, FFZ, 7TV, and Giphy emotes), automatically slices broadcasts by game category, backfills missed VOD footage when joining mid-stream, and renders synchronized chat overlay videos via `ChatRenderCLI` (or legacy `TwitchDownloaderCLI`).
 
 ---
 
 ## ✨ Key Features
 
-- **Zero-Loss Live Video & Chat Capture**
+- **Zero-Loss Live Video & Full-Spectrum Chat + Event Capture**
   - Polls Twitch Usher & GraphQL with automatic outage fallback and live-edge lock-on.
-  - Captures real-time Twitch IRC WebSocket chat with embedded 3rd-party emotes (**7TV**, **BetterTTV**, **FrankerFaceZ**, and **Giphy**) in native `TwitchDownloaderCLI` JSON schema (`v1.5.3`).
+  - **Dual-WebSocket Event Engine (`v2.0-extended` Schema, 100% Backwards-Compatible):**
+    - **WebSocket 1 (`wss://irc-ws.chat.twitch.tv:443`):** Captures enriched `PRIVMSG` (First-Time Chatter, Returning Chatter, Highlighted Messages, Threaded Replies, Bits/Cheers, Hype Chat, Gigantified Emotes, Shared Chat), `USERNOTICE` (Subscriptions, Resubs, Gift Subs, Community Mystery Gifts, Raids, Announcements, Watch Streaks), and Moderation (`CLEARCHAT`, `CLEARMSG`, `ROOMSTATE`).
+    - **WebSocket 2 (`wss://pubsub-edge.twitch.tv/v1`):** Captures real-time ~1s channel Predictions, Polls, Pinned Chat Messages (`pinned-chat-updates-v1`), Channel Point Redemptions, Hype Trains, and Outgoing Raids with active overlay state carry-over across game splices.
+    - **Full `ChatRenderCLI` Integration & Legacy `TwitchDownloaderCLI` Compatibility:** Enriched `PRIVMSG` and `USERNOTICE` entries populate native `user_notice_params`, `bits_spent`, and `event_data` inside `comments[]`, while non-chat moderation and overlay updates reside in top-level `"events": [...]`. Supports all `ChatRenderCLI` flags (`--prediction-mode`, `--poll-mode`, `--pinned-chat-mode`, `--hype-train-mode`, `--moderation-mode`, `--jobs`, `--image-cache-mb`, `--highlight-users`, etc.) with automatic fallback if a legacy binary is used. See [`docs/CHAT_EVENT_SCHEMA_SPEC.md`](docs/CHAT_EVENT_SCHEMA_SPEC.md) for the formal Renderer Integration Specification.
 - **Twitch Enhanced Broadcasting (1440p60 HEVC / CMAF) Support**
   - Automatically advertises `av1,h265,h264` capabilities to Twitch Usher and selects the highest pixel-area, framerate, and bitrate source stream.
   - Automatically upgrades CloudFront VOD backfills to `/chunked/index-dvr.m3u8` (1440p60 HEVC) even when unauthenticated tokens cap master manifests at 1080p60.
@@ -16,18 +19,19 @@
 - **Automated Game Category Slicing & Transition Buffering**
   - Detects game changes mid-broadcast, applies a configurable leading/trailing buffer (default: `5 minutes` on both sides), and automatically remuxes completed game segments in the background while live recording continues.
   - **Subathon / Extended Stream Autosplice:** Automatically splits single-game marathon broadcasts (e.g., at the 8-hour mark once a game hits 9 hours) with zero dropped frames.
-- **3-Mode Live Manual Video Splice**
+- **4-Mode Live Manual Video Splice**
   - Cut or extract footage at any moment during a live broadcast:
     1. **Append Extension to Previous Game:** Stitch extra post-switch footage onto the previous game segment and advance the current game's start boundary.
     2. **Extract Standalone Highlight / Clip:** Non-destructively export the whole current game so far or the last `X` minutes without interrupting the master recording.
     3. **Split Game into New Part / Chapter:** Finalize the current segment immediately and start Part `N+1` with leading buffer preserved.
+    4. **End Current Game & Await Next Category Switch:** Finalize and stitch the outgoing game immediately (with a configurable leading buffer override defaulting to `2x` buffer time) while recording upcoming footage into a pending segment (`[Previous Game] Part 2`) that automatically adopts the new game name once the broadcaster updates their Twitch category.
 - **Intelligent Mid-Stream & Crash Recovery (VOD Backfill)**
   - **Mid-Stream Join Prompt:** Joining a broadcast that is already live prompts to backfill the **Full VOD**, **Current Game Only** (using Twitch VOD chapter markers), or **No Backfill** (with a 60-second AFK auto-selection timer so unattended starts never stall).
   - **Downtime / Restart Gap Recovery:** Automatically detects missed segments after a system reboot or network drop and offers seamless VOD backfill of the interrupted game segment.
   - **Strict VOD vs. Live Isolation:** Standalone VOD backfills (`vod_seq_*.ts`) and live segments (`seq_*.ts`) are never interleaved into the same container, preventing timestamp and discontinuity corruption.
-- **Automated & Custom Chat Rendering (`TwitchDownloaderCLI`)**
+- **Automated & Custom Chat Rendering (`ChatRenderCLI` / `TwitchDownloaderCLI`)**
   - Probes exact container durations via `ffprobe` / `ffmpeg` and normalizes chat offsets with codec-specific sync presets (`-2.5s` for H.264 1080p, `-7.5s` for HEVC 1440p) and long-broadcast clock drift compensation.
-  - Supports transparent **VP9 (`.webm`)**, **ProRes (`.mov`)**, and standard **H.264 / HEVC (`.mp4` / `.mkv`)** chat renders, with a quick-select **Recent Recording Folders** picker for manual chat renders and un-stitched folder video recovery.
+  - Two dedicated Settings tabs (**Render: Video & Output** and **Render: Chat & Events**) configure parallel multi-FFmpeg rendering (`-j / --jobs`), decoded sprite cache budgets (`--image-cache-mb`), sticky top overlays (`Predictions`, `Polls`, `Pinned Chat`, `Hype Train`), moderation strikethroughs (`--moderation-mode`), and custom user highlighting.
 - **Windows Background Service & Storage Safety**
   - One-click `install.bat` compiles the production bundle (`dist/server.js`) and registers **VOD Automator** as a native Windows Service (`node-windows`) running on `http://localhost:3000`.
   - Pre-flight and periodic 5-minute disk space checks warn at `< 20 GB` free and gracefully finalize/seal recordings at `< 5 GB` free to prevent disk exhaustion.
@@ -37,11 +41,11 @@
 
 ## 🛠️ Prerequisites
 
-1. **Operating System:** Windows 10/11 (primary target for Windows Service & `TwitchDownloaderCLI.exe`), macOS, or Linux.
+1. **Operating System:** Windows 10/11 (primary target for Windows Service & `ChatRenderCLI.exe` / `TwitchDownloaderCLI.exe`), macOS, or Linux.
 2. **Node.js:** `v20+` (LTS recommended).
-3. **TwitchDownloaderCLI & FFmpeg:**
-   - Download [`TwitchDownloaderCLI`](https://github.com/lay295/TwitchDownloader/releases) and place `TwitchDownloaderCLI.exe` in `C:\TwitchDownloader\TwitchDownloaderCLI.exe` (or inside `./TwitchDownloader/` in the project root, or configure a custom path in the **Settings → Chat Render** tab).
-   - If `ffmpeg` / `ffprobe` are not already in the same folder as `TwitchDownloaderCLI` or on your system `PATH`, VOD Automator will automatically invoke `TwitchDownloaderCLI ffmpeg -d` on first stitch to download it.
+3. **ChatRenderCLI / TwitchDownloaderCLI & FFmpeg:**
+   - Place `ChatRenderCLI.exe` (or `TwitchDownloaderCLI.exe`) in `C:\TwitchDownloader\` or inside `./TwitchDownloader/` in the project root (or configure a custom path in the **Settings → Render: Video & Output** tab).
+   - If `ffmpeg` / `ffprobe` are not already in the same folder as the CLI binary or on your system `PATH`, VOD Automator will automatically invoke `<CLI> ffmpeg -d` on first stitch to download it.
 
 ---
 
@@ -129,6 +133,8 @@ downloads/
 │       ├── emotes.ts          # 7TV, BetterTTV, and FrankerFaceZ emote fetching & embedding
 │       ├── ffmpeg.ts          # FFmpeg/FFprobe binary resolution, HEVC codec detection & container duration probing
 │       └── state.ts           # Atomic config.json & state.json persistence, log rotation (system.log) & path self-healing
+├── docs/
+│   └── CHAT_EVENT_SCHEMA_SPEC.md # Formal v2.0-extended JSON schema & C# System.Text.Json integration spec for custom TwitchDownloader renderers
 ├── scripts/
 │   ├── install-service.js     # Windows Service registration wrapper (node-windows -> dist/server.js)
 │   └── uninstall-service.js   # Windows Service uninstaller
