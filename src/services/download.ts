@@ -3,8 +3,8 @@ import path from "path";
 import axios from "axios";
 import checkDiskSpace from "check-disk-space";
 import { Parser } from "m3u8-parser";
-import { ActiveDownloadSession, SessionGame } from "../types";
-import { state, addLog, updateTask, removeTask, scheduleStateSave, cleanChannelName, PROJECT_ROOT, getResolvedSavePath } from "./state";
+import { ActiveDownloadSession, SessionGame, CaptureMode } from "../types";
+import { state, addLog, updateTask, removeTask, scheduleStateSave, cleanChannelName, PROJECT_ROOT, getResolvedSavePath, getChatRenderDimensionsForChatFile } from "./state";
 import { 
   twitchAxios, 
   requestWithBackoff, 
@@ -315,19 +315,25 @@ export async function checkStreamStatus() {
           // Never trigger if the session is actively polling or has polled within the last 45s
           const isStalled = !activeSession.playlistPollInterval && !activeSession.isPollingActive && (!activeSession.lastPollTimestampMs || (Date.now() - activeSession.lastPollTimestampMs > 45000));
           if (isStalled) {
-            addLog(`[Recovery] Re-initializing intervals for restored session: ${channelLogin}`);
+            const sessionCaptureMode: CaptureMode = activeSession.captureMode || state.config.channelCaptureModes?.[cleanChannelName(channelLogin)] || 'both';
+            activeSession.captureMode = sessionCaptureMode;
+            addLog(`[Recovery] Re-initializing intervals for restored session: ${channelLogin} (mode: ${sessionCaptureMode})`);
             // Ensure folder exists on disk
             if (activeSession.folderPath && !fs.existsSync(activeSession.folderPath)) {
               await fs.promises.mkdir(activeSession.folderPath, { recursive: true }).catch(() => {});
             }
-            // Grab token again and await playlist refresh before scheduling poll
-            await refreshMediaPlaylist(channelLogin).catch((err: any) => {
-              addLog(`[Recovery Warning] Failed to refresh stalled playlist for ${channelLogin}: ${err.message}`);
-            });
+            if (sessionCaptureMode !== 'chat_only') {
+              // Grab token again and await playlist refresh before scheduling poll
+              await refreshMediaPlaylist(channelLogin).catch((err: any) => {
+                addLog(`[Recovery Warning] Failed to refresh stalled playlist for ${channelLogin}: ${err.message}`);
+              });
+            }
             if (!activeSession.playlistPollInterval && !(activeSession as any).isStopped) {
               activeSession.playlistPollInterval = setTimeout(() => pollPlaylist(channelLogin), 2000) as any;
             }
-            startLiveChatDownload(channelLogin, activeSession.folderPath, stream.id, userId || "", stream.createdAt || new Date().toISOString());
+            if (sessionCaptureMode !== 'video_only') {
+              startLiveChatDownload(channelLogin, activeSession.folderPath, stream.id, userId || "", stream.createdAt || new Date().toISOString());
+            }
           }
 
           // Reset missing count if stream is found
@@ -384,7 +390,12 @@ export async function checkStreamStatus() {
                 }
               } else {
                 // Valid game change
-                addLog(`[Game Change] Detected switch to "${newGame}". Logging boundary for Video/Chat split.`);
+                const splitLabel = activeSession.captureMode === 'video_only'
+                  ? 'Video split'
+                  : activeSession.captureMode === 'chat_only'
+                  ? 'Chat split'
+                  : 'Video/Chat split';
+                addLog(`[Game Change] Detected switch to "${newGame}". Logging boundary for ${splitLabel}.`);
                 activeSession.games.push({
                   gameName: newGame,
                   startChunk: maxChunk,
@@ -428,7 +439,12 @@ export async function checkStreamStatus() {
         }
 
         if (activeSession.missingCount >= maxGraceChecks) {
-          addLog(`[Stream] Stream @${channelLogin} exceeded ${graceMins}m grace period. Concluding broadcast and triggering finalization (chat & stitching)...`);
+          const finalizeDesc = activeSession.captureMode === 'video_only'
+            ? 'video stitching'
+            : activeSession.captureMode === 'chat_only'
+            ? 'chat slicing'
+            : 'video stitching & chat slicing';
+          addLog(`[Stream] Stream @${channelLogin} exceeded ${graceMins}m grace period. Concluding broadcast and triggering finalization (${finalizeDesc})...`);
           const sessionData = { ...activeSession };
           await stopActiveDownload(channelLogin);
           
@@ -566,6 +582,11 @@ export async function checkStreamStatus() {
     // Always anchor videoStartTimeMs to the broadcast start time (streamCreatedAtMs)
     // so timeline offsets (live chat, VOD backfill, and game slices) are consistently referenced to broadcast start
     const videoStartTimeMs = streamCreatedAtMs;
+    const captureMode: CaptureMode = state.config.channelCaptureModes?.[cleanChannelName(channelLogin)] || 'both';
+
+    const elapsedSecAtInit = Math.max(0, Math.floor((Date.now() - streamCreatedAtMs) / 1000));
+    const chatOnlyJoinOffsetSec = elapsedSecAtInit < 60 ? 0 : elapsedSecAtInit;
+    const chatOnlyInitChunk = Math.floor(chatOnlyJoinOffsetSec / 2);
 
     state.activeDownloadSessions[channelLogin] = {
       channel: channelLogin,
@@ -573,6 +594,9 @@ export async function checkStreamStatus() {
       twitchId: twitchId,
       startTime: new Date().toISOString(),
       streamCreatedAtMs: streamCreatedAtMs,
+      initialJoinOffsetSec: captureMode === 'chat_only' ? chatOnlyJoinOffsetSec : undefined,
+      firstSeqNum: captureMode === 'chat_only' ? chatOnlyInitChunk : undefined,
+      videoDurationSeconds: captureMode === 'chat_only' ? chatOnlyJoinOffsetSec : undefined,
       chunksDownloaded: liveChunksCount, // Exclusively count live seq_*.ts segments (never vod_seq_*.ts)
       folderPath: folderPath,
       segmentsFile: segmentsFile,
@@ -582,43 +606,57 @@ export async function checkStreamStatus() {
       previewImageUrl: stream.previewImageURL || '',
       games: [{
         gameName: stream.game?.name || 'Unknown',
-        startChunk: currentChunkIndex,
-        startTimeOffset: currentChunkIndex * 2,
+        startChunk: captureMode === 'chat_only' ? chatOnlyInitChunk : currentChunkIndex,
+        startTimeOffset: captureMode === 'chat_only' ? chatOnlyJoinOffsetSec : currentChunkIndex * 2,
         startTimeMs: streamCreatedAtMs
       }],
       downloadedSegments: downloadedSegments,
       mediaPlaylistUrl: "",
       playlistPollInterval: null,
       isRefreshingPlaylist: false,
-      highestSeq: currentChunkIndex > 0 ? currentChunkIndex : -1,
+      highestSeq: captureMode === 'chat_only' ? chatOnlyInitChunk : (currentChunkIndex > 0 ? currentChunkIndex : -1),
       videoStartTimeMs: videoStartTimeMs,
       commentsWritten: 0,
-      autoRenderChat: state.config.channelAutoRender?.[channelLogin] ?? state.config.autoRenderChat ?? false
+      autoRenderChat: state.config.channelAutoRender?.[channelLogin] ?? state.config.autoRenderChat ?? false,
+      captureMode
     };
 
     scheduleStateSave();
 
-    // Robust media playlist initialization with retry for newly live streams
-    let playlistAttempts = 0;
-    while (playlistAttempts < 3 && (!state.activeDownloadSessions[channelLogin]?.mediaPlaylistUrl)) {
-      if (playlistAttempts > 0) {
-        addLog(`[Session] Waiting for media playlist to become available for ${channelLogin} (attempt ${playlistAttempts + 1}/3)...`);
-        await new Promise(r => setTimeout(r, 2000));
+    if (captureMode !== 'chat_only') {
+      // Robust media playlist initialization with retry for newly live streams
+      let playlistAttempts = 0;
+      while (playlistAttempts < 3 && (!state.activeDownloadSessions[channelLogin]?.mediaPlaylistUrl)) {
+        if (playlistAttempts > 0) {
+          addLog(`[Session] Waiting for media playlist to become available for ${channelLogin} (attempt ${playlistAttempts + 1}/3)...`);
+          await new Promise(r => setTimeout(r, 2000));
+        }
+        await refreshMediaPlaylist(channelLogin);
+        playlistAttempts++;
       }
-      await refreshMediaPlaylist(channelLogin);
-      playlistAttempts++;
+    } else {
+      addLog(`[Session] Initialized Chat-Only session for @${channelLogin} (skipping HLS video stream download).`);
     }
     
-    if (state.activeDownloadSessions[channelLogin] && state.activeDownloadSessions[channelLogin].mediaPlaylistUrl) {
+    const isSessionReady = Boolean(
+      state.activeDownloadSessions[channelLogin] &&
+      (captureMode === 'chat_only' || state.activeDownloadSessions[channelLogin].mediaPlaylistUrl)
+    );
+
+    if (isSessionReady) {
       delete initFailureCooldowns[channelLogin];
       state.activeDownloadSessions[channelLogin].playlistPollInterval = setTimeout(() => pollPlaylist(channelLogin), 2500) as any; // Poll every 2.5s
 
-      // Start live chat recording only after the video playlist is successfully verified
-      if (twitchId) {
-        const chatStartTime = stream.createdAt || state.activeDownloadSessions[channelLogin].startTime;
-        startLiveChatDownload(channelLogin, folderPath, streamId, twitchId, chatStartTime);
+      // Start live chat recording unless channel is configured for Video Only
+      if (captureMode !== 'video_only') {
+        if (twitchId) {
+          const chatStartTime = stream.createdAt || state.activeDownloadSessions[channelLogin].startTime;
+          startLiveChatDownload(channelLogin, folderPath, streamId, twitchId, chatStartTime);
+        } else {
+          addLog("[Chat] Failed to get Twitch ID, chat will not be recorded.");
+        }
       } else {
-        addLog("[Chat] Failed to get Twitch ID, chat will not be recorded.");
+        addLog(`[Session] Video-Only mode active for @${channelLogin} (skipping live chat IRC/PubSub recording).`);
       }
       
       const streamAgeMs = Date.now() - new Date(stream.createdAt).getTime();
@@ -627,16 +665,28 @@ export async function checkStreamStatus() {
       if (wasAlreadyLive) {
         const taskId = `prompt_backfill_${streamId}`;
         const timeMins = Math.round(streamAgeMs / 60000);
+        const promptTitleBase = captureMode === 'video_only'
+          ? 'VOD Video Backfill'
+          : captureMode === 'chat_only'
+          ? 'VOD Chat Backfill'
+          : 'VOD & Chat Backfill';
+        const promptTargetDesc = captureMode === 'video_only'
+          ? 'missed video'
+          : captureMode === 'chat_only'
+          ? 'missed chat'
+          : 'missed video & chat';
+
         state.activeTasks[taskId] = {
           id: taskId,
-          name: "VOD & Chat Backfill",
+          name: promptTitleBase,
           progressText: `Stream has been live for ${timeMins}m. Inspecting broadcast chapters...`,
           status: "running",
           actionRequired: true,
           actions: [],
           streamId,
           channelLogin,
-          folderPath
+          folderPath,
+          captureMode
         };
 
         // Query Twitch for VOD chapters
@@ -687,8 +737,8 @@ export async function checkStreamStatus() {
 
               updateTask(
                 taskId,
-                `VOD & Chat Backfill (@${channelLogin})`,
-                `Stream has been live for ${timeMins}m across ${chapters.length} games. Choose backfill option (Auto-selecting No Backfill in ${countdownSec}s):`,
+                `${promptTitleBase} (@${channelLogin})`,
+                `Stream has been live for ${timeMins}m across ${chapters.length} games. Choose ${promptTargetDesc} backfill option (Auto-selecting No Backfill in ${countdownSec}s):`,
                 "running",
                 true,
                 [
@@ -701,8 +751,8 @@ export async function checkStreamStatus() {
               // If there is only one game/segment in the broadcast, only present Full or No backfill!
               updateTask(
                 taskId,
-                `VOD & Chat Backfill (@${channelLogin})`,
-                `Stream has been live for ${timeMins}m. Would you like to backfill missed video & chat from VOD? (Auto-selecting No Backfill in ${countdownSec}s)`,
+                `${promptTitleBase} (@${channelLogin})`,
+                `Stream has been live for ${timeMins}m. Would you like to backfill ${promptTargetDesc} from VOD? (Auto-selecting No Backfill in ${countdownSec}s)`,
                 "running",
                 true,
                 [
@@ -722,8 +772,8 @@ export async function checkStreamStatus() {
             const expiresAt = Date.now() + (countdownSec * 1000);
             updateTask(
               taskId,
-              `VOD & Chat Backfill (@${channelLogin})`,
-              `Stream has been live for ${timeMins}m. Would you like to backfill missed video & chat from VOD? (Auto-selecting No Backfill in ${countdownSec}s)`,
+              `${promptTitleBase} (@${channelLogin})`,
+              `Stream has been live for ${timeMins}m. Would you like to backfill ${promptTargetDesc} from VOD? (Auto-selecting No Backfill in ${countdownSec}s)`,
               "running",
               true,
               [
@@ -741,10 +791,12 @@ export async function checkStreamStatus() {
           // AFK Default Behavior: Auto-select "No Backfill" after 60s so buffered live chat flushes to disk
           setTimeout(() => {
             if (state.activeTasks[taskId] && state.activeTasks[taskId].actionRequired) {
-              addLog(`[Backfill] AFK timeout (60s) elapsed for @${channelLogin}. Auto-selecting No Backfill to flush buffered live chat to disk.`);
-              resolveLiveChatBackfill(channelLogin, 'none', 0).catch(err => {
-                addLog(`[Chat Backfill Error] ${err.message}`);
-              });
+              addLog(`[Backfill] AFK timeout (60s) elapsed for @${channelLogin}. Auto-selecting No Backfill.`);
+              if (captureMode !== 'video_only') {
+                resolveLiveChatBackfill(channelLogin, 'none', 0).catch(err => {
+                  addLog(`[Chat Backfill Error] ${err.message}`);
+                });
+              }
               removeTask(taskId);
             }
           }, 60000);
@@ -1013,6 +1065,94 @@ export async function executeResumeVodBackfill(
       }
     };
 
+    // Chat-Only Mode lightweight clock & game-slicing tick (skips HLS segment downloads)
+    if (session.captureMode === 'chat_only') {
+      try {
+        if (!session.folderVerified) {
+          if (!fs.existsSync(session.folderPath)) {
+            await fs.promises.mkdir(session.folderPath, { recursive: true }).catch(() => {});
+          }
+          session.folderVerified = true;
+        }
+
+        const nowMs = Date.now();
+        if (!session.lastDiskCheckMs || (nowMs - session.lastDiskCheckMs) >= DISK_CHECK_INTERVAL_MS) {
+          session.lastDiskCheckMs = nowMs;
+          const freeBytes = await queryFreeDiskBytes(session.folderPath);
+          if (freeBytes !== null && freeBytes < DISK_CRITICAL_THRESHOLD_BYTES) {
+            const freeGb = (freeBytes / (1024 * 1024 * 1024)).toFixed(2);
+            addLog(`[Storage Safety] CRITICAL: Free disk space dropped to ${freeGb} GB (< 5 GB threshold) during active Chat-Only recording of @${channelLogin}. Finalizing session!`);
+            initFailureCooldowns[channelLogin] = Date.now() + 300000;
+            const sessionData = { ...session };
+            await stopActiveDownload(channelLogin);
+            triggerFinalizeFlow(sessionData, channelLogin, "low_disk");
+            return;
+          }
+        }
+
+        const broadcastStartMs = session.streamCreatedAtMs || session.videoStartTimeMs || Date.now();
+        session.videoDurationSeconds = Math.max(0, Math.floor((nowMs - broadcastStartMs) / 1000));
+        session.highestSeq = Math.floor(session.videoDurationSeconds / 2);
+        if (session.firstSeqNum === undefined) {
+          session.firstSeqNum = Math.floor((session.initialJoinOffsetSec || 0) / 2);
+        }
+
+        // Check for extended stream / single-game autosplice
+        const isAutospliceEnabled = state.config.longGameAutospliceEnabled ?? true;
+        const triggerHours = state.config.longGameAutospliceTriggerHours ?? 9;
+        const cutHours = Math.min(triggerHours, state.config.longGameAutospliceCutHours ?? 8);
+        if (isAutospliceEnabled && triggerHours > 0 && cutHours > 0 && session.games && session.games.length > 0) {
+          const lastGame = session.games[session.games.length - 1];
+          const startChunk = (lastGame.startChunk && lastGame.startChunk > 0) ? lastGame.startChunk : (session.firstSeqNum || 0);
+          const currentGameDuration = Math.max(0, (session.videoDurationSeconds || 0) - (lastGame.startTimeOffset || 0));
+          const triggerSec = triggerHours * 3600;
+          const cutSec = cutHours * 3600;
+          if (currentGameDuration >= triggerSec) {
+            const chunksElapsed = Math.round(cutSec / 2.0);
+            const spliceStartChunk = startChunk + chunksElapsed;
+            const spliceTimeOffset = (lastGame.startTimeOffset || 0) + cutSec;
+            const spliceStartTimeMs = (lastGame.startTimeMs || Date.now()) + (cutSec * 1000);
+            addLog(`[Time Splice] Chat-Only broadcast has been on "${lastGame.gameName}" for >= ${triggerHours}h. Creating time-based chat splice at the ${cutHours}h mark.`);
+            session.games.push({
+              gameName: lastGame.gameName,
+              startChunk: spliceStartChunk,
+              startTimeOffset: spliceTimeOffset,
+              startTimeMs: spliceStartTimeMs,
+              isTimeSplice: true
+            });
+            scheduleStateSave();
+          }
+        }
+
+        // Check mid-stream game switch buffer completion
+        const bufferMins = state.config.gameSwitchBufferMins ?? 5;
+        const triggerChunkDistance = Math.floor((bufferMins * 60) / 2);
+        if (session.games && session.games.length > 1) {
+          for (let i = 0; i < session.games.length - 1; i++) {
+            const pastGame = session.games[i];
+            const nextGame = session.games[i + 1];
+            if (!pastGame.isExported && session.highestSeq >= nextGame.startChunk + triggerChunkDistance) {
+              pastGame.isExported = true;
+              scheduleStateSave();
+              addLog(`[Game Slicing] Chat-Only Mid-stream: ${pastGame.gameName} (Segment ${i + 1}) is fully buffered! Slicing chat segment in background...`);
+              triggerMidStreamGameExport(session, i, channelLogin);
+            }
+          }
+        }
+      } finally {
+        const currentSession = state.activeDownloadSessions[channelLogin];
+        if (currentSession) {
+          const now = Date.now();
+          if (!currentSession.lastStateSaveMs || (now - currentSession.lastStateSaveMs) >= 20000) {
+            currentSession.lastStateSaveMs = now;
+            scheduleStateSave();
+          }
+        }
+        scheduleNext(2500);
+      }
+      return;
+    }
+
     if (!session.mediaPlaylistUrl || session.isRefreshingPlaylist) {
       scheduleNext(2500);
       return;
@@ -1040,7 +1180,10 @@ export async function executeResumeVodBackfill(
         if (freeBytes !== null) {
           const freeGb = (freeBytes / (1024 * 1024 * 1024)).toFixed(2);
           if (freeBytes < DISK_CRITICAL_THRESHOLD_BYTES) {
-            addLog(`[Storage Safety] CRITICAL: Free disk space dropped to ${freeGb} GB (< 5 GB threshold) during active recording of @${channelLogin}. Gracefully pausing stream recording, sealing chat JSON, and finalizing recorded chunks!`);
+            const diskFinalizeDesc = session.captureMode === 'video_only'
+              ? 'finalizing recorded video chunks'
+              : 'sealing chat JSON and finalizing recorded chunks';
+            addLog(`[Storage Safety] CRITICAL: Free disk space dropped to ${freeGb} GB (< 5 GB threshold) during active recording of @${channelLogin}. Gracefully pausing stream recording and ${diskFinalizeDesc}!`);
             initFailureCooldowns[channelLogin] = Date.now() + 300000; // 5-minute cooldown before re-attempting
             const sessionData = { ...session };
             await stopActiveDownload(channelLogin);
@@ -1351,7 +1494,8 @@ export async function executeResumeVodBackfill(
   export function triggerMidStreamGameExport(session: ActiveDownloadSession, gameIndex: number, channelLogin: string) {
     const pastGame = session.games![gameIndex];
     const exportTaskId = `export_${channelLogin}_${session.streamId}_game_${gameIndex}`;
-    updateTask(exportTaskId, `Exporting ${pastGame.gameName} (${channelLogin})`, `Stitching...`, "running", false, undefined);
+    const initialSubtext = session.captureMode === 'chat_only' ? 'Slicing chat segment...' : 'Stitching...';
+    updateTask(exportTaskId, `Exporting ${pastGame.gameName} (${channelLogin})`, initialSubtext, "running", false, undefined);
     
     if (state.activeTasks[exportTaskId]) {
       state.activeTasks[exportTaskId].games = session.games;
@@ -1365,20 +1509,23 @@ export async function executeResumeVodBackfill(
       state.activeTasks[exportTaskId].firstSeqNum = session.firstSeqNum;
       state.activeTasks[exportTaskId].streamCreatedAtMs = session.streamCreatedAtMs;
       state.activeTasks[exportTaskId].gapAdjustments = session.gapAdjustments;
+      state.activeTasks[exportTaskId].captureMode = session.captureMode || 'both';
     }
     
     stitchVideoChunks(session.folderPath, 'live', exportTaskId).then((chatFiles) => {
       updateTask(exportTaskId, `Exported ${pastGame.gameName} (${channelLogin})`, `Saved to ${session.folderPath}`, "success", false, [
+        ...(session.captureMode !== 'video_only' ? [{ label: "Render Chat", value: "render_chat" }] : []),
         { label: "Open Folder", value: "open_folder" },
         { label: "Close", value: "dismiss" }
       ]);
 
       const filesArray = Array.isArray(chatFiles) ? chatFiles : [];
-      if (session.autoRenderChat && filesArray.length > 0) {
+      if (session.captureMode !== 'video_only' && session.autoRenderChat && filesArray.length > 0) {
         addLog(`[Auto-Render] Triggering automatic chat render for mid-stream segment ${pastGame.gameName}...`);
-        const fallbackW = (state.config.chatRender && state.config.chatRender.width) || 350;
-        const fallbackH = (state.config.chatRender && state.config.chatRender.height) || 800;
-        const segments = filesArray.map((f: string) => ({ filename: f, width: fallbackW, height: fallbackH }));
+        const segments = filesArray.map((f: string) => {
+          const resDim = getChatRenderDimensionsForChatFile(path.join(session.folderPath, f), pastGame.gameName);
+          return { filename: f, width: resDim.width, height: resDim.height };
+        });
         
         startChatRenderMultiple(channelLogin, session.folderPath, segments).catch((err: any) => {
           addLog(`[Auto-Render] Error: ${err.message}`);
@@ -1462,7 +1609,8 @@ export async function executeResumeVodBackfill(
       const outputBase = `${prevIndex + 1}_${cleanPrevName}_extension_${dateStr}`;
 
       const exportTaskId = `export_${cleaned}_${session.streamId}_extension_${Date.now()}`;
-      updateTask(exportTaskId, `Appending extension to ${prevGame.gameName} (@${session.channel})`, "Stitching extension...", "running", false, undefined);
+      const extSubtext = session.captureMode === 'chat_only' ? 'Slicing chat extension...' : 'Stitching extension...';
+      updateTask(exportTaskId, `Appending extension to ${prevGame.gameName} (@${session.channel})`, extSubtext, "running", false, undefined);
 
       if (state.activeTasks[exportTaskId]) {
         state.activeTasks[exportTaskId].customExportMode = 'append_previous';
@@ -1480,22 +1628,25 @@ export async function executeResumeVodBackfill(
         state.activeTasks[exportTaskId].firstSeqNum = session.firstSeqNum;
         state.activeTasks[exportTaskId].streamCreatedAtMs = session.streamCreatedAtMs;
         state.activeTasks[exportTaskId].gapAdjustments = session.gapAdjustments;
+        state.activeTasks[exportTaskId].captureMode = session.captureMode || 'both';
       }
 
       addLog(`[Manual Splice] Appending extension to "${prevGame.gameName}" on @${session.channel} (chunks ${extensionStartChunk} - ${extensionEndChunk}). Current game "${currentGame.gameName}" shifted to chunk ${currentChunk}.`);
 
       stitchVideoChunks(session.folderPath, 'live', exportTaskId).then((chatFiles) => {
         updateTask(exportTaskId, `Appended extension to ${prevGame.gameName} (@${session.channel})`, `Saved to ${session.folderPath}`, "success", false, [
+          ...(session.captureMode !== 'video_only' ? [{ label: "Render Chat", value: "render_chat" }] : []),
           { label: "Open Folder", value: "open_folder" },
           { label: "Close", value: "dismiss" }
         ]);
 
         const filesArray = Array.isArray(chatFiles) ? chatFiles : [];
-        if (session.autoRenderChat && filesArray.length > 0) {
+        if (session.captureMode !== 'video_only' && session.autoRenderChat && filesArray.length > 0) {
           addLog(`[Auto-Render] Triggering automatic chat render for extension segment ${prevGame.gameName}...`);
-          const fallbackW = (state.config.chatRender && state.config.chatRender.width) || 350;
-          const fallbackH = (state.config.chatRender && state.config.chatRender.height) || 800;
-          const segments = filesArray.map((f: string) => ({ filename: f, width: fallbackW, height: fallbackH }));
+          const segments = filesArray.map((f: string) => {
+            const resDim = getChatRenderDimensionsForChatFile(path.join(session.folderPath, f), prevGame.gameName);
+            return { filename: f, width: resDim.width, height: resDim.height };
+          });
           startChatRenderMultiple(session.channel, session.folderPath, segments).catch((err: any) => {
             addLog(`[Auto-Render] Error: ${err.message}`);
           });
@@ -1554,22 +1705,25 @@ export async function executeResumeVodBackfill(
         state.activeTasks[exportTaskId].firstSeqNum = session.firstSeqNum;
         state.activeTasks[exportTaskId].streamCreatedAtMs = session.streamCreatedAtMs;
         state.activeTasks[exportTaskId].gapAdjustments = session.gapAdjustments;
+        state.activeTasks[exportTaskId].captureMode = session.captureMode || 'both';
       }
 
-      addLog(`[Manual Splice] Extracting standalone clip "${outputBase}.mp4" on @${session.channel} (chunks ${startIdx} - ${endIdx}, ${durationLabel}). Master stream timeline preserved.`);
+      addLog(`[Manual Splice] Extracting standalone clip "${outputBase}" on @${session.channel} (chunks ${startIdx} - ${endIdx}, ${durationLabel}). Master stream timeline preserved.`);
 
       stitchVideoChunks(session.folderPath, 'live', exportTaskId).then((chatFiles) => {
         updateTask(exportTaskId, `Extracted Clip (${durationLabel}) for ${currentGame.gameName} (@${session.channel})`, `Saved to ${session.folderPath}`, "success", false, [
+          ...(session.captureMode !== 'video_only' ? [{ label: "Render Chat", value: "render_chat" }] : []),
           { label: "Open Folder", value: "open_folder" },
           { label: "Close", value: "dismiss" }
         ]);
 
         const filesArray = Array.isArray(chatFiles) ? chatFiles : [];
-        if (session.autoRenderChat && filesArray.length > 0) {
+        if (session.captureMode !== 'video_only' && session.autoRenderChat && filesArray.length > 0) {
           addLog(`[Auto-Render] Triggering automatic chat render for standalone clip ${outputBase}...`);
-          const fallbackW = (state.config.chatRender && state.config.chatRender.width) || 350;
-          const fallbackH = (state.config.chatRender && state.config.chatRender.height) || 800;
-          const segments = filesArray.map((f: string) => ({ filename: f, width: fallbackW, height: fallbackH }));
+          const segments = filesArray.map((f: string) => {
+            const resDim = getChatRenderDimensionsForChatFile(path.join(session.folderPath, f), currentGame.gameName);
+            return { filename: f, width: resDim.width, height: resDim.height };
+          });
           startChatRenderMultiple(session.channel, session.folderPath, segments).catch((err: any) => {
             addLog(`[Auto-Render] Error: ${err.message}`);
           });
@@ -1799,9 +1953,10 @@ export async function executeResumeVodBackfill(
           }
         };
 
-        const prefix = session.commentsWritten === 0 ? "\n    " : ",\n    ";
+        const realUserCommentsCount = session.commentsWritten || 0;
+        const prefix = realUserCommentsCount === 0 ? "\n    " : ",\n    ";
         session.chatStream.write(prefix + JSON.stringify(dummyMessage));
-        session.commentsWritten = (session.commentsWritten || 0) + 1;
+        session.commentsWritten = realUserCommentsCount + 1;
 
         const embeddedData = {
           thirdParty: session.thirdPartyEmotes || [],
@@ -1834,7 +1989,8 @@ export async function executeResumeVodBackfill(
                   }
                 }
                 
-                addLog(`[Chat] Updated chat file header with video length: ${duration}s.`);
+                const lengthLabel = session.captureMode === 'chat_only' ? 'broadcast duration' : 'video length';
+                addLog(`[Chat] Updated chat file header with ${lengthLabel}: ${duration}s.`);
                 await repairChatJsonFile(session.chatFilePath);
                 const sidecarPath = getEventsSidecarPath(session.chatFilePath);
                 if (sidecarPath && fs.existsSync(sidecarPath)) {
@@ -1847,7 +2003,7 @@ export async function executeResumeVodBackfill(
             resolve();
           });
         });
-        addLog(`[Chat] Live chat recording saved (${session.commentsWritten} messages, ${session.eventsWritten || 0} broadcast events) for ${channelLogin}.`);
+        addLog(`[Chat] Live chat recording saved (${realUserCommentsCount} messages, ${session.eventsWritten || 0} broadcast events) for ${channelLogin}.`);
       }
       if (state.activeTasks[`prompt_backfill_${session.streamId}`]) {
         delete state.activeTasks[`prompt_backfill_${session.streamId}`];
@@ -2066,6 +2222,7 @@ export async function executeResumeVodBackfill(
         false,
         undefined
       );
+      const sessionCaptureMode = state.activeDownloadSessions[channelLogin]?.captureMode || state.config.channelCaptureModes?.[cleanChannelName(channelLogin)] || 'both';
       if (state.activeTasks[stitchTaskId]) {
         state.activeTasks[stitchTaskId].folderPath = folderPath;
         state.activeTasks[stitchTaskId].channelLogin = channelLogin;
@@ -2075,11 +2232,12 @@ export async function executeResumeVodBackfill(
         (state.activeTasks[stitchTaskId] as any).outputSuffix = options?.outputSuffix;
         (state.activeTasks[stitchTaskId] as any).vodAvgSegmentDuration = avgVodSegDur;
         state.activeTasks[stitchTaskId].chatFilePath = state.activeDownloadSessions[channelLogin]?.chatFilePath;
+        state.activeTasks[stitchTaskId].captureMode = sessionCaptureMode;
       }
 
       stitchVideoChunks(folderPath, 'vod', stitchTaskId).then(() => {
         updateTask(stitchTaskId, `VOD Backfill Complete (${options?.gameName || 'Backfill'})`, "Saved standalone VOD video.", "success", false, [
-          { label: "Render Chat", value: "render_chat" },
+          ...(sessionCaptureMode !== 'video_only' ? [{ label: "Render Chat", value: "render_chat" }] : []),
           { label: "Open Folder", value: "open_folder" },
           { label: "Close", value: "dismiss" }
         ]);
@@ -2108,19 +2266,27 @@ export async function executeResumeVodBackfill(
     videoError?: string | null,
     generatedChatFiles?: string[]
   ) {
+    const captureMode: CaptureMode = sessionData?.captureMode || state.config.channelCaptureModes?.[cleanChannelName(channelName)] || 'both';
     const isWarning = Boolean(videoError);
     const taskStatus = isWarning ? "warning" : "success";
     const statusMsg = isWarning
       ? `Broadcast processed with video notice: ${videoError}. Chat saved to ${sessionData.folderPath}`
       : `Saved to ${sessionData.folderPath}`;
 
-    updateTask(completeTaskId, `Broadcast Complete (${channelName})`, statusMsg, taskStatus as any, false, [
-      { label: "Render Chat", value: "render_chat" },
-      { label: "Open Folder", value: "open_folder" },
-      { label: "Re-fetch VOD Chat", value: "download_vod_chat" },
-      { label: "Close", value: "dismiss" }
-    ]);
-    if (sessionData.autoRenderChat) {
+    const taskActions = captureMode === 'video_only'
+      ? [
+          { label: "Open Folder", value: "open_folder" },
+          { label: "Close", value: "dismiss" }
+        ]
+      : [
+          { label: "Render Chat", value: "render_chat" },
+          { label: "Open Folder", value: "open_folder" },
+          { label: "Re-fetch VOD Chat", value: "download_vod_chat" },
+          { label: "Close", value: "dismiss" }
+        ];
+
+    updateTask(completeTaskId, `Broadcast Complete (${channelName})`, statusMsg, taskStatus as any, false, taskActions);
+    if (captureMode !== 'video_only' && sessionData.autoRenderChat) {
       addLog(`[Auto-Render] Triggering automatic chat render for ${channelName}...`);
       setTimeout(async () => {
         let jsonFiles: string[] = [];
@@ -2141,9 +2307,10 @@ export async function executeResumeVodBackfill(
           return;
         }
 
-        const fallbackW = (state.config.chatRender && state.config.chatRender.width) || 350;
-        const fallbackH = (state.config.chatRender && state.config.chatRender.height) || 800;
-        const segments = jsonFiles.map((f: string) => ({ filename: f, width: fallbackW, height: fallbackH }));
+        const segments = jsonFiles.map((f: string) => {
+          const resDim = getChatRenderDimensionsForChatFile(path.join(sessionData.folderPath, f), sessionData.currentGame);
+          return { filename: f, width: resDim.width, height: resDim.height };
+        });
         
         startChatRenderMultiple(channelName, sessionData.folderPath, segments).catch((err: any) => {
           addLog(`[Auto-Render] Error: ${err.message}`);
@@ -2154,7 +2321,8 @@ export async function executeResumeVodBackfill(
 
   export function triggerFinalizeFlow(sessionData: any, channelLogin: string, taskIdSuffix?: string) {
     const completeTaskId = `complete_${channelLogin}_${taskIdSuffix || Date.now()}`;
-    updateTask(completeTaskId, `Broadcast Complete (${channelLogin})`, `Stitching in progress...`, "running", false, undefined);
+    const finalizeSubtext = sessionData?.captureMode === 'chat_only' ? 'Slicing chat segments...' : 'Stitching in progress...';
+    updateTask(completeTaskId, `Broadcast Complete (${channelLogin})`, finalizeSubtext, "running", false, undefined);
     if (state.activeTasks[completeTaskId]) {
       state.activeTasks[completeTaskId].folderPath = sessionData.folderPath;
       state.activeTasks[completeTaskId].channelLogin = channelLogin;
@@ -2165,6 +2333,7 @@ export async function executeResumeVodBackfill(
       state.activeTasks[completeTaskId].firstSeqNum = sessionData.firstSeqNum;
       state.activeTasks[completeTaskId].streamCreatedAtMs = sessionData.streamCreatedAtMs;
       state.activeTasks[completeTaskId].gapAdjustments = sessionData.gapAdjustments;
+      state.activeTasks[completeTaskId].captureMode = sessionData.captureMode || 'both';
     }
     finalizeLiveDownload(sessionData, completeTaskId, channelLogin);
   }

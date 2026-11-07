@@ -2,8 +2,8 @@ import fs from "fs";
 import path from "path";
 import { spawn, ChildProcess } from "child_process";
 import { Parser } from "m3u8-parser";
-import { state, addLog, updateTask, removeTask, resolveTdPath } from "./state";
-import { startChatRenderMultiple, safeParseChatData, repairChatJsonFile, sliceAndCarryOverBroadcastEvents, getEventsSidecarPath } from "./chat";
+import { state, addLog, updateTask, removeTask, resolveTdPath, getChatRenderDimensionsForGame, cleanChannelName } from "./state";
+import { startChatRenderMultiple, safeParseChatData, repairChatJsonFile, sliceAndCarryOverBroadcastEvents, getEventsSidecarPath, flushPendingChatWrites } from "./chat";
 import { ensureFfmpeg, getVideoDurationSeconds } from "./ffmpeg";
 import { twitchAxios, getSourceMediaPlaylistUrl, fetchRecentVods, fetchInitSegmentFromTwitch, inspectMp4InitBuffer } from "./twitch";
 
@@ -346,8 +346,10 @@ export function stitchVideoChunks(folderPath: string, type: 'all' | 'live' | 'vo
 
     if (isStitchRunning) {
       const queuePos = stitchQueue.length;
-      addLog(`[Video Queue] Stitch job queued for ${path.basename(folderPath)} (Position #${queuePos} in queue).`);
-      updateTask(taskId, "Stitching Video", `Queued (Position #${queuePos} in line)...`, "running", false);
+      const queuedTask = state.activeTasks[taskId];
+      const isChatOnlyJob = queuedTask?.captureMode === 'chat_only';
+      addLog(`[${isChatOnlyJob ? 'Chat-Only' : 'Video Queue'}] ${isChatOnlyJob ? 'Chat slice' : 'Stitch'} job queued for ${path.basename(folderPath)} (Position #${queuePos} in queue).`);
+      updateTask(taskId, queuedTask?.name || (isChatOnlyJob ? "Slicing Chat Segments" : "Stitching Video"), `Queued (Position #${queuePos} in line)...`, "running", false);
     } else {
       processNextStitchJob();
     }
@@ -378,7 +380,8 @@ async function processNextStitchJob() {
     stitchQueue.forEach((qJob, idx) => {
       const qTask = state.activeTasks[qJob.taskId];
       if (qTask && qTask.status === 'running') {
-        updateTask(qJob.taskId, qTask.name || "Stitching Video", `Queued (Position #${idx + 1} in line)...`, "running", false);
+        const isChatOnlyQueued = qTask.captureMode === 'chat_only';
+        updateTask(qJob.taskId, qTask.name || (isChatOnlyQueued ? "Slicing Chat Segments" : "Stitching Video"), `Queued (Position #${idx + 1} in line)...`, "running", false);
       }
     });
     processNextStitchJob();
@@ -386,11 +389,26 @@ async function processNextStitchJob() {
 }
 
 async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live' | 'vod' = 'all', taskId: string, existingTaskId?: string): Promise<string[]> {
-  updateTask(taskId, "Stitching Video", "Scanning sequence files...");
-  
-  addLog(`[Video] Starting video stitching in ${folderPath} (Type: ${type})...`);
   const generatedChatFiles: string[] = [];
   try {
+    // Retrieve session from task if available or assume games array passed
+    const taskObj = state.activeTasks[taskId];
+    const sessionMatching = Object.values(state.activeDownloadSessions).find(s => s.folderPath === folderPath);
+    const games = (taskObj?.games && taskObj.games.length > 0) ? taskObj.games : (sessionMatching?.games || []);
+    const chatFilePath = taskObj?.chatFilePath || sessionMatching?.chatFilePath;
+    const channelLogin = taskObj?.channelLogin || sessionMatching?.channel || "";
+    const session = channelLogin ? state.activeDownloadSessions[channelLogin] : sessionMatching;
+    const captureMode = taskObj?.captureMode || session?.captureMode || (channelLogin ? state.config.channelCaptureModes?.[cleanChannelName(channelLogin)] : undefined) || 'both';
+    const isMidStreamExport = taskId.includes('_game_') || taskId.includes('_clip_') || taskId.includes('_extension_');
+
+    if (captureMode === 'chat_only' && type !== 'vod') {
+      updateTask(taskId, taskObj?.name || "Slicing Chat Segments", "Slicing chat JSON...");
+      addLog(`[Chat-Only] Finalizing chat segments in ${folderPath}...`);
+    } else {
+      updateTask(taskId, taskObj?.name || "Stitching Video", "Scanning sequence files...");
+      addLog(`[Video] Starting video stitching in ${folderPath} (Type: ${type})...`);
+    }
+
     // Asynchronous non-blocking directory reading
     const dirEntries = await fs.promises.readdir(folderPath, { withFileTypes: true });
     const files = dirEntries.filter(entry => entry.isFile()).map(entry => entry.name);
@@ -410,15 +428,6 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
 
     const dateMatch = folderPath.match(/_(\d{4}-\d{2}-\d{2})_/);
     const dateStr = dateMatch ? dateMatch[1] : new Date().toISOString().split('T')[0];
-
-    // Retrieve session from task if available or assume games array passed
-    const taskObj = state.activeTasks[taskId];
-    const sessionMatching = Object.values(state.activeDownloadSessions).find(s => s.folderPath === folderPath);
-    const games = (taskObj?.games && taskObj.games.length > 0) ? taskObj.games : (sessionMatching?.games || []);
-    const chatFilePath = taskObj?.chatFilePath || sessionMatching?.chatFilePath;
-    const channelLogin = taskObj?.channelLogin || sessionMatching?.channel || "";
-    const session = channelLogin ? state.activeDownloadSessions[channelLogin] : sessionMatching;
-    const isMidStreamExport = taskId.includes('_game_') || taskId.includes('_clip_') || taskId.includes('_extension_');
 
     // Track successfully verified output files so we only clean up chunks if stitching succeeded
     const successfullyStitchedMp4s: string[] = [];
@@ -716,7 +725,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
         addLog(`[Video Warning] Standalone VOD video stitching failed: ${err.message}. Proceeding with paired chat creation...`);
       }
 
-      // Generate paired chat JSON file for standalone VOD backfill if chat exists
+      // Generate paired chat JSON file for standalone VOD backfill if chat exists (skip in video_only mode)
       const vodChatFilePath = taskObj?.chatFilePath || session?.chatFilePath;
       const vodJsonOutputName = cleanName 
         ? `${cleanName}_vod_backfill_${outputSuffix ? `${outputSuffix}_` : ''}${dateStr}.json`
@@ -724,7 +733,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
       const vodOutChatPath = path.join(folderPath, vodJsonOutputName);
 
       // Await any in-flight chat backfill promise so that the chat file is fully populated before slicing
-      if (session?.activeChatBackfillPromise) {
+      if (captureMode !== 'video_only' && session?.activeChatBackfillPromise) {
         addLog(`[VOD Chat] Waiting for chat backfill pagination to finish before slicing ${vodJsonOutputName}...`);
         try {
           await session.activeChatBackfillPromise;
@@ -737,7 +746,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
       let pairedChatReady = false;
 
       // 1. Check if the standalone backfill chat JSON was already generated directly upon download completion
-      if (fs.existsSync(vodOutChatPath)) {
+      if (captureMode !== 'video_only' && fs.existsSync(vodOutChatPath)) {
         try {
           const existingData = safeParseChatData(await fs.promises.readFile(vodOutChatPath, 'utf8'));
           if (existingData && Array.isArray(existingData.comments) && existingData.comments.length > 0) {
@@ -754,7 +763,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
       }
 
       // 2. If not already written, slice from the master chat file as fallback
-      if (!pairedChatReady && vodChatFilePath && fs.existsSync(vodChatFilePath)) {
+      if (captureMode !== 'video_only' && !pairedChatReady && vodChatFilePath && fs.existsSync(vodChatFilePath)) {
         try {
           // Ensure any unclosed or malformed comments in the master chat file are sealed and clean
           await repairChatJsonFile(vodChatFilePath);
@@ -823,16 +832,15 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
       }
 
       // Check if auto-render is enabled for this channel or globally
-      if (pairedChatReady && fs.existsSync(vodOutChatPath)) {
+      if (captureMode !== 'video_only' && pairedChatReady && fs.existsSync(vodOutChatPath)) {
         const autoRender = channelLogin 
           ? (state.config.channelAutoRender?.[channelLogin] ?? state.config.autoRenderChat ?? false)
           : (state.config.autoRenderChat ?? false);
 
         if (autoRender && channelLogin) {
-          addLog(`[VOD Chat] Triggering chat render for standalone VOD backfill: ${vodJsonOutputName}`);
-          const renderWidth = state.config.chatRender?.width || 400;
-          const renderHeight = state.config.chatRender?.height || 1080;
-          startChatRenderMultiple(channelLogin, folderPath, [{ filename: vodJsonOutputName, width: renderWidth, height: renderHeight }]);
+          const resDim = getChatRenderDimensionsForGame(vodGameName, vodJsonOutputName);
+          addLog(`[VOD Chat] Triggering chat render for standalone VOD backfill: ${vodJsonOutputName} (${resDim.width}x${resDim.height}${resDim.isCustomProfile ? ` via profile "${resDim.matchedProfile}"` : ''})`);
+          startChatRenderMultiple(channelLogin, folderPath, [{ filename: vodJsonOutputName, width: resDim.width, height: resDim.height }]);
         }
       }
 
@@ -854,7 +862,245 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
       return [];
     }
 
+    const bufferMins = state.config.gameSwitchBufferMins ?? 5;
+    const CHAT_BUFFER_SEC = bufferMins * 60;
+    const CHUNK_BUFFER = Math.floor(CHAT_BUFFER_SEC / 2);
+
     if (liveChunkFiles.length === 0) {
+      // In Chat-Only capture mode, there are no live .ts video chunks—slice the chat file directly across game/custom boundaries!
+      if (captureMode === 'chat_only' && chatFilePath && fs.existsSync(chatFilePath)) {
+        if (session) {
+          flushPendingChatWrites(session);
+        }
+        addLog(`[Chat-Only] Slicing chat in ${folderPath} without video chunks (mode: chat_only)...`);
+
+        // 1. Custom Export in Chat-Only Mode (Append Extension / Extract Clip)
+        if (taskObj?.customExportMode && taskObj.customChunkRange) {
+          const { startIdx, endIdx } = taskObj.customChunkRange;
+          const chatOutputName = taskObj.customChatOutputName || (taskObj.customOutputName || `custom_${Date.now()}.ts`).replace(/\.ts$/, '.json');
+          try {
+            const chatDataRaw = await fs.promises.readFile(chatFilePath, 'utf8');
+            const chatData = safeParseChatData(chatDataRaw, chatFilePath);
+            if (chatData && Array.isArray(chatData.comments)) {
+              const avgChunkDur = 2.0;
+              const baseOffsetSec = session?.initialJoinOffsetSec ?? taskObj?.initialJoinOffsetSec ?? 0;
+              const baseSeq = session?.firstSeqNum ?? taskObj?.firstSeqNum ?? 0;
+              const broadcastStartMs = session?.streamCreatedAtMs || session?.videoStartTimeMs || taskObj?.streamCreatedAtMs;
+              const targetGameIdx = taskObj?.targetGameIndex;
+              const targetGame = (targetGameIdx !== undefined && games[targetGameIdx])
+                ? games[targetGameIdx]
+                : games.find(g => g.gameName === taskObj?.gameName);
+
+              let videoStartOffset = Math.max(0, baseOffsetSec + Math.max(0, startIdx - baseSeq) * avgChunkDur);
+              if (targetGame && targetGameIdx !== undefined && targetGameIdx > 0 && broadcastStartMs && targetGame.startTimeMs && targetGame.startTimeMs >= broadcastStartMs) {
+                const gameSwitchOffsetSec = (targetGame.startTimeMs - broadcastStartMs) / 1000;
+                const chunkDelta = startIdx - targetGame.startChunk;
+                videoStartOffset = Math.max(0, gameSwitchOffsetSec + (chunkDelta * avgChunkDur));
+              } else if (targetGame && targetGame.startTimeOffset !== undefined && targetGame.startTimeOffset > 0 && targetGame.startChunk > 0) {
+                const chunkDelta = startIdx - targetGame.startChunk;
+                videoStartOffset = Math.max(0, targetGame.startTimeOffset + (chunkDelta * avgChunkDur));
+              }
+
+              const actualVideoDurationSec = Math.max(1, Math.round(Math.max(1, endIdx - startIdx + 1) * avgChunkDur));
+              const videoEndOffset = videoStartOffset + actualVideoDurationSec;
+              const gapAdjustments = session?.gapAdjustments || taskObj?.gapAdjustments || [];
+
+              const filteredComments = [];
+              for (const c of chatData.comments || []) {
+                let streamTime = c.content_offset_seconds;
+                if (streamTime >= videoStartOffset && streamTime <= videoEndOffset) {
+                  const newC = JSON.parse(JSON.stringify(c));
+                  newC.content_offset_seconds = Math.max(0, streamTime - videoStartOffset);
+                  filteredComments.push(newC);
+                }
+              }
+
+              const filteredEvents = sliceAndCarryOverBroadcastEvents(
+                Array.isArray(chatData.events) ? chatData.events : [],
+                videoStartOffset,
+                videoEndOffset,
+                gapAdjustments,
+                baseOffsetSec,
+                baseSeq,
+                avgChunkDur
+              );
+
+              const newChatData = { ...chatData, comments: filteredComments, events: filteredEvents };
+              if (newChatData.video) {
+                newChatData.video.start = 0;
+                newChatData.video.end = actualVideoDurationSec;
+                newChatData.video.length = actualVideoDurationSec;
+                if (taskObj.gameName) newChatData.video.game = taskObj.gameName;
+              }
+              if (!newChatData.FileInfo) {
+                newChatData.FileInfo = {
+                  Version: { Major: 1, Minor: 5, Patch: 3 },
+                  CreatedAt: new Date().toISOString(),
+                  UpdatedAt: new Date().toISOString()
+                };
+              }
+              if (!newChatData.streamer) {
+                newChatData.streamer = { name: channelLogin, id: 0 };
+              } else {
+                newChatData.streamer.id = parseInt(String(newChatData.streamer.id || 0), 10) || 0;
+              }
+              if (!newChatData.embeddedData) {
+                newChatData.embeddedData = {
+                  thirdParty: newChatData.emotes || [],
+                  firstParty: [],
+                  twitchBadges: []
+                };
+              }
+
+              const outChatPath = path.join(folderPath, chatOutputName);
+              await fs.promises.writeFile(outChatPath, JSON.stringify(newChatData, null, 2));
+              generatedChatFiles.push(path.basename(outChatPath));
+              addLog(`[Chat-Only Split] Sliced custom chat (${taskObj.customExportMode}) -> ${outChatPath} (${filteredComments.length} messages, ${actualVideoDurationSec}s)`);
+            }
+          } catch (err: any) {
+            addLog(`[Chat-Only Split] Error slicing custom chat: ${err.message}`);
+          }
+          if (!existingTaskId) removeTask(taskId);
+          return generatedChatFiles;
+        }
+
+        // 2. Multi-Game or Buffered Game Slicing in Chat-Only Mode
+        if (games.length > 0) {
+          for (let i = 0; i < games.length; i++) {
+            if (taskObj?.targetGameIndex !== undefined && taskObj.targetGameIndex !== i) continue;
+            if (!isMidStreamExport && games[i].isExported) continue;
+
+            const game = games[i];
+            const nextGame = games[i + 1];
+            const cleanName = game.gameName.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+
+            try {
+              const chatDataRaw = await fs.promises.readFile(chatFilePath, 'utf8');
+              const chatData = safeParseChatData(chatDataRaw, chatFilePath);
+              if (!chatData || !Array.isArray(chatData.comments)) {
+                throw new Error("Unable to parse valid comments from chat file");
+              }
+
+              const baseOffsetSec = session?.initialJoinOffsetSec ?? taskObj?.initialJoinOffsetSec ?? 0;
+              const baseSeq = session?.firstSeqNum ?? taskObj?.firstSeqNum ?? 0;
+              const broadcastStartMs = session?.streamCreatedAtMs || session?.videoStartTimeMs || taskObj?.streamCreatedAtMs;
+              const leadBufSec = ((game.customLeadingBufferMins !== undefined && Number.isFinite(game.customLeadingBufferMins) && game.customLeadingBufferMins >= 0)
+                ? game.customLeadingBufferMins
+                : bufferMins) * 60;
+              const trailBufSec = game.overrideBuffer ? 0 : (bufferMins * 60);
+
+              let videoStartOffset = baseOffsetSec;
+              if (i > 0) {
+                if (broadcastStartMs && game.startTimeMs && game.startTimeMs >= broadcastStartMs) {
+                  videoStartOffset = Math.max(0, ((game.startTimeMs - broadcastStartMs) / 1000) - leadBufSec);
+                } else {
+                  videoStartOffset = Math.max(0, (game.startTimeOffset || (game.startChunk * 2)) - leadBufSec);
+                }
+              }
+
+              let videoEndOffset = videoStartOffset + 60;
+              if (nextGame) {
+                if (broadcastStartMs && nextGame.startTimeMs && nextGame.startTimeMs >= broadcastStartMs) {
+                  videoEndOffset = Math.max(videoStartOffset + 1, ((nextGame.startTimeMs - broadcastStartMs) / 1000) + trailBufSec);
+                } else {
+                  videoEndOffset = Math.max(videoStartOffset + 1, (nextGame.startTimeOffset || (nextGame.startChunk * 2)) + trailBufSec);
+                }
+              } else {
+                const liveElapsed = broadcastStartMs ? Math.max(0, (Date.now() - broadcastStartMs) / 1000) : 0;
+                const maxCommentSec = chatData.comments.length > 0
+                  ? Math.max(...chatData.comments.map((c: any) => c.content_offset_seconds || 0))
+                  : 0;
+                videoEndOffset = Math.max(
+                  videoStartOffset + 1,
+                  session?.videoDurationSeconds || 0,
+                  taskObj?.videoDurationSeconds || 0,
+                  liveElapsed,
+                  maxCommentSec
+                );
+              }
+
+              const actualDurationSec = Math.max(1, Math.round(videoEndOffset - videoStartOffset));
+              game.endChunk = Math.floor(videoEndOffset / 2);
+
+              const gapAdjustments = session?.gapAdjustments || taskObj?.gapAdjustments || [];
+              const filteredComments = [];
+              for (const c of chatData.comments || []) {
+                const streamTime = c.content_offset_seconds;
+                if (streamTime >= videoStartOffset && streamTime <= videoEndOffset) {
+                  const newC = JSON.parse(JSON.stringify(c));
+                  newC.content_offset_seconds = Math.max(0, streamTime - videoStartOffset);
+                  filteredComments.push(newC);
+                }
+              }
+
+              const filteredEvents = sliceAndCarryOverBroadcastEvents(
+                Array.isArray(chatData.events) ? chatData.events : [],
+                videoStartOffset,
+                videoEndOffset,
+                gapAdjustments,
+                baseOffsetSec,
+                baseSeq,
+                2.0
+              );
+
+              const newChatData = { ...chatData, comments: filteredComments, events: filteredEvents };
+              if (newChatData.video) {
+                newChatData.video.start = 0;
+                newChatData.video.end = actualDurationSec;
+                newChatData.video.length = actualDurationSec;
+                newChatData.video.game = game.gameName;
+              }
+              if (!newChatData.FileInfo) {
+                newChatData.FileInfo = {
+                  Version: { Major: 1, Minor: 5, Patch: 3 },
+                  CreatedAt: new Date().toISOString(),
+                  UpdatedAt: new Date().toISOString()
+                };
+              }
+              if (!newChatData.streamer) {
+                newChatData.streamer = { name: channelLogin, id: 0 };
+              } else {
+                newChatData.streamer.id = parseInt(String(newChatData.streamer.id || 0), 10) || 0;
+              }
+              if (!newChatData.embeddedData) {
+                newChatData.embeddedData = {
+                  thirdParty: newChatData.emotes || [],
+                  firstParty: [],
+                  twitchBadges: []
+                };
+              }
+
+              const outChatPath = path.join(folderPath, `${i + 1}_${cleanName}_${dateStr}.json`);
+              await fs.promises.writeFile(outChatPath, JSON.stringify(newChatData, null, 2));
+              generatedChatFiles.push(path.basename(outChatPath));
+              addLog(`[Chat-Only Split] Sliced chat for ${game.gameName} -> ${outChatPath} (${filteredComments.length} messages, ${actualDurationSec}s, range ${videoStartOffset.toFixed(1)}s - ${videoEndOffset.toFixed(1)}s)`);
+            } catch (err: any) {
+              addLog(`[Chat-Only Split] Error processing game chat ${cleanName}: ${err.message}`);
+            }
+          }
+
+          if (!isMidStreamExport && generatedChatFiles.length > 0 && fs.existsSync(chatFilePath)) {
+            try {
+              const testData = await fs.promises.readFile(chatFilePath, 'utf8');
+              JSON.parse(testData);
+              addLog(`[Chat-Only] Cleaning up original full broadcast chat file...`);
+              await fs.promises.unlink(chatFilePath).catch(() => {});
+              const sidecarPath = getEventsSidecarPath(chatFilePath);
+              if (sidecarPath && fs.existsSync(sidecarPath)) {
+                await fs.promises.unlink(sidecarPath).catch(() => {});
+              }
+            } catch (_) {}
+          }
+        } else if (!isMidStreamExport) {
+          // Single-game broadcast conclusion without game array
+          await repairChatJsonFile(chatFilePath);
+          generatedChatFiles.push(path.basename(chatFilePath));
+        }
+
+        if (!existingTaskId) removeTask(taskId);
+        return generatedChatFiles;
+      }
+
       addLog(`[Video] No live sequence files found to stitch.`);
       if (!existingTaskId) removeTask(taskId);
       return [];
@@ -873,10 +1119,6 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
 
     // Slice by Games
     const activeChunkList = liveChunkFiles;
-    
-    const bufferMins = state.config.gameSwitchBufferMins ?? 5;
-    const CHAT_BUFFER_SEC = bufferMins * 60;
-    const CHUNK_BUFFER = Math.floor(CHAT_BUFFER_SEC / 2);
 
     // Custom Export Handling (Option 1 Append Extension, Option 2 Extract Standalone Clip)
     if (taskObj?.customExportMode && taskObj.customChunkRange) {
@@ -904,8 +1146,8 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
         addLog(`[Video Warning] Custom slice video stitching failed: ${err.message}. Proceeding with chat slice...`);
       }
 
-      // Split Chat File for Custom Slice
-      if (chatFilePath && fs.existsSync(chatFilePath)) {
+      // Split Chat File for Custom Slice (skip in video_only mode)
+      if (captureMode !== 'video_only' && chatFilePath && fs.existsSync(chatFilePath)) {
         try {
           const chatDataRaw = await fs.promises.readFile(chatFilePath, 'utf8');
           const chatData = safeParseChatData(chatDataRaw, chatFilePath);
@@ -1135,8 +1377,8 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
           addLog(`[Video] Preserving sequence files for Game ${i + 1} (${game.gameName}) for recovery.`);
         }
 
-        // Split Chat File
-        if (chatFilePath && fs.existsSync(chatFilePath)) {
+        // Split Chat File (skip in video_only mode)
+        if (captureMode !== 'video_only' && chatFilePath && fs.existsSync(chatFilePath)) {
           try {
             const chatDataRaw = await fs.promises.readFile(chatFilePath, 'utf8');
             const chatData = safeParseChatData(chatDataRaw, chatFilePath);

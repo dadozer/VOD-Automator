@@ -1,3 +1,11 @@
+export type CaptureMode = 'both' | 'video_only' | 'chat_only';
+
+export interface GameResolutionProfile {
+  gameName: string;
+  width: number;
+  height: number;
+}
+
 export interface Config {
   browserClientId: string;
   browserOAuthToken: string;
@@ -9,6 +17,7 @@ export interface Config {
   autoStartMonitoring: boolean;
   autoRenderChat?: boolean;
   channelAutoRender?: Record<string, boolean>;
+  channelCaptureModes?: Record<string, CaptureMode>;
   gameSwitchBufferMins?: number;
   offlineGracePeriodMins?: number;
   longGameAutospliceEnabled?: boolean;
@@ -20,6 +29,7 @@ export interface Config {
     syncOffsetHevc?: number;
     width: number;
     height: number;
+    gameProfiles?: GameResolutionProfile[];
     backgroundColor: string;
     altBackgroundColor: string;
     alternateBackgrounds: boolean;
@@ -145,6 +155,7 @@ export interface ActiveTask {
   preGapHighestSeq?: number;
   resumptionSeq?: number;
   missingChunkCount?: number;
+  captureMode?: CaptureMode;
 }
 
 export interface ActiveDownloadSession {
@@ -188,6 +199,7 @@ export interface ActiveDownloadSession {
   playlistConsecutiveErrors?: number;
   downloadedSegments: Set<string | number>;
   autoRenderChat?: boolean;
+  captureMode?: CaptureMode;
   isFmp4?: boolean;
   initSegmentDownloaded?: boolean;
   folderVerified?: boolean;
@@ -268,6 +280,7 @@ export interface Status {
     viewersCount?: number;
     previewImageUrl?: string;
     autoRenderChat?: boolean;
+    captureMode?: CaptureMode;
     highestSeq?: number;
     commentsWritten?: number;
     eventsWritten?: number;

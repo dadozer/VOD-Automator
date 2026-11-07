@@ -58,7 +58,7 @@ export default function App() {
   const [pendingTabSwitch, setPendingTabSwitch] = useState<"dashboard" | "settings" | "logs" | null>(null);
   const [showOAuthToken, setShowOAuthToken] = useState<boolean>(false);
   const [timeSinceCheck, setTimeSinceCheck] = useState<number>(0);
-  const [renderDialog, setRenderDialog] = useState<{ taskId: string, channelLogin: string, folderPath: string, width: number, height: number, files?: {filename: string, width: number, height: number, enabled?: boolean}[] } | null>(null);
+  const [renderDialog, setRenderDialog] = useState<{ taskId: string, channelLogin: string, folderPath: string, width: number, height: number, files?: {filename: string, width: number, height: number, enabled?: boolean, gameName?: string, matchedProfile?: string, isCustomProfile?: boolean}[] } | null>(null);
   const [pendingTaskActions, setPendingTaskActions] = useState<Record<string, string>>({});
   const [forceStitchingChannels, setForceStitchingChannels] = useState<Record<string, boolean>>({});
   const [isSavingConfig, setIsSavingConfig] = useState(false);
@@ -69,8 +69,14 @@ export default function App() {
   const [manualRenderPath, setManualRenderPath] = useState<string>("");
   const [manualRenderWidth, setManualRenderWidth] = useState<number>(350);
   const [manualRenderHeight, setManualRenderHeight] = useState<number>(800);
+  const [manualRenderMatchedProfile, setManualRenderMatchedProfile] = useState<string | null>(null);
   const [isStartingManualRender, setIsStartingManualRender] = useState<boolean>(false);
   const [manualRenderMsg, setManualRenderMsg] = useState<{ type: 'success' | 'error', text: string } | null>(null);
+  const [quickGameProfileModal, setQuickGameProfileModal] = useState<{ gameName: string; width: number | string; height: number | string; hasExistingProfile: boolean } | null>(null);
+  const [isSavingQuickGameProfile, setIsSavingQuickGameProfile] = useState<boolean>(false);
+  const [newProfileGameName, setNewProfileGameName] = useState<string>("");
+  const [newProfileWidth, setNewProfileWidth] = useState<string>("640");
+  const [newProfileHeight, setNewProfileHeight] = useState<string>("936");
   const [recentFolders, setRecentFolders] = useState<RecentFolderItem[]>([]);
   const [isLoadingRecentFolders, setIsLoadingRecentFolders] = useState<boolean>(false);
   const [recoverFolderDialog, setRecoverFolderDialog] = useState<boolean>(false);
@@ -533,18 +539,32 @@ export default function App() {
         const channelLogin = (task as any).channelLogin || "stream";
         axios.get(`/api/tasks/${taskId}/chat-files`).then(res => {
           const fetchedFiles = res.data.files || [];
+          const fileDetails = res.data.fileDetails || [];
+          const defaultW = (config as any)?.chatRender?.width || 350;
+          const defaultH = (config as any)?.chatRender?.height || 800;
+          const mappedFiles = fileDetails.length > 0
+            ? fileDetails.map((d: any) => ({
+                filename: d.filename,
+                width: d.width || defaultW,
+                height: d.height || defaultH,
+                enabled: true,
+                gameName: d.gameName,
+                matchedProfile: d.matchedProfile,
+                isCustomProfile: Boolean(d.isCustomProfile),
+              }))
+            : fetchedFiles.map((f: string) => ({
+                filename: f,
+                width: defaultW,
+                height: defaultH,
+                enabled: true,
+              }));
           setRenderDialog({
             taskId,
             channelLogin,
             folderPath: (task as any).folderPath,
-            width: (config as any)?.chatRender?.width || 350,
-            height: (config as any)?.chatRender?.height || 800,
-            files: fetchedFiles.map((f: string) => ({
-              filename: f,
-              width: (config as any)?.chatRender?.width || 350,
-              height: (config as any)?.chatRender?.height || 800,
-              enabled: true
-            }))
+            width: mappedFiles[0]?.width || defaultW,
+            height: mappedFiles[0]?.height || defaultH,
+            files: mappedFiles
           });
         }).catch(err => {
           console.error("Failed to fetch chat files", err);
@@ -712,10 +732,128 @@ export default function App() {
     }
   };
 
+  const setChannelCaptureMode = async (channel: string, captureMode: 'both' | 'video_only' | 'chat_only') => {
+    const cleaned = cleanChannel(channel);
+    if (!cleaned) return;
+
+    setConfig(prev => prev ? {
+      ...prev,
+      channelCaptureModes: {
+        ...(prev.channelCaptureModes || {}),
+        [cleaned]: captureMode
+      }
+    } : null);
+
+    try {
+      const res = await axios.post(`/api/sessions/${cleaned}/capture-mode`, { mode: captureMode, captureMode });
+      if (res.data && res.data.config && !isConfigDirty) {
+        setConfig(res.data.config);
+      }
+      const modeLabel = captureMode === 'video_only' ? 'Video Only' : captureMode === 'chat_only' ? 'Chat Only' : 'Video + Chat';
+      showToast(`Capture mode for @${cleaned} set to ${modeLabel}.`, "info", "Capture Mode");
+      await fetchStatus();
+    } catch (err: any) {
+      showToast(err.response?.data?.error || err.message || "Failed to update capture mode", "error", "Capture Mode");
+      await fetchConfig();
+      await fetchStatus();
+    }
+  };
+
+  const resolveClientGameProfile = (gameName?: string | null) => {
+    const defaultW = (config as any)?.chatRender?.width || 350;
+    const defaultH = (config as any)?.chatRender?.height || 800;
+    const profiles: { gameName: string; width: number; height: number }[] = Array.isArray((config as any)?.chatRender?.gameProfiles)
+      ? (config as any).chatRender.gameProfiles
+      : [];
+    if (!gameName || profiles.length === 0) {
+      return { width: defaultW, height: defaultH, matchedProfile: undefined as string | undefined, isCustomProfile: false };
+    }
+    const cleanTarget = gameName.trim().toLowerCase();
+    const baseTarget = cleanTarget.replace(/\s+part\s+\d+$/i, '').trim();
+    const match = profiles.find(p => {
+      const pName = (p.gameName || '').trim().toLowerCase();
+      return pName === cleanTarget || pName === baseTarget;
+    });
+    if (match) {
+      return { width: match.width, height: match.height, matchedProfile: match.gameName, isCustomProfile: true };
+    }
+    return { width: defaultW, height: defaultH, matchedProfile: undefined as string | undefined, isCustomProfile: false };
+  };
+
+  const openQuickGameProfile = (gameName: string) => {
+    const baseGameName = gameName.replace(/\s+Part\s+\d+$/i, '').trim() || gameName.trim();
+    const resolved = resolveClientGameProfile(baseGameName);
+    setQuickGameProfileModal({
+      gameName: baseGameName,
+      width: resolved.width,
+      height: resolved.height,
+      hasExistingProfile: resolved.isCustomProfile,
+    });
+  };
+
+  const saveQuickGameProfile = async (remove = false) => {
+    if (!quickGameProfileModal || isSavingQuickGameProfile) return;
+    setIsSavingQuickGameProfile(true);
+    try {
+      const rawW = parseInt(String(quickGameProfileModal.width), 10) || ((config as any)?.chatRender?.width || 350);
+      const rawH = parseInt(String(quickGameProfileModal.height), 10) || ((config as any)?.chatRender?.height || 800);
+      const clampedW = Math.max(100, Math.min(7680, rawW));
+      const clampedH = Math.max(100, Math.min(7680, rawH));
+      const evenW = clampedW % 2 !== 0 ? clampedW + 1 : clampedW;
+      const evenH = clampedH % 2 !== 0 ? clampedH + 1 : clampedH;
+
+      const res = await axios.post('/api/game-profiles', {
+        gameName: quickGameProfileModal.gameName,
+        width: evenW,
+        height: evenH,
+        remove,
+      });
+
+      if (res.data && Array.isArray(res.data.gameProfiles)) {
+        setConfig(prev => prev ? {
+          ...prev,
+          chatRender: {
+            ...prev.chatRender,
+            gameProfiles: res.data.gameProfiles,
+          }
+        } : null);
+      }
+
+      if (remove) {
+        showToast(`Reset "${quickGameProfileModal.gameName}" to default chat render dimensions.`, "info", "Game Profile");
+      } else {
+        showToast(`Saved ${evenW}×${evenH} render profile for "${quickGameProfileModal.gameName}".`, "success", "Game Profile");
+      }
+      setQuickGameProfileModal(null);
+    } catch (err: any) {
+      showToast(err.response?.data?.error || err.message || "Failed to save game profile", "error", "Game Profile");
+    } finally {
+      setIsSavingQuickGameProfile(false);
+    }
+  };
+
+  const applyManualRenderProfileForPath = async (filePath: string) => {
+    if (!filePath.trim()) {
+      setManualRenderMatchedProfile(null);
+      return;
+    }
+    try {
+      const res = await axios.post('/api/chat-file-profile', { filePath: filePath.trim() });
+      if (res.data && res.data.width && res.data.height) {
+        setManualRenderWidth(res.data.width);
+        setManualRenderHeight(res.data.height);
+        setManualRenderMatchedProfile(res.data.isCustomProfile ? (res.data.matchedProfile || res.data.gameName || 'Custom Profile') : null);
+      }
+    } catch {
+      setManualRenderMatchedProfile(null);
+    }
+  };
+
   const openManualRenderModal = () => {
     setManualRenderPath("");
     setManualRenderWidth((config as any)?.chatRender?.width || 350);
     setManualRenderHeight((config as any)?.chatRender?.height || 800);
+    setManualRenderMatchedProfile(null);
     setManualRenderMsg(null);
     setManualRenderDialog(true);
     fetchRecentFolders();
@@ -824,7 +962,7 @@ export default function App() {
             </div>
             <div>
               <h1 className="font-bold text-base tracking-tight text-white leading-tight">VOD Automator</h1>
-              <p className="text-xs text-purple-400 font-mono font-medium">v5.1.0</p>
+              <p className="text-xs text-purple-400 font-mono font-medium">v5.2.3</p>
             </div>
           </div>
         </div>
@@ -926,7 +1064,7 @@ export default function App() {
                     type="button"
                     onClick={openManualRenderModal}
                     className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-200 border border-white/10 hover:border-purple-500/30 transition-all cursor-pointer"
-                    title="Render any downloaded chat JSON file with TwitchDownloaderCLI"
+                    title="Render any downloaded chat JSON file with ChatRenderCLI / TwitchDownloaderCLI"
                   >
                     <Film className="w-3.5 h-3.5 text-purple-400" />
                     <span>Manual Chat Render</span>
@@ -953,7 +1091,7 @@ export default function App() {
                       <Tv className="w-4.5 h-4.5 text-purple-400" />
                       Monitored Streams ({configuredSlotsCount}/2)
                     </h3>
-                    <p className="text-sm text-gray-400 mt-0.5">When monitoring is paused, click channel handle to change or clear monitored stream</p>
+                    <p className="text-sm text-gray-400 mt-0.5">Configure capture mode prior to broadcast, or pause monitoring to rename or clear a channel slot</p>
                   </div>
                 </div>
 
@@ -1154,19 +1292,47 @@ export default function App() {
 
                               {/* If Live: Game & Viewer Count IN LINE */}
                               {isLive && activeSession && (
-                                <div className="flex items-center gap-2 text-sm">
-                                  {activeSession.currentGame && (
-                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-purple-500/10 border border-purple-500/20 text-purple-300 font-medium">
-                                      <Gamepad2 className="w-3.5 h-3.5 text-purple-400" />
-                                      {activeSession.currentGame}
-                                    </span>
-                                  )}
+                                <div className="flex items-center gap-2 text-sm flex-wrap">
+                                  {activeSession.currentGame && (() => {
+                                    const gameProfile = resolveClientGameProfile(activeSession.currentGame);
+                                    return (
+                                      <button
+                                        type="button"
+                                        onClick={() => openQuickGameProfile(activeSession.currentGame!)}
+                                        className="group inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/20 hover:border-purple-500/40 text-purple-300 font-medium transition-all cursor-pointer"
+                                        title={`Click to set or edit chat render resolution profile for "${activeSession.currentGame}" (Currently ${gameProfile.width}×${gameProfile.height}${gameProfile.isCustomProfile ? ' custom profile' : ' default'})`}
+                                      >
+                                        <Gamepad2 className="w-3.5 h-3.5 text-purple-400" />
+                                        <span>{activeSession.currentGame}</span>
+                                        <span className={`text-[11px] font-mono px-1.5 py-0.2 rounded ${
+                                          gameProfile.isCustomProfile
+                                            ? "bg-purple-500/30 text-purple-200 border border-purple-400/40"
+                                            : "bg-black/40 text-gray-400 group-hover:text-gray-200"
+                                        }`}>
+                                          {gameProfile.width}×{gameProfile.height}
+                                        </span>
+                                        <Edit2 className="w-3 h-3 text-purple-400/60 group-hover:text-purple-300 transition-colors" />
+                                      </button>
+                                    );
+                                  })()}
                                   {activeSession.viewersCount !== undefined && activeSession.viewersCount > 0 && (
                                     <span className="inline-flex items-center gap-1.5 text-gray-300 bg-black/40 px-2.5 py-0.5 rounded-md border border-white/5 font-mono">
                                       <Users className="w-3.5 h-3.5 text-red-400" />
                                       {activeSession.viewersCount.toLocaleString()}
                                     </span>
                                   )}
+                                  {(() => {
+                                    const activeMode = activeSession.captureMode || config?.channelCaptureModes?.[cleaned] || 'both';
+                                    const modeLabel = activeMode === 'video_only' ? 'Video Only' : activeMode === 'chat_only' ? 'Chat Only' : 'Video + Chat';
+                                    return (
+                                      <span
+                                        className="inline-flex items-center gap-1 text-[11px] font-mono font-semibold uppercase tracking-wider px-2 py-0.5 rounded-md bg-white/5 text-gray-300 border border-white/10"
+                                        title="Capture mode is locked while a broadcast is actively recording"
+                                      >
+                                        {modeLabel}
+                                      </span>
+                                    );
+                                  })()}
                                 </div>
                               )}
                             </div>
@@ -1174,7 +1340,7 @@ export default function App() {
                             {/* Stream Subtitle */}
                             <p className="text-xs text-gray-500 mt-0.5 font-mono">
                               {isLive 
-                                ? "Source resolution" 
+                                ? (activeSession?.captureMode === 'chat_only' ? "Live IRC + PubSub chat capture • Click game badge to set render resolution" : "Source resolution • Click game badge to set render resolution") 
                                 : isRunning 
                                 ? `Last check: ${timeSinceCheck}s ago` 
                                 : "Monitoring paused • Click handle above to edit"}
@@ -1227,35 +1393,48 @@ export default function App() {
                       {isLive && activeSession ? (
                         <div className="p-4 space-y-3.5">
                           {/* Compact metrics strip */}
-                          <div className="grid grid-cols-3 gap-2.5">
-                            <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between">
-                              <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold">Video Segments</span>
-                              <span className="text-sm sm:text-base font-bold text-white font-mono">{activeSession.chunksDownloaded?.toLocaleString() || "0"}</span>
-                            </div>
-                            <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between">
-                              <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold">Duration</span>
-                              <span className="text-sm sm:text-base font-bold text-white font-mono">{formatDuration(activeSession.videoDurationSeconds || 0)}</span>
-                            </div>
-                            <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between gap-2">
-                              <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold flex items-center gap-1.5">
-                                <MessageSquare className="w-3.5 h-3.5 text-purple-400" />
-                                Chat & Events
-                              </span>
-                              <div className="flex items-center gap-1.5 font-mono">
-                                <span className="text-sm sm:text-base font-bold text-white" title="Chat Messages & Notices">
-                                  {(activeSession.commentsWritten || 0).toLocaleString()}
-                                </span>
-                                {(activeSession.eventsWritten || 0) > 0 && (
-                                  <span
-                                    className="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/30"
-                                    title="Captured Broadcast & Moderation Events (Predictions, Polls, Pins, Redemptions, Timeouts, Mode Changes)"
-                                  >
-                                    +{(activeSession.eventsWritten || 0).toLocaleString()}
+                          {(() => {
+                            const activeMode = activeSession.captureMode || config?.channelCaptureModes?.[cleaned] || 'both';
+                            return (
+                              <div className="grid grid-cols-3 gap-2.5">
+                                <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between">
+                                  <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold">Video Segments</span>
+                                  {activeMode === 'chat_only' ? (
+                                    <span className="text-xs font-mono text-gray-500 uppercase">Off (Chat Only)</span>
+                                  ) : (
+                                    <span className="text-sm sm:text-base font-bold text-white font-mono">{activeSession.chunksDownloaded?.toLocaleString() || "0"}</span>
+                                  )}
+                                </div>
+                                <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between">
+                                  <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold">Duration</span>
+                                  <span className="text-sm sm:text-base font-bold text-white font-mono">{formatDuration(activeSession.videoDurationSeconds || 0)}</span>
+                                </div>
+                                <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between gap-2">
+                                  <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold flex items-center gap-1.5">
+                                    <MessageSquare className="w-3.5 h-3.5 text-purple-400" />
+                                    Chat & Events
                                   </span>
-                                )}
+                                  {activeMode === 'video_only' ? (
+                                    <span className="text-xs font-mono text-gray-500 uppercase">Off (Video Only)</span>
+                                  ) : (
+                                    <div className="flex items-center gap-1.5 font-mono">
+                                      <span className="text-sm sm:text-base font-bold text-white" title="Chat Messages & Notices">
+                                        {(activeSession.commentsWritten || 0).toLocaleString()}
+                                      </span>
+                                      {(activeSession.eventsWritten || 0) > 0 && (
+                                        <span
+                                          className="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/30"
+                                          title="Captured Broadcast & Moderation Events (Predictions, Polls, Pins, Redemptions, Timeouts, Mode Changes)"
+                                        >
+                                          +{(activeSession.eventsWritten || 0).toLocaleString()}
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
                               </div>
-                            </div>
-                          </div>
+                            );
+                          })()}
 
                           {/* Offline warning if missing chunks */}
                           {activeSession.missingCount !== undefined && activeSession.missingCount > 0 && (
@@ -1351,15 +1530,33 @@ export default function App() {
 
                           {/* Stream Options & Actions Footer */}
                           <div className="pt-2.5 flex flex-wrap items-center justify-between gap-3 text-sm border-t border-white/5">
-                            <label className="flex items-center gap-2.5 cursor-pointer text-gray-400 hover:text-gray-300">
-                              <input 
-                                type="checkbox" 
-                                checked={isLive && activeSession ? (activeSession.autoRenderChat || false) : (config?.channelAutoRender?.[cleaned] ?? config?.autoRenderChat ?? false)} 
-                                onChange={() => toggleAutoRender(channelName, isLive && activeSession ? (activeSession.autoRenderChat || false) : (config?.channelAutoRender?.[cleaned] ?? config?.autoRenderChat ?? false))} 
-                                className="w-4 h-4 rounded border-white/20 bg-black/40 text-purple-600 focus:ring-0" 
-                              />
-                              <span className="text-sm">Auto-render chat upon conclusion</span>
-                            </label>
+                            {(() => {
+                              const isVideoOnly = (activeSession.captureMode || config?.channelCaptureModes?.[cleaned] || 'both') === 'video_only';
+                              const isChecked = isLive && activeSession ? (activeSession.autoRenderChat || false) : (config?.channelAutoRender?.[cleaned] ?? config?.autoRenderChat ?? false);
+                              return (
+                                <label
+                                  className={`flex items-center gap-2.5 transition-opacity ${
+                                    isVideoOnly
+                                      ? "opacity-40 cursor-not-allowed text-gray-500"
+                                      : "cursor-pointer text-gray-400 hover:text-gray-300"
+                                  }`}
+                                  title={isVideoOnly ? "Chat capture and rendering are disabled in Video Only mode" : "Automatically render chat video when each game segment, VOD backfill, clip, or broadcast finishes"}
+                                >
+                                  <input 
+                                    type="checkbox" 
+                                    disabled={isVideoOnly}
+                                    checked={isChecked} 
+                                    onChange={() => {
+                                      if (!isVideoOnly) {
+                                        toggleAutoRender(channelName, isChecked);
+                                      }
+                                    }} 
+                                    className="w-4 h-4 rounded border-white/20 bg-black/40 text-purple-600 focus:ring-0 disabled:cursor-not-allowed" 
+                                  />
+                                  <span className="text-sm">Auto-render chat segments</span>
+                                </label>
+                              );
+                            })()}
 
                             <div className="flex items-center gap-2">
                               <button
@@ -1374,7 +1571,7 @@ export default function App() {
                                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white border border-white/10 hover:border-purple-500/40 transition-all cursor-pointer ${
                                   isManualSplicing[activeSession.channel] ? "opacity-75 cursor-wait" : ""
                                 }`}
-                                title="Manually cut the current game segment and begin a new segment"
+                                title="Cut game segment, extract a standalone highlight clip, or append to previous game"
                               >
                                 <Scissors className="w-3.5 h-3.5 text-purple-400" />
                                 <span>{isManualSplicing[activeSession.channel] ? "Cutting..." : "Splice Game Segment"}</span>
@@ -1385,7 +1582,7 @@ export default function App() {
                       ) : (
                         /* Revised Idle Polling State */
                         <div className="px-4 py-3 bg-black/20 flex flex-wrap items-center justify-between gap-3 text-sm">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2 flex-wrap">
                             <span className="w-2 h-2 rounded-full bg-gray-500 shrink-0" />
                             <span className="font-semibold text-gray-300">Stream Offline.</span>
                             <span className="text-gray-400">Recording will start when broadcast begins.</span>
@@ -1395,15 +1592,61 @@ export default function App() {
                               </span>
                             )}
                           </div>
-                          <label className="flex items-center gap-2 cursor-pointer text-gray-400 hover:text-gray-300 shrink-0 ml-auto">
-                            <input 
-                              type="checkbox" 
-                              checked={config?.channelAutoRender?.[cleaned] ?? config?.autoRenderChat ?? false} 
-                              onChange={() => toggleAutoRender(channelName, config?.channelAutoRender?.[cleaned] ?? config?.autoRenderChat ?? false)} 
-                              className="w-4 h-4 rounded border-white/20 bg-black/40 text-purple-600 focus:ring-0" 
-                            />
-                            <span className="text-xs sm:text-sm">Auto-render chat upon conclusion</span>
-                          </label>
+
+                          <div className="flex flex-wrap items-center gap-3 ml-auto">
+                            {/* Per-Channel Capture Mode Selector (editable while offline / not recording live) */}
+                            {(() => {
+                              const currentMode = config?.channelCaptureModes?.[cleaned] || 'both';
+                              const isVideoOnly = currentMode === 'video_only';
+                              const isChecked = config?.channelAutoRender?.[cleaned] ?? config?.autoRenderChat ?? false;
+                              return (
+                                <>
+                                  <div className="inline-flex items-center bg-[#18181b] border border-white/10 rounded-lg p-0.5" title="Select what to record for this channel before the broadcast begins">
+                                    {([
+                                      { id: 'both', label: 'Video + Chat' },
+                                      { id: 'video_only', label: 'Video Only' },
+                                      { id: 'chat_only', label: 'Chat Only' }
+                                    ] as const).map(opt => (
+                                      <button
+                                        key={opt.id}
+                                        type="button"
+                                        onClick={() => setChannelCaptureMode(channelName, opt.id)}
+                                        className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-all cursor-pointer ${
+                                          currentMode === opt.id
+                                            ? "bg-purple-600 text-white shadow-sm"
+                                            : "text-gray-400 hover:text-white"
+                                        }`}
+                                      >
+                                        {opt.label}
+                                      </button>
+                                    ))}
+                                  </div>
+
+                                  <label
+                                    className={`flex items-center gap-2 shrink-0 transition-opacity ${
+                                      isVideoOnly
+                                        ? "opacity-40 cursor-not-allowed text-gray-500"
+                                        : "cursor-pointer text-gray-400 hover:text-gray-300"
+                                    }`}
+                                    title={isVideoOnly ? "Chat capture and rendering are disabled in Video Only mode" : "Automatically render chat video when each game segment, VOD backfill, clip, or broadcast finishes"}
+                                  >
+                                    <input 
+                                      type="checkbox" 
+                                      disabled={isVideoOnly}
+                                      checked={isChecked} 
+                                      onChange={() => {
+                                        if (!isVideoOnly) {
+                                          toggleAutoRender(channelName, isChecked);
+                                        }
+                                      }} 
+                                      className="w-4 h-4 rounded border-white/20 bg-black/40 text-purple-600 focus:ring-0 disabled:cursor-not-allowed" 
+                                    />
+                                    <span className="text-xs sm:text-sm">Auto-render chat segments</span>
+                                  </label>
+                                </>
+                              );
+                            })()}
+                          </div>
                         </div>
                       )}
                     </div>
@@ -1666,18 +1909,25 @@ export default function App() {
                       <div className="space-y-3">
                         {renderDialog.files.map((file, idx) => (
                           <div key={idx} className={`bg-[#1c1c1f] p-3.5 rounded-lg border ${file.enabled === false ? 'border-red-500/30 opacity-50' : 'border-white/5'} space-y-3 transition-opacity`}>
-                            <div className="flex items-center gap-2.5">
-                              <input 
-                                type="checkbox" 
-                                checked={file.enabled !== false} 
-                                onChange={e => {
-                                  const newFiles = [...renderDialog.files!];
-                                  newFiles[idx].enabled = e.target.checked;
-                                  setRenderDialog({...renderDialog, files: newFiles});
-                                }}
-                                className="w-4 h-4 rounded text-purple-500 bg-[#242428] border-white/10"
-                              />
-                              <p className="text-sm font-medium text-white truncate flex-1" title={file.filename}>{file.filename}</p>
+                            <div className="flex items-center justify-between gap-2.5">
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <input 
+                                  type="checkbox" 
+                                  checked={file.enabled !== false} 
+                                  onChange={e => {
+                                    const newFiles = [...renderDialog.files!];
+                                    newFiles[idx].enabled = e.target.checked;
+                                    setRenderDialog({...renderDialog, files: newFiles});
+                                  }}
+                                  className="w-4 h-4 rounded text-purple-500 bg-[#242428] border-white/10 shrink-0"
+                                />
+                                <p className="text-sm font-medium text-white truncate" title={file.filename}>{file.filename}</p>
+                              </div>
+                              {file.isCustomProfile && (
+                                <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 shrink-0" title={`Matched Per-Game Profile: ${file.matchedProfile || file.gameName}`}>
+                                  {file.matchedProfile || file.gameName} Profile
+                                </span>
+                              )}
                             </div>
                             <div className="grid grid-cols-2 gap-3">
                               <div className="space-y-1.5">
@@ -1750,7 +2000,7 @@ export default function App() {
             <motion.div key="settings" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="space-y-6">
               <div>
                 <h2 className="text-3xl font-bold text-white tracking-tight">Settings</h2>
-                <p className="text-sm text-gray-400 mt-0.5">Configure your browser tokens and download preferences.</p>
+                <p className="text-sm text-gray-400 mt-0.5">Configure stream monitoring, automated game splicing, per-game render profiles, and chat overlay preferences.</p>
               </div>
 
               <div className="flex flex-wrap gap-x-6 gap-y-2 border-b border-white/10 pb-2">
@@ -1871,7 +2121,7 @@ export default function App() {
                             onChange={(e) => updateDraftConfig({ ...config!, autoRenderChat: e.target.checked } as any)}
                             className="w-4.5 h-4.5 rounded border-white/20 bg-[#141416] text-purple-600 focus:ring-0 focus:ring-offset-0"
                           />
-                          <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">Auto-Render Chat when stream finishes</span>
+                          <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">Auto-render chat segments by default (game switches, backfills &amp; stream end)</span>
                         </label>
                       </div>
                     </div>
@@ -2145,6 +2395,178 @@ export default function App() {
                           <p className="text-xs text-gray-500">Time in seconds between chat scroll frame updates (`0` = every frame).</p>
                         </div>
                       </div>
+
+                      {/* Per-Game Chat Render Resolution Profiles */}
+                      <div className="pt-4 border-t border-white/10 space-y-3">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                          <div>
+                            <h5 className="text-xs font-bold text-purple-300 uppercase tracking-wider flex items-center gap-1.5">
+                              <Gamepad2 className="w-3.5 h-3.5 text-purple-400" />
+                              Per-Game Resolution Profiles
+                            </h5>
+                            <p className="text-xs text-gray-400 mt-0.5">
+                              Override `Default Width × Default Height` for specific games (case-insensitive exact match). You can also click any live game badge on the Livestream Monitor to set its profile on the fly.
+                            </p>
+                          </div>
+                        </div>
+
+                        {Array.isArray((config as any)?.chatRender?.gameProfiles) && (config as any).chatRender.gameProfiles.length > 0 ? (
+                          <div className="space-y-2">
+                            {((config as any).chatRender.gameProfiles as { gameName: string; width: number; height: number }[]).map((prof, pIdx) => (
+                              <div key={`${prof.gameName}-${pIdx}`} className="bg-[#0a0a0c] border border-white/10 rounded-lg p-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                                <div className="flex items-center gap-2 min-w-0 flex-1">
+                                  <Gamepad2 className="w-4 h-4 text-purple-400 shrink-0" />
+                                  <input
+                                    type="text"
+                                    value={prof.gameName}
+                                    onChange={(e) => {
+                                      const next = [...((config as any).chatRender.gameProfiles || [])];
+                                      next[pIdx] = { ...next[pIdx], gameName: e.target.value };
+                                      updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
+                                    }}
+                                    className="bg-[#141416] border border-white/10 rounded px-2.5 py-1 text-xs sm:text-sm font-semibold text-white focus:outline-none focus:border-purple-500/50 w-full max-w-xs"
+                                  />
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-[11px] text-gray-400 uppercase font-mono">W</span>
+                                    <input
+                                      type="number"
+                                      min="100"
+                                      max="7680"
+                                      step="2"
+                                      value={prof.width}
+                                      onChange={(e) => {
+                                        const next = [...((config as any).chatRender.gameProfiles || [])];
+                                        next[pIdx] = { ...next[pIdx], width: e.target.value as any };
+                                        updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
+                                      }}
+                                      onBlur={(e) => {
+                                        const parsed = parseInt(e.target.value, 10);
+                                        const rawVal = Number.isFinite(parsed) && parsed > 0 ? Math.max(100, Math.min(7680, parsed)) : 350;
+                                        const cleanVal = rawVal % 2 !== 0 ? rawVal + 1 : rawVal;
+                                        const next = [...((config as any).chatRender.gameProfiles || [])];
+                                        next[pIdx] = { ...next[pIdx], width: cleanVal };
+                                        updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
+                                      }}
+                                      className="w-20 bg-[#141416] border border-white/10 rounded px-2 py-1 text-xs sm:text-sm font-mono text-white focus:outline-none focus:border-purple-500/50"
+                                    />
+                                  </div>
+                                  <span className="text-gray-500 font-mono">×</span>
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-[11px] text-gray-400 uppercase font-mono">H</span>
+                                    <input
+                                      type="number"
+                                      min="100"
+                                      max="7680"
+                                      step="2"
+                                      value={prof.height}
+                                      onChange={(e) => {
+                                        const next = [...((config as any).chatRender.gameProfiles || [])];
+                                        next[pIdx] = { ...next[pIdx], height: e.target.value as any };
+                                        updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
+                                      }}
+                                      onBlur={(e) => {
+                                        const parsed = parseInt(e.target.value, 10);
+                                        const rawVal = Number.isFinite(parsed) && parsed > 0 ? Math.max(100, Math.min(7680, parsed)) : 800;
+                                        const cleanVal = rawVal % 2 !== 0 ? rawVal + 1 : rawVal;
+                                        const next = [...((config as any).chatRender.gameProfiles || [])];
+                                        next[pIdx] = { ...next[pIdx], height: cleanVal };
+                                        updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
+                                      }}
+                                      className="w-20 bg-[#141416] border border-white/10 rounded px-2 py-1 text-xs sm:text-sm font-mono text-white focus:outline-none focus:border-purple-500/50"
+                                    />
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const next = ((config as any).chatRender.gameProfiles || []).filter((_: any, i: number) => i !== pIdx);
+                                      updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
+                                    }}
+                                    className="p-1.5 rounded hover:bg-red-500/15 text-gray-400 hover:text-red-400 transition-colors cursor-pointer"
+                                    title="Remove game profile"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="text-xs text-gray-500 bg-[#0a0a0c] border border-dashed border-white/10 rounded-lg px-3 py-2.5">
+                            No per-game resolution profiles configured yet. All games currently use Default Width × Default Height ({(config as any)?.chatRender?.width ?? 350}×{(config as any)?.chatRender?.height ?? 800}).
+                          </div>
+                        )}
+
+                        {/* Add New Game Profile Row */}
+                        <div className="bg-[#0a0a0c] border border-white/10 rounded-lg p-3 flex flex-col sm:flex-row sm:items-end gap-3">
+                          <div className="flex-1 space-y-1">
+                            <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Game / Category Name</label>
+                            <input
+                              type="text"
+                              value={newProfileGameName}
+                              onChange={e => setNewProfileGameName(e.target.value)}
+                              placeholder="e.g. Just Chatting, VALORANT, League of Legends"
+                              className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-1.5 text-xs sm:text-sm text-white placeholder-gray-600 focus:outline-none focus:border-purple-500/50"
+                            />
+                          </div>
+                          <div className="w-24 space-y-1">
+                            <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Width</label>
+                            <input
+                              type="number"
+                              min="100"
+                              max="7680"
+                              step="2"
+                              value={newProfileWidth}
+                              onChange={e => setNewProfileWidth(e.target.value)}
+                              className="w-full bg-[#141416] border border-white/10 rounded-lg px-2.5 py-1.5 text-xs sm:text-sm font-mono text-white focus:outline-none focus:border-purple-500/50"
+                            />
+                          </div>
+                          <div className="w-24 space-y-1">
+                            <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Height</label>
+                            <input
+                              type="number"
+                              min="100"
+                              max="7680"
+                              step="2"
+                              value={newProfileHeight}
+                              onChange={e => setNewProfileHeight(e.target.value)}
+                              className="w-full bg-[#141416] border border-white/10 rounded-lg px-2.5 py-1.5 text-xs sm:text-sm font-mono text-white focus:outline-none focus:border-purple-500/50"
+                            />
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const trimmed = newProfileGameName.trim();
+                              if (!trimmed) {
+                                showToast("Enter a Twitch game/category name first.", "error", "Game Profile");
+                                return;
+                              }
+                              const rawW = parseInt(newProfileWidth, 10) || 350;
+                              const rawH = parseInt(newProfileHeight, 10) || 800;
+                              const clampedW = Math.max(100, Math.min(7680, rawW));
+                              const clampedH = Math.max(100, Math.min(7680, rawH));
+                              const evenW = clampedW % 2 !== 0 ? clampedW + 1 : clampedW;
+                              const evenH = clampedH % 2 !== 0 ? clampedH + 1 : clampedH;
+                              const existing: { gameName: string; width: number; height: number }[] = Array.isArray((config as any)?.chatRender?.gameProfiles)
+                                ? [...(config as any).chatRender.gameProfiles]
+                                : [];
+                              const idx = existing.findIndex(p => p.gameName.trim().toLowerCase() === trimmed.toLowerCase());
+                              if (idx >= 0) {
+                                existing[idx] = { gameName: trimmed, width: evenW, height: evenH };
+                              } else {
+                                existing.push({ gameName: trimmed, width: evenW, height: evenH });
+                              }
+                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: existing } } as any);
+                              setNewProfileGameName("");
+                            }}
+                            className="flex items-center justify-center gap-1.5 px-3.5 py-1.5 bg-purple-600/20 hover:bg-purple-600 text-purple-300 hover:text-white border border-purple-500/30 rounded-lg text-xs font-semibold uppercase tracking-wider transition-all cursor-pointer shrink-0"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            <span>Add / Update</span>
+                          </button>
+                        </div>
+                      </div>
                     </div>
 
                     {/* Hardware Acceleration & Memory (ChatRenderCLI) */}
@@ -2412,7 +2834,14 @@ export default function App() {
 
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-white/10">
                         <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Highlight Users (comma separated)</label>
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Highlight Users (comma separated)</label>
+                            {config?.channels && config.channels.length > 0 && (
+                              <span className="text-[11px] font-mono text-purple-300 bg-purple-500/15 border border-purple-500/30 px-2 py-0.5 rounded">
+                                Auto-included: {config.channels.map(c => `@${c}`).join(', ')}
+                              </span>
+                            )}
+                          </div>
                           <input
                             type="text"
                             value={(config as any)?.chatRender?.highlightUsers || ""}
@@ -2420,7 +2849,7 @@ export default function App() {
                             className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
                             placeholder="moderator1, vip_friend, streamer_alt"
                           />
-                          <p className="text-xs text-gray-500">Case-insensitive list of usernames to highlight with a colored background and left border (`--highlight-users`).</p>
+                          <p className="text-xs text-gray-500">The broadcaster of the monitored/rendered channel is included automatically. Add any extra usernames here (`--highlight-users`).</p>
                         </div>
                         <div className="space-y-1.5">
                           <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Highlight User Color (Hex)</label>
@@ -2710,17 +3139,7 @@ export default function App() {
                   </div>
                 )}
 
-                <div className="flex flex-wrap justify-between items-center gap-4 mt-6 pt-6 border-t border-white/10">
-                  <div className="flex items-center gap-3">
-                    <a
-                      href="/api/system-log"
-                      download
-                      className="flex items-center gap-2 bg-white/5 text-gray-300 border border-white/10 hover:border-white/20 hover:text-white px-4 py-2.5 rounded-lg text-sm font-semibold uppercase tracking-wider transition-all"
-                    >
-                      <Download className="w-4 h-4" />
-                      Download System Log
-                    </a>
-                  </div>
+                <div className="flex flex-wrap justify-end items-center gap-4 mt-6 pt-6 border-t border-white/10">
                   <div className="flex flex-wrap items-center gap-3">
                     {isConfigDirty && (
                       <div className="flex items-center gap-2">
@@ -2864,7 +3283,7 @@ export default function App() {
                 <div 
                   ref={logContainerRef}
                   onScroll={handleLogScroll}
-                  className="p-3.5 h-[620px] overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5 scrollbar-thin scrollbar-thumb-white/10"
+                  className="p-3 h-[620px] overflow-y-auto font-mono text-xs leading-tight space-y-0 scrollbar-thin scrollbar-thumb-white/10"
                 >
                   {(() => {
                     const allLogs = status?.logs || [];
@@ -2873,9 +3292,30 @@ export default function App() {
                       if (logCategory === 'errors') {
                         if (!lower.includes('error') && !lower.includes('warn') && !lower.includes('critical') && !lower.includes('fail')) return false;
                       } else if (logCategory === 'video') {
-                        if (!lower.includes('[video]') && !lower.includes('[stitch') && !lower.includes('[backfill]') && !lower.includes('[game slicing]') && !lower.includes('[manual splice]') && !lower.includes('[recovery]') && !lower.includes('[stream]')) return false;
+                        if (
+                          !lower.includes('[video') &&
+                          !lower.includes('[stitch') &&
+                          !lower.includes('[backfill]') &&
+                          !lower.includes('[game slicing]') &&
+                          !lower.includes('[game change]') &&
+                          !lower.includes('[manual splice') &&
+                          !lower.includes('[time splice]') &&
+                          !lower.includes('[recovery]') &&
+                          !lower.includes('[stream') &&
+                          !lower.includes('[resumption') &&
+                          !lower.includes('[session resumption]')
+                        ) return false;
                       } else if (logCategory === 'chat') {
-                        if (!lower.includes('[chat') && !lower.includes('[render') && !lower.includes('[auto-render]')) return false;
+                        if (
+                          !lower.includes('[chat') &&
+                          !lower.includes('[vod chat]') &&
+                          !lower.includes('[render') &&
+                          !lower.includes('[auto-render]') &&
+                          !lower.includes('[manual render]') &&
+                          !lower.includes('[pubsub]') &&
+                          !lower.includes('[emotes]') &&
+                          !lower.includes('[game profile]')
+                        ) return false;
                       }
                       if (logSearchQuery.trim()) {
                         return lower.includes(logSearchQuery.trim().toLowerCase());
@@ -2898,7 +3338,7 @@ export default function App() {
                       return (
                         <div 
                           key={i} 
-                          className={`px-2.5 py-0.5 rounded transition-colors break-words font-mono select-text whitespace-pre-wrap ${
+                          className={`px-2 py-[1px] leading-[1.3] rounded-sm transition-colors break-words font-mono select-text whitespace-pre-wrap ${
                             isErr
                               ? "text-red-300 bg-red-500/10 hover:bg-red-500/15"
                               : isWarn
@@ -2948,6 +3388,7 @@ export default function App() {
                         if (e.target.value) {
                           setManualRenderPath(e.target.value);
                           setManualRenderMsg(null);
+                          applyManualRenderProfileForPath(e.target.value);
                         }
                       }}
                       className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-purple-500/50 cursor-pointer"
@@ -2969,9 +3410,16 @@ export default function App() {
                 )}
 
                 <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
-                    Chat JSON File Path
-                  </label>
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
+                      Chat JSON File Path
+                    </label>
+                    {manualRenderMatchedProfile && (
+                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                        Matched Profile: {manualRenderMatchedProfile}
+                      </span>
+                    )}
+                  </div>
                   <input
                     type="text"
                     value={manualRenderPath}
@@ -2979,11 +3427,12 @@ export default function App() {
                       setManualRenderPath(e.target.value);
                       setManualRenderMsg(null);
                     }}
+                    onBlur={(e) => applyManualRenderProfileForPath(e.target.value)}
                     placeholder="e.g. downloads/channel_2026-10-18/chat.json (or full path)"
                     className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3.5 py-2.5 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white placeholder-gray-600 shadow-inner"
                   />
                   <p className="text-xs text-gray-500">
-                    Select a file above or paste the path to any chat JSON file.
+                    Select a file above or paste the path to any chat JSON file. Dimensions auto-fill if the game matches a saved profile.
                   </p>
                 </div>
 
@@ -3046,6 +3495,96 @@ export default function App() {
                   {isStartingManualRender && <RefreshCw className="w-4 h-4 animate-spin" />}
                   {isStartingManualRender ? "Starting..." : "Start Render"}
                 </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Quick Game Resolution Profile Modal (triggered by clicking live game badge) */}
+        {quickGameProfileModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+            <div className="bg-[#141416] border border-white/15 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-5">
+              <div className="flex items-center justify-between border-b border-white/10 pb-4">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <Gamepad2 className="w-5 h-5 text-purple-400 shrink-0" />
+                  <div className="min-w-0">
+                    <h3 className="text-base font-bold text-white tracking-tight truncate">Game Render Resolution</h3>
+                    <p className="text-xs text-purple-300 font-medium truncate">{quickGameProfileModal.gameName}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setQuickGameProfileModal(null)}
+                  className="text-gray-400 hover:text-white p-1 rounded-lg transition-colors cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="space-y-4">
+                <p className="text-xs text-gray-400 leading-relaxed">
+                  Set a dedicated chat render resolution (`Width × Height`) for <strong className="text-white">{quickGameProfileModal.gameName}</strong>. Used automatically when Auto-Render or Manual Render processes segments for this game.
+                </p>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Width (px)</label>
+                    <input
+                      type="number"
+                      min="100"
+                      max="7680"
+                      step="2"
+                      value={quickGameProfileModal.width}
+                      onChange={e => setQuickGameProfileModal({ ...quickGameProfileModal, width: e.target.value })}
+                      className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Height (px)</label>
+                    <input
+                      type="number"
+                      min="100"
+                      max="7680"
+                      step="2"
+                      value={quickGameProfileModal.height}
+                      onChange={e => setQuickGameProfileModal({ ...quickGameProfileModal, height: e.target.value })}
+                      className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-3 pt-3 border-t border-white/10">
+                {quickGameProfileModal.hasExistingProfile ? (
+                  <button
+                    type="button"
+                    disabled={isSavingQuickGameProfile}
+                    onClick={() => saveQuickGameProfile(true)}
+                    className="px-3 py-2 text-xs font-semibold text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg transition-colors cursor-pointer"
+                  >
+                    Reset to Default
+                  </button>
+                ) : <div />}
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={isSavingQuickGameProfile}
+                    onClick={() => setQuickGameProfileModal(null)}
+                    className="px-3.5 py-2 text-xs font-semibold text-gray-400 hover:text-white rounded-lg transition-colors cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isSavingQuickGameProfile}
+                    onClick={() => saveQuickGameProfile(false)}
+                    className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-semibold uppercase tracking-wider transition-colors shadow-md shadow-purple-900/30 cursor-pointer"
+                  >
+                    {isSavingQuickGameProfile && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                    <span>Save Profile</span>
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -3226,9 +3765,25 @@ export default function App() {
                 </div>
               </div>
 
-              <p className="text-sm text-gray-300 leading-relaxed">
-                Stream @{stopConfirmChannel} is actively recording! Stopping monitoring now will conclude recording and immediately trigger segment stitching and chat rendering.
-              </p>
+              {(() => {
+                const stopSession = status?.activeSessions.find(
+                  s => cleanChannel(s.channel) === cleanChannel(stopConfirmChannel)
+                );
+                const stopMode = stopSession?.captureMode || config?.channelCaptureModes?.[cleanChannel(stopConfirmChannel)] || 'both';
+                const stopAutoRender = stopSession
+                  ? Boolean(stopSession.autoRenderChat)
+                  : Boolean(config?.channelAutoRender?.[cleanChannel(stopConfirmChannel)] ?? config?.autoRenderChat);
+                const stopActionText = stopMode === 'video_only'
+                  ? 'segment video stitching'
+                  : stopMode === 'chat_only'
+                  ? (stopAutoRender ? 'chat segment slicing and chat rendering' : 'chat segment slicing')
+                  : (stopAutoRender ? 'segment stitching, chat slicing, and automatic chat rendering' : 'segment video stitching and chat slicing');
+                return (
+                  <p className="text-sm text-gray-300 leading-relaxed">
+                    Stream @{stopConfirmChannel} is actively recording! Stopping monitoring now will conclude recording and immediately trigger {stopActionText}.
+                  </p>
+                );
+              })()}
 
               <div className="flex items-center justify-end gap-3 pt-3 border-t border-white/10">
                 <button
@@ -3294,11 +3849,15 @@ export default function App() {
             </div>
           </div>
         )}
-        {/* 3-Mode Manual Splice Game Modal */}
+        {/* 4-Mode Manual Stream Splice & Clip Modal */}
         {manualSpliceChannel && (() => {
           const activeSession = status?.activeSessions.find(
             s => cleanChannel(s.channel) === cleanChannel(manualSpliceChannel)
           );
+          const sessionCaptureMode = activeSession?.captureMode || config?.channelCaptureModes?.[cleanChannel(manualSpliceChannel)] || 'both';
+          const isChatOnlyMode = sessionCaptureMode === 'chat_only';
+          const isVideoOnlyMode = sessionCaptureMode === 'video_only';
+          const mediaNoun = isChatOnlyMode ? 'chat log' : isVideoOnlyMode ? 'video' : 'video and chat';
           const games = activeSession?.games || [];
           const hasPrevious = games.length > 1;
           const previousGameName = hasPrevious ? games[games.length - 2].gameName : null;
@@ -3316,7 +3875,7 @@ export default function App() {
                       <Scissors className="w-5 h-5 text-purple-400" />
                     </div>
                     <div>
-                      <h3 className="text-base font-bold text-white tracking-tight">Manual Video Splice</h3>
+                      <h3 className="text-base font-bold text-white tracking-tight">Manual Stream Splice &amp; Clip</h3>
                       <p className="text-xs text-purple-300 font-mono">@{manualSpliceChannel} • Playing {currentGameName}</p>
                     </div>
                   </div>
@@ -3330,10 +3889,10 @@ export default function App() {
                 </div>
 
                 <p className="text-xs text-gray-400 leading-relaxed">
-                  Choose what to do with the footage recorded up to this moment:
+                  Choose what to do with the {mediaNoun} recorded up to this moment:
                 </p>
 
-                {/* 3 Options */}
+                {/* 4 Options */}
                 <div className="space-y-3">
                   {/* Option 1: Append to Previous Game */}
                   <label
@@ -3369,7 +3928,11 @@ export default function App() {
                           )}
                         </div>
                         <p className="text-xs text-gray-400 mt-1 leading-relaxed">
-                          Slices footage recorded up to now and stitches it as a seamless extension file to {previousGameName || 'the previous game'} with matching chat. Shifts {currentGameName}'s start point to now.
+                          {isChatOnlyMode
+                            ? `Slices chat recorded up to now as a standalone extension file for ${previousGameName || 'the previous game'} and shifts ${currentGameName}'s start point to now.`
+                            : isVideoOnlyMode
+                            ? `Slices video recorded up to now and stitches it as a seamless extension file to ${previousGameName || 'the previous game'}. Shifts ${currentGameName}'s start point to now.`
+                            : `Slices footage recorded up to now and stitches it as a seamless extension file to ${previousGameName || 'the previous game'} with matching chat. Shifts ${currentGameName}'s start point to now.`}
                         </p>
                       </div>
                     </div>
@@ -3400,7 +3963,11 @@ export default function App() {
                           </span>
                         </div>
                         <p className="text-xs text-gray-400 mt-1 leading-relaxed">
-                          Remuxes a standalone video and chat clip right now. The ongoing broadcast recording continues completely untouched without splitting the master game VOD.
+                          {isChatOnlyMode
+                            ? "Exports a standalone chat clip right now. The ongoing broadcast recording continues completely untouched without splitting the master game segment."
+                            : isVideoOnlyMode
+                            ? "Remuxes a standalone video clip right now. The ongoing broadcast recording continues completely untouched without splitting the master game VOD."
+                            : "Remuxes a standalone video and chat clip right now. The ongoing broadcast recording continues completely untouched without splitting the master game VOD."}
                         </p>
 
                         {/* Sub-options for Clip */}
@@ -3465,7 +4032,7 @@ export default function App() {
                                   +0.5m
                                 </button>
                                 <span className="text-[11px] text-gray-400 font-mono">
-                                  ({Math.round(clipMinutes * 60)}s • {Math.round(clipMinutes * 30)} chunks)
+                                  ({Math.round(clipMinutes * 60)}s{!isChatOnlyMode ? ` • ~${Math.round(clipMinutes * 30)} chunks` : ''})
                                 </span>
                               </div>
                             )}
@@ -3500,7 +4067,7 @@ export default function App() {
                           </span>
                         </div>
                         <p className="text-xs text-gray-400 mt-1 leading-relaxed">
-                          Finalizes the current segment now for stitching and starts the next part immediately, preserving the transition buffer.
+                          Finalizes the current segment now for {isChatOnlyMode ? 'chat slicing' : 'stitching'} and starts the next part immediately, preserving the transition buffer.
                         </p>
                       </div>
                     </div>
@@ -3542,7 +4109,7 @@ export default function App() {
                               </span>
                             </div>
                             <p className="text-xs text-gray-400 mt-1 leading-relaxed">
-                              Immediately ends and stitches <strong>{lastSegmentName}</strong>, then records upcoming footage into the next game VOD (temporarily labeled <strong>{fallbackNextName}</strong> until the broadcaster updates their Twitch category).
+                              Immediately ends and {isChatOnlyMode ? 'slices' : 'stitches'} <strong>{lastSegmentName}</strong>, then records upcoming {isChatOnlyMode ? 'chat' : 'footage'} into the next game segment (temporarily labeled <strong>{fallbackNextName}</strong> until the broadcaster updates their Twitch category).
                             </p>
 
                             {spliceAction === 'await_next_game' && (
@@ -3565,11 +4132,11 @@ export default function App() {
                                     className="w-24 px-2.5 py-1 text-xs text-center rounded bg-black/40 border border-white/20 text-white font-mono focus:outline-none focus:border-purple-500"
                                   />
                                   <span className="text-[11px] text-gray-400 font-mono">
-                                    (Default: {defaultBufMins * 2}m = 2x {defaultBufMins}m buffer • {Math.round(effectiveLeadMins * 30)} chunks)
+                                    (Default: {defaultBufMins * 2}m = 2x {defaultBufMins}m buffer{!isChatOnlyMode ? ` • ~${Math.round(effectiveLeadMins * 30)} chunks` : ''})
                                   </span>
                                 </div>
                                 <p className="text-[11px] text-gray-400 leading-relaxed">
-                                  Includes the last <strong>{effectiveLeadMins} minutes</strong> before now as leading footage for the new game so early gameplay before you clicked splice is retained.
+                                  Includes the last <strong>{effectiveLeadMins} minutes</strong> before now as leading {isChatOnlyMode ? 'chat' : 'footage'} for the new game so early activity before you clicked splice is retained.
                                 </p>
                               </div>
                             )}
@@ -3586,17 +4153,21 @@ export default function App() {
                   <div className="leading-relaxed">
                     {spliceAction === 'append_previous' && (
                       <span>
-                        Will stitch extra footage up to now as an extension file for <strong>{previousGameName}</strong> with matching chat, then advance <strong>{currentGameName}</strong>'s start point.
+                        {isChatOnlyMode
+                          ? <>Will slice extra chat up to now as an extension file for <strong>{previousGameName}</strong>, then advance <strong>{currentGameName}</strong>'s start point.</>
+                          : isVideoOnlyMode
+                          ? <>Will stitch extra video up to now as an extension file for <strong>{previousGameName}</strong>, then advance <strong>{currentGameName}</strong>'s start point.</>
+                          : <>Will stitch extra footage up to now as an extension file for <strong>{previousGameName}</strong> with matching chat, then advance <strong>{currentGameName}</strong>'s start point.</>}
                       </span>
                     )}
                     {spliceAction === 'extract_clip' && clipScope === 'whole_game' && (
                       <span>
-                        Will export a standalone ~<strong>{currentGameDurationMins}m</strong> video and chat clip of <strong>{currentGameName}</strong> up to now. The live recording continues without interruption.
+                        Will export a standalone ~<strong>{currentGameDurationMins}m</strong> {mediaNoun} clip of <strong>{currentGameName}</strong> up to now. The live recording continues without interruption.
                       </span>
                     )}
                     {spliceAction === 'extract_clip' && clipScope === 'custom_duration' && (
                       <span>
-                        Will extract a standalone <strong>{clipMinutes}m</strong> video and chat clip of <strong>{currentGameName}</strong> ending now. The live recording continues without interruption.
+                        Will extract a standalone <strong>{clipMinutes}m</strong> {mediaNoun} clip of <strong>{currentGameName}</strong> ending now. The live recording continues without interruption.
                       </span>
                     )}
                     {spliceAction === 'split_new_part' && (
@@ -3615,7 +4186,7 @@ export default function App() {
                       const effectiveLeadMins = Number.isFinite(parsedLeadMins) && parsedLeadMins >= 0 ? parsedLeadMins : defaultBufMins * 2;
                       return (
                         <span>
-                          Will finalize and stitch <strong>{lastSegmentName}</strong> now, retain a <strong>{effectiveLeadMins}m</strong> leading buffer for the new segment (labeled <strong>{fallbackNextName}</strong>), and automatically rename it when the Twitch game category updates.
+                          Will finalize and {isChatOnlyMode ? 'slice' : 'stitch'} <strong>{lastSegmentName}</strong> now, retain a <strong>{effectiveLeadMins}m</strong> leading buffer for the new segment (labeled <strong>{fallbackNextName}</strong>), and automatically rename it when the Twitch game category updates.
                         </span>
                       );
                     })()}

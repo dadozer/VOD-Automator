@@ -134,6 +134,7 @@ export const defaultConfig: Config = {
   autoStartMonitoring: false,
   autoRenderChat: false,
   channelAutoRender: {},
+  channelCaptureModes: {},
   gameSwitchBufferMins: 5,
   offlineGracePeriodMins: 5,
   longGameAutospliceEnabled: true,
@@ -145,6 +146,7 @@ export const defaultConfig: Config = {
     syncOffsetHevc: -7.5,
     width: 350,
     height: 800,
+    gameProfiles: [],
     backgroundColor: "#111111",
     altBackgroundColor: "#191919",
     alternateBackgrounds: false,
@@ -273,13 +275,13 @@ export const addLog = (msg: string) => {
   const rawLines = String(msg).split(/\r?\n/);
   for (const line of rawLines) {
     if (!line && rawLines.length > 1) continue;
-    const logMsg = `[${timestamp}] ${line}`;
+    const logMsg = `[${localDateStr} ${timestamp}] ${line}`;
     console.log(logMsg);
     state.logs.push(logMsg);
     // Keep last 300 logs in memory for debugging inspection
     if (state.logs.length > 300) state.logs.shift();
 
-    const fileLogMessage = `[${localDateStr} ${timestamp}] ${line}\n`;
+    const fileLogMessage = `${logMsg}\n`;
     fs.appendFile(LOG_FILE, fileLogMessage, (err) => {
       if (err) console.error("Failed to write to log file:", err);
     });
@@ -402,10 +404,152 @@ function getSerializableSessions() {
         gapAdjustments: session.gapAdjustments,
         missingCount: session.missingCount,
         downloadedSegments: serializeDownloadedSegments(session.downloadedSegments),
-        autoRenderChat: session.autoRenderChat
+        autoRenderChat: session.autoRenderChat,
+        captureMode: session.captureMode || 'both'
       }
     ])
   );
+}
+
+export function normalizeGameSlug(name: string): string {
+  return (name || '')
+    .trim()
+    .replace(/\s+Part\s+\d+$/i, '')
+    .replace(/\s*\(Part\s+\d+[^)]*\)$/i, '')
+    .replace(/[^a-z0-9]/gi, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .toLowerCase();
+}
+
+export function getChatRenderDimensionsForGame(
+  gameName?: string | null,
+  filename?: string | null
+): { width: number; height: number; matchedProfile?: string; isCustomProfile: boolean } {
+  const defaultW = state.config.chatRender?.width || 350;
+  const defaultH = state.config.chatRender?.height || 800;
+  const profiles = Array.isArray(state.config.chatRender?.gameProfiles)
+    ? state.config.chatRender!.gameProfiles!
+    : [];
+
+  if (profiles.length === 0) {
+    return { width: defaultW, height: defaultH, isCustomProfile: false };
+  }
+
+  const rawGame = (gameName || '').trim();
+  const strippedGame = rawGame
+    .replace(/\s+Part\s+\d+$/i, '')
+    .replace(/\s*\(Part\s+\d+[^)]*\)$/i, '')
+    .trim();
+
+  if (rawGame) {
+    // 1. Exact case-insensitive match on raw gameName
+    const exactMatch = profiles.find(
+      p => p.gameName && p.gameName.trim().toLowerCase() === rawGame.toLowerCase()
+    );
+    if (exactMatch && exactMatch.width >= 100 && exactMatch.height >= 100) {
+      return {
+        width: exactMatch.width,
+        height: exactMatch.height,
+        matchedProfile: exactMatch.gameName.trim(),
+        isCustomProfile: true
+      };
+    }
+
+    // 2. Exact case-insensitive match on stripped gameName (e.g. "Elden Ring Part 2" -> "Elden Ring")
+    if (strippedGame && strippedGame.toLowerCase() !== rawGame.toLowerCase()) {
+      const strippedMatch = profiles.find(
+        p => p.gameName && p.gameName.trim().toLowerCase() === strippedGame.toLowerCase()
+      );
+      if (strippedMatch && strippedMatch.width >= 100 && strippedMatch.height >= 100) {
+        return {
+          width: strippedMatch.width,
+          height: strippedMatch.height,
+          matchedProfile: strippedMatch.gameName.trim(),
+          isCustomProfile: true
+        };
+      }
+    }
+
+    // 3. Slug match on gameName
+    const targetSlug = normalizeGameSlug(rawGame);
+    if (targetSlug) {
+      const slugMatch = profiles.find(
+        p => p.gameName && normalizeGameSlug(p.gameName) === targetSlug
+      );
+      if (slugMatch && slugMatch.width >= 100 && slugMatch.height >= 100) {
+        return {
+          width: slugMatch.width,
+          height: slugMatch.height,
+          matchedProfile: slugMatch.gameName.trim(),
+          isCustomProfile: true
+        };
+      }
+    }
+  }
+
+  // 4. Fallback filename slug inspection (e.g. "1_elden_ring_2026-11-05.json" or "elden_ring_vod_backfill_2026-11-05.json")
+  if (filename) {
+    const base = path.basename(filename).replace(/\.json$/i, '').toLowerCase();
+    // Strip leading index ("1_") or "clip_" and trailing "_2026-11-05..." or "_vod_backfill_..." or "_extension_..."
+    const candidateSlug = base
+      .replace(/^\d+_/, '')
+      .replace(/^clip_/, '')
+      .replace(/_vod_backfill.*$/, '')
+      .replace(/_extension_\d{4}-\d{2}-\d{2}.*$/, '')
+      .replace(/_\d+(?:\.\d+)?m_\d{4}-\d{2}-\d{2}.*$/, '')
+      .replace(/_\d{4}-\d{2}-\d{2}.*$/, '')
+      .replace(/_part_\d+$/, '')
+      .replace(/_+/g, '_')
+      .replace(/^_|_$/g, '');
+
+    if (candidateSlug) {
+      const fileMatch = profiles.find(
+        p => p.gameName && normalizeGameSlug(p.gameName) === candidateSlug
+      );
+      if (fileMatch && fileMatch.width >= 100 && fileMatch.height >= 100) {
+        return {
+          width: fileMatch.width,
+          height: fileMatch.height,
+          matchedProfile: fileMatch.gameName.trim(),
+          isCustomProfile: true
+        };
+      }
+    }
+  }
+
+  return { width: defaultW, height: defaultH, isCustomProfile: false };
+}
+
+export function getChatRenderDimensionsForChatFile(
+  chatFilePath: string,
+  fallbackGameName?: string | null
+): { width: number; height: number; gameName: string; matchedProfile?: string; isCustomProfile: boolean } {
+  let detectedGame = (fallbackGameName || '').trim();
+  const filename = path.basename(chatFilePath);
+
+  if (chatFilePath && fs.existsSync(chatFilePath)) {
+    try {
+      const fd = fs.openSync(chatFilePath, 'r');
+      try {
+        const buf = Buffer.alloc(4096);
+        const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
+        const head = buf.toString('utf8', 0, bytesRead);
+        const gameMatch = head.match(/"game"\s*:\s*"([^"]*)"/);
+        if (gameMatch && gameMatch[1] && gameMatch[1].trim()) {
+          detectedGame = gameMatch[1].trim();
+        }
+      } finally {
+        try { fs.closeSync(fd); } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  const res = getChatRenderDimensionsForGame(detectedGame, filename);
+  return {
+    ...res,
+    gameName: detectedGame || res.matchedProfile || ''
+  };
 }
 
 let stateSaveTimeout: NodeJS.Timeout | null = null;
@@ -627,6 +771,12 @@ export function loadState(onOrphanedSession?: (session: any) => void) {
             state.config.chatRender.dispersion = "off";
           } else if (state.config.chatRender.dispersion !== "on" && state.config.chatRender.dispersion !== "off" && state.config.chatRender.dispersion !== "smart") {
             state.config.chatRender.dispersion = "smart";
+          }
+          if (!Array.isArray(state.config.chatRender.gameProfiles)) {
+            state.config.chatRender.gameProfiles = [];
+          }
+          if (!state.config.channelCaptureModes || typeof state.config.channelCaptureModes !== 'object') {
+            state.config.channelCaptureModes = {};
           }
           loadedConfig = true;
           // If we restored from a backup or alternate path, or healed a hardcoded/legacy savePath, synchronize to primary CONFIG_FILE

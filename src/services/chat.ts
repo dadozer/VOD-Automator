@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
 import WebSocket from "ws";
-import { state, addLog, updateTask, removeTask, resolveTdPath } from "./state";
+import { state, addLog, updateTask, removeTask, resolveTdPath, getChatRenderDimensionsForGame, getChatRenderDimensionsForChatFile } from "./state";
 import { postTwitchGql, fetchRecentVods } from "./twitch";
 import { fetchThirdPartyEmotes } from "./emotes";
 import { ensureFfmpeg, getVideoDurationSeconds, checkVideoIsHevc } from "./ffmpeg";
@@ -1498,8 +1498,30 @@ export function buildFragments(message: string, emotesTag: string) {
         baseArgs.push("--alternate-backgrounds");
         if (cr.altBackgroundColor) { baseArgs.push("--alt-background-color", cr.altBackgroundColor); }
       }
+      const highlightUserMap = new Map<string, string>();
+      const addHighlightUser = (u: string | undefined | null) => {
+        if (!u) return;
+        const cleaned = String(u).trim().replace(/^@/, "");
+        if (!cleaned || cleaned.toLowerCase() === "manual" || cleaned.toLowerCase() === "streamer") return;
+        const lower = cleaned.toLowerCase();
+        if (!highlightUserMap.has(lower)) {
+          highlightUserMap.set(lower, cleaned);
+        }
+      };
+      addHighlightUser(parsedInputChatData?.streamer?.name);
+      addHighlightUser(channelLogin);
+      if (Array.isArray(state.config.channels)) {
+        for (const ch of state.config.channels) {
+          addHighlightUser(ch);
+        }
+      }
       if (cr.highlightUsers && String(cr.highlightUsers).trim()) {
-        baseArgs.push("--highlight-users", String(cr.highlightUsers).trim());
+        for (const u of String(cr.highlightUsers).split(",")) {
+          addHighlightUser(u);
+        }
+      }
+      if (highlightUserMap.size > 0) {
+        baseArgs.push("--highlight-users", Array.from(highlightUserMap.values()).join(","));
         if (cr.highlightUserColor) {
           baseArgs.push("--highlight-user-color", cr.highlightUserColor);
         }
@@ -1840,11 +1862,11 @@ export function buildFragments(message: string, emotesTag: string) {
       }
     } catch (e) {}
 
-    const cr = (state.config.chatRender || {}) as any;
-    const width = customWidth || cr.width || 350;
-    const height = customHeight || cr.height || 800;
+    const resolvedProfile = getChatRenderDimensionsForChatFile(filePath);
+    const width = customWidth || resolvedProfile.width;
+    const height = customHeight || resolvedProfile.height;
 
-    addLog(`[Manual Render] Initiating manual render for ${filePath} (${width}x${height})...`);
+    addLog(`[Manual Render] Initiating manual render for ${filePath} (${width}x${height}${resolvedProfile.isCustomProfile ? ` via profile "${resolvedProfile.matchedProfile}"` : ''})...`);
     return startChatRenderMultiple(channelLogin, folderPath, [{ filename, width, height }]);
   }
 
@@ -3369,6 +3391,39 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
 
           await fs.promises.writeFile(vodOutChatPath, JSON.stringify(standalonePayload, null, 2), 'utf8');
           addLog(`[VOD Chat] Successfully generated standalone paired chat: ${vodJsonOutputName} (${standaloneComments.length} messages, duration: ${standaloneDuration}s, streamer.id: ${streamerId}).`);
+
+          // In Chat-Only mode, backfillVod is not invoked, so surface completion task & auto-render directly here
+          if (session.captureMode === 'chat_only') {
+            const vodChatTaskId = `vod_chat_backfill_${session.streamId}_${Date.now()}`;
+            updateTask(
+              vodChatTaskId,
+              `VOD Chat Backfill Complete (${vodGameName || 'Backfill'})`,
+              `Saved standalone VOD chat (${standaloneComments.length.toLocaleString()} messages) to ${session.folderPath}`,
+              "success",
+              false,
+              [
+                { label: "Render Chat", value: "render_chat" },
+                { label: "Open Folder", value: "open_folder" },
+                { label: "Close", value: "dismiss" }
+              ]
+            );
+            if (state.activeTasks[vodChatTaskId]) {
+              state.activeTasks[vodChatTaskId].folderPath = session.folderPath;
+              state.activeTasks[vodChatTaskId].channelLogin = channelLogin;
+              state.activeTasks[vodChatTaskId].captureMode = 'chat_only';
+            }
+
+            const autoRender = state.config.channelAutoRender?.[channelLogin] ?? state.config.autoRenderChat ?? session.autoRenderChat ?? false;
+            if (autoRender) {
+              const resDim = getChatRenderDimensionsForGame(vodGameName, vodJsonOutputName);
+              addLog(`[VOD Chat] Triggering automatic chat render for Chat-Only VOD backfill: ${vodJsonOutputName} (${resDim.width}x${resDim.height}${resDim.isCustomProfile ? ` via profile "${resDim.matchedProfile}"` : ''})`);
+              startChatRenderMultiple(channelLogin, session.folderPath, [
+                { filename: vodJsonOutputName, width: resDim.width, height: resDim.height }
+              ]).catch(err => {
+                addLog(`[VOD Chat Auto-Render Error] ${err.message}`);
+              });
+            }
+          }
         } catch (standaloneErr: any) {
           addLog(`[VOD Chat] Non-fatal error creating standalone backfill chat JSON: ${standaloneErr.message}`);
         }

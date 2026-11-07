@@ -3,10 +3,11 @@ import fs from "fs";
 import path from "path";
 import checkDiskSpace from "check-disk-space";
 import { spawn, exec, execFile } from "child_process";
-import { state, addLog, updateTask, removeTask, scheduleStateSave, flushStateSync, LOG_FILE, LOG_ROTATED_FILE, cleanChannelName, PROJECT_ROOT, saveConfigAtomic, getResolvedSavePath, normalizeConfigSavePath } from "../services/state";
+import { state, addLog, updateTask, removeTask, scheduleStateSave, flushStateSync, LOG_FILE, LOG_ROTATED_FILE, cleanChannelName, PROJECT_ROOT, saveConfigAtomic, getResolvedSavePath, normalizeConfigSavePath, getChatRenderDimensionsForChatFile, getChatRenderDimensionsForGame } from "../services/state";
 import { stopActiveDownload, startMonitoring, stopMonitoringTimer, backfillVod, triggerFinalizeFlow, manualSpliceGame, overrideGameSwitchBuffer, formatTimestamp, executeResumeStitchGap, executeResumeVodBackfill, refreshMediaPlaylist } from "../services/download";
 import { stitchVideoChunks, abortAllFfmpegProcesses } from "../services/video";
 import { downloadVodChat, startChatRenderMultiple, startManualChatRender, resolveLiveChatBackfill, abortAllChatProcesses, abortChatProcess } from "../services/chat";
+import type { CaptureMode, GameResolutionProfile } from "../types";
 
 export async function openFolderInOs(targetPath?: string): Promise<{ success: boolean; folderPath: string; error?: string }> {
   let resolved: string;
@@ -177,6 +178,42 @@ export function setupRoutes(app: express.Application) {
 
       const validModModes = ['Strikethrough', 'ReplaceDeleted', 'Hide', 'Off'];
       if (!validModModes.includes(cr.moderationMode)) cr.moderationMode = 'Strikethrough';
+
+      // Sanitize per-game resolution profiles
+      if (Array.isArray(cr.gameProfiles)) {
+        const deduped = new Map<string, GameResolutionProfile>();
+        for (const item of cr.gameProfiles) {
+          if (!item || typeof item.gameName !== 'string') continue;
+          const cleanGame = item.gameName.trim();
+          if (!cleanGame) continue;
+          const rawW = Math.round(toNum(item.width, cr.width || 350, 100, 7680));
+          const rawH = Math.round(toNum(item.height, cr.height || 800, 100, 7680));
+          const evenW = rawW % 2 !== 0 ? rawW + 1 : rawW;
+          const evenH = rawH % 2 !== 0 ? rawH + 1 : rawH;
+          deduped.set(cleanGame.toLowerCase(), {
+            gameName: cleanGame,
+            width: evenW,
+            height: evenH
+          });
+        }
+        cr.gameProfiles = Array.from(deduped.values());
+      } else {
+        cr.gameProfiles = [];
+      }
+    }
+
+    if (state.config.channelCaptureModes && typeof state.config.channelCaptureModes === 'object') {
+      const sanitizedModes: Record<string, CaptureMode> = {};
+      const validCaptureModes: CaptureMode[] = ['both', 'video_only', 'chat_only'];
+      for (const [ch, mode] of Object.entries(state.config.channelCaptureModes)) {
+        const cleaned = cleanChannelName(ch);
+        if (cleaned && validCaptureModes.includes(mode as CaptureMode)) {
+          sanitizedModes[cleaned] = mode as CaptureMode;
+        }
+      }
+      state.config.channelCaptureModes = sanitizedModes;
+    } else {
+      state.config.channelCaptureModes = {};
     }
 
     if (Array.isArray(state.config.channels)) {
@@ -355,6 +392,7 @@ export function setupRoutes(app: express.Application) {
             viewersCount: session.viewersCount,
             previewImageUrl: session.previewImageUrl,
             autoRenderChat: session.autoRenderChat,
+            captureMode: session.captureMode || state.config.channelCaptureModes?.[cleanChannelName(session.channel)] || 'both',
             commentsWritten: session.commentsWritten || 0,
             eventsWritten: session.eventsWritten || 0,
             games: session.games || [],
@@ -396,6 +434,102 @@ export function setupRoutes(app: express.Application) {
       success: true, 
       channel: cleaned,
       enabled: state.config.channelAutoRender[cleaned],
+      config: state.config
+    });
+  });
+
+  app.post("/api/sessions/:channel/capture-mode", async (req, res) => {
+    const { channel } = req.params;
+    const rawMode = req.body?.captureMode ?? req.body?.mode;
+    const mode = typeof rawMode === 'string' ? (rawMode.trim() as CaptureMode) : undefined;
+    const cleaned = cleanChannelName(channel);
+    if (!cleaned) {
+      return res.status(400).json({ error: "Invalid channel name" });
+    }
+
+    const validModes: CaptureMode[] = ['both', 'video_only', 'chat_only'];
+    if (!mode || !validModes.includes(mode)) {
+      return res.status(400).json({ error: "Invalid capture mode. Must be 'both', 'video_only', or 'chat_only'." });
+    }
+
+    // Enforce pre-stream / monitoring-disabled rule: reject changes while an active live stream is currently recording
+    const matchingKey = Object.keys(state.activeDownloadSessions).find(k => cleanChannelName(k) === cleaned);
+    if (matchingKey && state.activeDownloadSessions[matchingKey]) {
+      return res.status(400).json({
+        error: `Cannot change capture mode while @${cleaned} is actively recording live. Stop monitoring first.`
+      });
+    }
+
+    if (!state.config.channelCaptureModes) {
+      state.config.channelCaptureModes = {};
+    }
+    state.config.channelCaptureModes[cleaned] = mode;
+
+    const modeLabel = mode === 'video_only' ? 'Video Only' : mode === 'chat_only' ? 'Chat Only' : 'Video + Chat';
+    addLog(`[Capture Mode] Set @${cleaned} capture mode to "${modeLabel}".`);
+
+    scheduleStateSave();
+    try {
+      await saveConfigAtomic(state.config);
+    } catch (err) {
+      console.error("Failed to save config.json", err);
+    }
+
+    return res.json({
+      success: true,
+      channel: cleaned,
+      mode,
+      config: state.config
+    });
+  });
+
+  app.post("/api/game-profiles", async (req, res) => {
+    const { gameName, width, height, remove } = req.body || {};
+    if (!gameName || typeof gameName !== 'string' || !gameName.trim()) {
+      return res.status(400).json({ error: "gameName is required" });
+    }
+
+    const cleanGame = gameName.trim();
+    if (!state.config.chatRender) {
+      state.config.chatRender = { width: 350, height: 800 } as any;
+    }
+    if (!Array.isArray(state.config.chatRender!.gameProfiles)) {
+      state.config.chatRender!.gameProfiles = [];
+    }
+
+    const profiles = state.config.chatRender!.gameProfiles!;
+    const existingIdx = profiles.findIndex(p => p.gameName.trim().toLowerCase() === cleanGame.toLowerCase());
+
+    if (remove) {
+      if (existingIdx !== -1) {
+        profiles.splice(existingIdx, 1);
+        addLog(`[Game Profile] Removed custom chat render resolution profile for "${cleanGame}".`);
+      }
+    } else {
+      const parsedW = parseInt(String(width), 10);
+      const parsedH = parseInt(String(height), 10);
+      const rawW = Number.isFinite(parsedW) ? Math.max(100, Math.min(7680, parsedW)) : (state.config.chatRender!.width || 350);
+      const rawH = Number.isFinite(parsedH) ? Math.max(100, Math.min(7680, parsedH)) : (state.config.chatRender!.height || 800);
+      const evenW = rawW % 2 !== 0 ? rawW + 1 : rawW;
+      const evenH = rawH % 2 !== 0 ? rawH + 1 : rawH;
+
+      if (existingIdx !== -1) {
+        profiles[existingIdx] = { gameName: cleanGame, width: evenW, height: evenH };
+      } else {
+        profiles.push({ gameName: cleanGame, width: evenW, height: evenH });
+      }
+      addLog(`[Game Profile] Saved chat render resolution profile for "${cleanGame}": ${evenW}x${evenH}px.`);
+    }
+
+    try {
+      await saveConfigAtomic(state.config);
+    } catch (err) {
+      console.error("Failed to save config.json", err);
+    }
+
+    return res.json({
+      success: true,
+      gameProfiles: state.config.chatRender!.gameProfiles,
       config: state.config
     });
   });
@@ -548,15 +682,47 @@ export function setupRoutes(app: express.Application) {
   app.get('/api/tasks/:taskId/chat-files', (req, res) => {
     const { taskId } = req.params;
     const task = state.activeTasks[taskId];
-    if (!task || !task.folderPath) return res.json({ files: [] });
+    if (!task || !task.folderPath) return res.json({ files: [], fileDetails: [] });
     try {
       if (fs.existsSync(task.folderPath)) {
         const files = fs.readdirSync(task.folderPath);
         const jsonFiles = files.filter(f => f.endsWith('.json') && !f.startsWith('session_'));
-        return res.json({ files: jsonFiles });
+        const fileDetails = jsonFiles.map(f => {
+          const fullPath = path.join(task.folderPath!, f);
+          const resolved = getChatRenderDimensionsForChatFile(fullPath, task.gameName || task.currentGameName);
+          return {
+            filename: f,
+            width: resolved.width,
+            height: resolved.height,
+            gameName: resolved.gameName,
+            matchedProfile: resolved.matchedProfile,
+            isCustomProfile: resolved.isCustomProfile
+          };
+        });
+        return res.json({ files: jsonFiles, fileDetails });
       }
     } catch (e) {}
-    res.json({ files: [] });
+    res.json({ files: [], fileDetails: [] });
+  });
+
+  app.post('/api/chat-file-profile', (req, res) => {
+    const { filePath } = req.body || {};
+    if (!filePath || typeof filePath !== 'string') {
+      return res.json(getChatRenderDimensionsForGame(null, null));
+    }
+    const trimmed = filePath.trim().replace(/^["']|["']$/g, '');
+    const baseSavePath = getResolvedSavePath();
+    let candidate = trimmed;
+    if (!path.isAbsolute(candidate)) {
+      const saveCandidate = path.resolve(baseSavePath, candidate);
+      const rootCandidate = path.resolve(PROJECT_ROOT, candidate);
+      if (fs.existsSync(saveCandidate)) candidate = saveCandidate;
+      else if (fs.existsSync(rootCandidate)) candidate = rootCandidate;
+    }
+    if (fs.existsSync(candidate)) {
+      return res.json(getChatRenderDimensionsForChatFile(candidate));
+    }
+    return res.json(getChatRenderDimensionsForGame(null, path.basename(trimmed)));
   });
 
   app.post('/api/tasks/dismiss-completed', (req, res) => {
@@ -580,20 +746,30 @@ export function setupRoutes(app: express.Application) {
     }
 
     if (taskId.startsWith('prompt_backfill_')) {
+      const captureMode: CaptureMode =
+        task.captureMode ||
+        (task.channelLogin && state.activeDownloadSessions[task.channelLogin]?.captureMode) ||
+        (task.channelLogin ? state.config.channelCaptureModes?.[cleanChannelName(task.channelLogin)] : undefined) ||
+        'both';
+
       if (action === 'backfill_full' || action === 'yes') {
-        addLog(`[Backfill] User accepted Full VOD & Chat backfill.`);
-        const chatPromise = resolveLiveChatBackfill(task.channelLogin!, 'full', 0).catch(err => {
-          addLog(`[Chat Backfill Error] ${err.message}`);
-        });
-        if (state.activeDownloadSessions[task.channelLogin!]) {
-          state.activeDownloadSessions[task.channelLogin!].activeChatBackfillPromise = chatPromise;
+        addLog(`[Backfill] User accepted Full backfill (mode: ${captureMode}).`);
+        if (captureMode !== 'video_only') {
+          const chatPromise = resolveLiveChatBackfill(task.channelLogin!, 'full', 0).catch(err => {
+            addLog(`[Chat Backfill Error] ${err.message}`);
+          });
+          if (state.activeDownloadSessions[task.channelLogin!]) {
+            state.activeDownloadSessions[task.channelLogin!].activeChatBackfillPromise = chatPromise;
+          }
         }
-        backfillVod(task.channelLogin!, task.streamId!, task.folderPath!, {
-          mode: 'full',
-          chapters: task.chapters
-        }).catch(err => {
-          addLog(`[Backfill] Unhandled error: ${err.message}`);
-        });
+        if (captureMode !== 'chat_only') {
+          backfillVod(task.channelLogin!, task.streamId!, task.folderPath!, {
+            mode: 'full',
+            chapters: task.chapters
+          }).catch(err => {
+            addLog(`[Backfill] Unhandled error: ${err.message}`);
+          });
+        }
         removeTask(taskId);
       } else if (action === 'backfill_current_game') {
         const bufferMins = (state.config.gameSwitchBufferMins ?? 5);
@@ -601,26 +777,32 @@ export function setupRoutes(app: express.Application) {
         const rawOffset = task.chapterRawStartOffset ?? task.currentGameStartOffset ?? 0;
         const finalStartOffset = task.currentGameStartOffset ?? Math.max(0, rawOffset - bufferSec);
 
-        addLog(`[Backfill] User accepted Current Game Only backfill (${task.currentGameName || 'Current Game'}) from ${formatTimestamp(finalStartOffset)} (${bufferMins}m buffer applied).`);
-        const chatPromise = resolveLiveChatBackfill(task.channelLogin!, 'current_game', finalStartOffset, task.currentGameName).catch(err => {
-          addLog(`[Chat Backfill Error] ${err.message}`);
-        });
-        if (state.activeDownloadSessions[task.channelLogin!]) {
-          state.activeDownloadSessions[task.channelLogin!].activeChatBackfillPromise = chatPromise;
+        addLog(`[Backfill] User accepted Current Game Only backfill (${task.currentGameName || 'Current Game'}, mode: ${captureMode}) from ${formatTimestamp(finalStartOffset)} (${bufferMins}m buffer applied).`);
+        if (captureMode !== 'video_only') {
+          const chatPromise = resolveLiveChatBackfill(task.channelLogin!, 'current_game', finalStartOffset, task.currentGameName).catch(err => {
+            addLog(`[Chat Backfill Error] ${err.message}`);
+          });
+          if (state.activeDownloadSessions[task.channelLogin!]) {
+            state.activeDownloadSessions[task.channelLogin!].activeChatBackfillPromise = chatPromise;
+          }
         }
-        backfillVod(task.channelLogin!, task.streamId!, task.folderPath!, {
-          mode: 'current_game',
-          startOffsetSec: finalStartOffset,
-          gameName: task.currentGameName
-        }).catch(err => {
-          addLog(`[Backfill] Unhandled error: ${err.message}`);
-        });
+        if (captureMode !== 'chat_only') {
+          backfillVod(task.channelLogin!, task.streamId!, task.folderPath!, {
+            mode: 'current_game',
+            startOffsetSec: finalStartOffset,
+            gameName: task.currentGameName
+          }).catch(err => {
+            addLog(`[Backfill] Unhandled error: ${err.message}`);
+          });
+        }
         removeTask(taskId);
       } else if (action === 'backfill_none' || action === 'no' || action === 'dismiss') {
         addLog(`[Backfill] User chose No Backfill. Continuing live recording.`);
-        resolveLiveChatBackfill(task.channelLogin!, 'none', 0).catch(err => {
-          addLog(`[Chat Backfill Error] ${err.message}`);
-        });
+        if (captureMode !== 'video_only') {
+          resolveLiveChatBackfill(task.channelLogin!, 'none', 0).catch(err => {
+            addLog(`[Chat Backfill Error] ${err.message}`);
+          });
+        }
         removeTask(taskId);
       }
       return res.json({ success: true });
