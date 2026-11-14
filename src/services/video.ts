@@ -4,6 +4,7 @@ import { spawn, ChildProcess } from "child_process";
 import { Parser } from "m3u8-parser";
 import { state, addLog, updateTask, removeTask, resolveTdPath, getChatRenderDimensionsForGame, cleanChannelName } from "./state";
 import { startChatRenderMultiple, safeParseChatData, repairChatJsonFile, sliceAndCarryOverBroadcastEvents, getEventsSidecarPath, flushPendingChatWrites } from "./chat";
+import { populateEmbeddedDataForChat } from "./emotes";
 import { ensureFfmpeg, getVideoDurationSeconds } from "./ffmpeg";
 import { twitchAxios, getSourceMediaPlaylistUrl, fetchRecentVods, fetchInitSegmentFromTwitch, inspectMp4InitBuffer } from "./twitch";
 
@@ -765,11 +766,23 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
       // 2. If not already written, slice from the master chat file as fallback
       if (captureMode !== 'video_only' && !pairedChatReady && vodChatFilePath && fs.existsSync(vodChatFilePath)) {
         try {
-          // Ensure any unclosed or malformed comments in the master chat file are sealed and clean
-          await repairChatJsonFile(vodChatFilePath);
+          if (session) {
+            flushPendingChatWrites(session);
+          }
+          // Never seal/overwrite the master chat file in place while a live recording stream is actively appending to it
+          const isLiveChatOpen = Boolean(
+            session &&
+            !(session as any).isStopped &&
+            session.chatStream &&
+            session.chatFilePath &&
+            path.resolve(session.chatFilePath) === path.resolve(vodChatFilePath)
+          );
+          if (!isLiveChatOpen) {
+            await repairChatJsonFile(vodChatFilePath);
+          }
 
           const chatDataRaw = await fs.promises.readFile(vodChatFilePath, 'utf8');
-          const chatData = safeParseChatData(chatDataRaw);
+          const chatData = safeParseChatData(chatDataRaw, vodChatFilePath);
           if (chatData && Array.isArray(chatData.comments)) {
             const vodStartOffsetSec = taskObj?.vodStartOffsetSec || 0;
             const fallbackChunkDur = (taskObj as any)?.vodAvgSegmentDuration || 2;
@@ -821,6 +834,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
                 twitchBadges: []
               };
             }
+            await populateEmbeddedDataForChat(vodChatPayload, channelLogin, vodChatPayload.streamer?.id);
 
             await fs.promises.writeFile(vodOutChatPath, JSON.stringify(vodChatPayload, null, 2));
             addLog(`[VOD Chat] Generated paired chat file: ${vodJsonOutputName} (${filteredComments.length}/${chatData.comments.length} messages, duration: ${finalDurationSec}s, range: ${vodStartOffsetSec}s - ${vodEndOffsetSec.toFixed(1)}s)`);
@@ -951,6 +965,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
                   twitchBadges: []
                 };
               }
+              await populateEmbeddedDataForChat(newChatData, channelLogin, newChatData.streamer?.id);
 
               const outChatPath = path.join(folderPath, chatOutputName);
               await fs.promises.writeFile(outChatPath, JSON.stringify(newChatData, null, 2));
@@ -1069,6 +1084,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
                   twitchBadges: []
                 };
               }
+              await populateEmbeddedDataForChat(newChatData, channelLogin, newChatData.streamer?.id);
 
               const outChatPath = path.join(folderPath, `${i + 1}_${cleanName}_${dateStr}.json`);
               await fs.promises.writeFile(outChatPath, JSON.stringify(newChatData, null, 2));
@@ -1231,6 +1247,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
                 twitchBadges: []
               };
             }
+            await populateEmbeddedDataForChat(newChatData, channelLogin, newChatData.streamer?.id);
 
             const outChatPath = path.join(folderPath, chatOutputName);
             await fs.promises.writeFile(outChatPath, JSON.stringify(newChatData, null, 2));
@@ -1469,6 +1486,7 @@ async function executeStitchVideoChunks(folderPath: string, type: 'all' | 'live'
                 twitchBadges: []
               };
             }
+            await populateEmbeddedDataForChat(newChatData, channelLogin, newChatData.streamer?.id);
 
             const outChatPath = path.join(folderPath, `${i + 1}_${cleanName}_${dateStr}.json`);
             await fs.promises.writeFile(outChatPath, JSON.stringify(newChatData, null, 2));

@@ -4,7 +4,13 @@ import { spawn } from "child_process";
 import WebSocket from "ws";
 import { state, addLog, updateTask, removeTask, resolveTdPath, getChatRenderDimensionsForGame, getChatRenderDimensionsForChatFile } from "./state";
 import { postTwitchGql, fetchRecentVods } from "./twitch";
-import { fetchThirdPartyEmotes } from "./emotes";
+import {
+  fetchThirdPartyEmotes,
+  extractUsedEmotesAndBadgesFromComments,
+  fetchFirstPartyEmotesFromMap,
+  fetchTwitchBadgesFromMap,
+  populateEmbeddedDataForChat
+} from "./emotes";
 import { ensureFfmpeg, getVideoDurationSeconds, checkVideoIsHevc } from "./ffmpeg";
 
 import type { ChatBroadcastEvent } from "../types";
@@ -162,6 +168,7 @@ export function sliceAndCarryOverBroadcastEvents(
   const activePredictionsBeforeStart = new Map<string, ChatBroadcastEvent>();
   const activePollsBeforeStart = new Map<string, ChatBroadcastEvent>();
   const activePinsBeforeStart = new Map<string, ChatBroadcastEvent>();
+  let activeHypeTrainBeforeStart: ChatBroadcastEvent | null = null;
   const sliced: ChatBroadcastEvent[] = [];
 
   for (const evt of events) {
@@ -199,7 +206,24 @@ export function sliceAndCarryOverBroadcastEvents(
         if (evt.category === 'unpin_message' || evt.data?.action === 'unpin-message') {
           activePinsBeforeStart.delete(pinId);
         } else {
-          activePinsBeforeStart.set(pinId, evt);
+          const prevPin = activePinsBeforeStart.get(pinId);
+          if (prevPin) {
+            const mergedPin: ChatBroadcastEvent = JSON.parse(JSON.stringify(prevPin));
+            mergedPin.data = { ...mergedPin.data, ...evt.data };
+            activePinsBeforeStart.set(pinId, mergedPin);
+          } else {
+            activePinsBeforeStart.set(pinId, evt);
+          }
+        }
+      } else if (evtType === 'hype_train') {
+        if (evt.category === 'hype_train_end' || evt.data?.pubsub_type === 'hype-train-end' || evt.data?.ended_at) {
+          activeHypeTrainBeforeStart = null;
+        } else if (activeHypeTrainBeforeStart) {
+          const mergedTrain: ChatBroadcastEvent = JSON.parse(JSON.stringify(activeHypeTrainBeforeStart));
+          mergedTrain.data = { ...mergedTrain.data, ...evt.data };
+          activeHypeTrainBeforeStart = mergedTrain;
+        } else {
+          activeHypeTrainBeforeStart = evt;
         }
       }
     } else if (streamTime >= videoStartOffset && streamTime <= videoEndOffset) {
@@ -229,6 +253,14 @@ export function sliceAndCarryOverBroadcastEvents(
   }
   for (const [, pinEvt] of activePinsBeforeStart) {
     const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(pinEvt));
+    cloned._id = `${cloned._id}_carryover_${Math.round(videoStartOffset)}`;
+    if (!cloned.type) cloned.type = cloned.event_type;
+    cloned.content_offset_seconds = 0;
+    cloned.carried_over = true;
+    carriedOver.push(cloned);
+  }
+  if (activeHypeTrainBeforeStart) {
+    const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(activeHypeTrainBeforeStart));
     cloned._id = `${cloned._id}_carryover_${Math.round(videoStartOffset)}`;
     if (!cloned.type) cloned.type = cloned.event_type;
     cloned.content_offset_seconds = 0;
@@ -354,6 +386,8 @@ export function buildFragments(message: string, emotesTag: string) {
 
       // 3. Fetch Chat Messages
       const processedIds = new Set<string>();
+      const vodUsedEmotes = new Map<string, string>();
+      const vodUsedBadges = new Map<string, Set<string>>();
       let cursor = "";
       let contentOffset = startOffset || 0.0;
       let pageCount = 0;
@@ -547,10 +581,12 @@ export function buildFragments(message: string, emotesTag: string) {
                 _id: b.setID,
                 version: b.version
               })) : [],
-              user_color: node.message.userColor || "#808080",
+              user_color: node.message.userColor || null,
               user_notice_params: {}
             }
           };
+
+          extractUsedEmotesAndBadgesFromComments([tdComment], undefined, vodUsedEmotes, vodUsedBadges);
           
           if (isBackfill) {
             backfillComments.push(tdComment);
@@ -593,12 +629,12 @@ export function buildFragments(message: string, emotesTag: string) {
       }
 
       if (!isBackfill) {
-        updateTask(taskId, "Downloading VOD Chat", `Downloaded ${commentsWritten} total messages. Finalizing JSON...`);
+        updateTask(taskId, "Downloading VOD Chat", `Downloaded ${commentsWritten} total messages. Embedding emotes & badges...`);
       }
       addLog(`[Chat] Finished downloading ${commentsWritten} messages.`);
 
       if (isBackfill) {
-        return { backfillComments, commentsWritten, processedIds, videoLength };
+        return { backfillComments, commentsWritten, processedIds, videoLength, vodUsedEmotes, vodUsedBadges };
       }
 
       const dummyMessage = {
@@ -633,11 +669,16 @@ export function buildFragments(message: string, emotesTag: string) {
       chatStream?.write(prefix + JSON.stringify(dummyMessage));
       commentsWritten++;
 
+      const [firstPartyEmotes, twitchBadges] = await Promise.all([
+        fetchFirstPartyEmotesFromMap(vodUsedEmotes),
+        fetchTwitchBadgesFromMap(channelLogin, twitchId, vodUsedBadges)
+      ]);
+
       // 4. Construct Final JSON
       chatStream?.write('],"embeddedData":' + JSON.stringify({
         thirdParty: thirdPartyEmotes,
-        firstParty: [],
-        twitchBadges: []
+        firstParty: firstPartyEmotes,
+        twitchBadges
       }) + '}');
       
       chatStream?.end();
@@ -720,6 +761,12 @@ export function buildFragments(message: string, emotesTag: string) {
           }
         }
       } else if (ch === ']' && braceDepth === 0) {
+        // If a premature mid-stream seal wrote a closing ']' followed by additional live comments,
+        // return -1 so safeParseChatData falls back to full-file comment extraction across the seam.
+        const remainder = content.substring(i + 1);
+        if (/"content_offset_seconds"\s*:\s*[\d.]+/.test(remainder) && /"commenter"\s*:\s*\{/.test(remainder)) {
+          return -1;
+        }
         break;
       }
     }
@@ -796,7 +843,13 @@ export function buildFragments(message: string, emotesTag: string) {
             commentStart = -1;
             try {
               const commentObj = JSON.parse(rawComment);
-              if (commentObj && commentObj._id && commentObj._id !== "dummy-end-message" && !seenIds.has(commentObj._id)) {
+              if (
+                commentObj &&
+                commentObj._id &&
+                commentObj._id !== "dummy-end-message" &&
+                (commentObj.message || commentObj.commenter) &&
+                !seenIds.has(commentObj._id)
+              ) {
                 seenIds.add(commentObj._id);
                 comments.push(commentObj);
               }
@@ -805,8 +858,6 @@ export function buildFragments(message: string, emotesTag: string) {
             }
           }
         }
-      } else if (ch === ']' && braceDepth === 0) {
-        break;
       }
     }
 
@@ -897,6 +948,15 @@ export function buildFragments(message: string, emotesTag: string) {
   export async function repairChatJsonFile(filePath: string): Promise<boolean> {
     if (!fs.existsSync(filePath)) return false;
     try {
+      const resolvedTarget = path.resolve(filePath);
+      const activeOpenSession = Object.values(state.activeDownloadSessions).find(
+        (s: any) => s && !s.isStopped && s.chatStream && s.chatFilePath && path.resolve(s.chatFilePath) === resolvedTarget
+      );
+      if (activeOpenSession) {
+        addLog(`[Chat Repair] Skipping in-place file seal on active open live chat stream: ${path.basename(filePath)} (@${activeOpenSession.channel}).`);
+        return true;
+      }
+
       const raw = await fs.promises.readFile(filePath, 'utf8');
       let parsed: any = null;
       let needsResave = false;
@@ -1247,7 +1307,7 @@ export function buildFragments(message: string, emotesTag: string) {
       let chatFile = segment.filename;
       
       if (!chatFile) {
-         chatFile = files.find(f => f.endsWith('.json') && (f.startsWith('chat_') || f.startsWith('vod_chat'))) || "";
+         chatFile = files.find(f => f.endsWith('.json') && !f.includes('_backup_') && (f.startsWith('chat_') || f.startsWith('vod_chat'))) || "";
       }
       
       if (!chatFile) {
@@ -1883,6 +1943,14 @@ export function flushPendingChatWrites(session: any) {
   const batch = session.pendingChatWrites;
   session.pendingChatWrites = [];
 
+  if (!session.usedFirstPartyEmotes) {
+    session.usedFirstPartyEmotes = new Map<string, string>();
+  }
+  if (!session.usedTwitchBadges) {
+    session.usedTwitchBadges = new Map<string, Set<string>>();
+  }
+  extractUsedEmotesAndBadgesFromComments(batch, undefined, session.usedFirstPartyEmotes, session.usedTwitchBadges);
+
   let batchStr = "";
   for (let i = 0; i < batch.length; i++) {
     if (session.commentsWritten > 0 || i > 0) {
@@ -2006,19 +2074,38 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
             isRecovery = true;
             addLog(`[Chat Recovery] Found existing chat file. Resuming from offset ${recoveredOffset.toFixed(1)}s (${recoveredCommentsWritten} messages, ${existingIds.size} unique IDs).`);
           } else {
+            const fallbackExtracted = extractChatCommentsFallback(contentToScan);
             const openCommentsEnd = commentsStartMatch.index + commentsStartMatch[0].length;
-            let fd: number | null = null;
-            try {
-              fd = fs.openSync(chatFilePath, 'r+');
-              fs.ftruncateSync(fd, Buffer.byteLength(content.substring(0, openCommentsEnd), 'utf8'));
-            } finally {
-              if (fd !== null) {
-                try { fs.closeSync(fd); } catch (e) {}
+            if (fallbackExtracted && Array.isArray(fallbackExtracted.comments) && fallbackExtracted.comments.length > 0) {
+              const headerPrefix = content.substring(0, openCommentsEnd);
+              const rebuiltComments = fallbackExtracted.comments
+                .map((c: any, idx: number) => (idx === 0 ? "\n    " : ",\n    ") + JSON.stringify(c))
+                .join("");
+              fs.writeFileSync(chatFilePath, headerPrefix + rebuiltComments, 'utf8');
+              for (const c of fallbackExtracted.comments) {
+                if (c._id && c._id !== "dummy-end-message") {
+                  existingIds.add(c._id);
+                }
               }
+              const lastComment = fallbackExtracted.comments[fallbackExtracted.comments.length - 1];
+              recoveredOffset = parseFloat(String(lastComment?.content_offset_seconds || 0));
+              recoveredCommentsWritten = fallbackExtracted.comments.length;
+              isRecovery = true;
+              addLog(`[Chat Recovery] Reconstructed multi-segment chat file across mid-stream seal. Resuming from offset ${recoveredOffset.toFixed(1)}s (${recoveredCommentsWritten} messages, ${existingIds.size} unique IDs).`);
+            } else {
+              let fd: number | null = null;
+              try {
+                fd = fs.openSync(chatFilePath, 'r+');
+                fs.ftruncateSync(fd, Buffer.byteLength(content.substring(0, openCommentsEnd), 'utf8'));
+              } finally {
+                if (fd !== null) {
+                  try { fs.closeSync(fd); } catch (e) {}
+                }
+              }
+              recoveredCommentsWritten = 0;
+              isRecovery = true;
+              addLog(`[Chat Recovery] Found existing chat file header without messages. Ready for recording.`);
             }
-            recoveredCommentsWritten = 0;
-            isRecovery = true;
-            addLog(`[Chat Recovery] Found existing chat file header without messages. Ready for recording.`);
           }
         }
       } catch (e: any) {
@@ -2214,6 +2301,22 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
     }
 
     const enqueueComment = (tdComment: any) => {
+      const curSessionForTrack = state.activeDownloadSessions[channelLogin];
+      if (curSessionForTrack) {
+        if (!curSessionForTrack.usedFirstPartyEmotes) {
+          curSessionForTrack.usedFirstPartyEmotes = new Map<string, string>();
+        }
+        if (!curSessionForTrack.usedTwitchBadges) {
+          curSessionForTrack.usedTwitchBadges = new Map<string, Set<string>>();
+        }
+        extractUsedEmotesAndBadgesFromComments(
+          [tdComment],
+          undefined,
+          curSessionForTrack.usedFirstPartyEmotes,
+          curSessionForTrack.usedTwitchBadges
+        );
+      }
+
       if (isBackfilling || state.activeDownloadSessions[channelLogin]?.isAwaitingBackfillChoice) {
         liveBuffer.push(tdComment);
       } else if (state.activeDownloadSessions[channelLogin]) {
@@ -2486,7 +2589,7 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
                 fragments: buildFragments(msgBody, emotesTag),
                 is_action: isAction,
                 user_badges: parseBadges(parsed.tags.badges || ""),
-                user_color: parsed.tags.color || "#FFFFFF",
+                user_color: parsed.tags.color || null,
                 bits_spent: bitsSpent,
                 user_notice_params: userNoticeParams
               },
@@ -2518,11 +2621,40 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
 
             const loginName = parsed.tags['login'] || parsed.username || "twitch";
             const displayName = parsed.tags['display-name'] || loginName || "Twitch";
-            const commentEventType = msgId === 'announcement'
-              ? 'announcement'
-              : msgId === 'raid'
-              ? 'raid'
-              : 'usernotice';
+            const userId = parsed.tags['user-id'] || "0";
+            const originId = parsed.tags['msg-param-origin-id'] || "";
+
+            // Resolve sender lifetime gift count across submysterygift and child subgift notices
+            const rawSenderCountStr = parsed.tags['msg-param-sender-count'] ?? parsed.tags['msg-param-cumulative-gift-count'];
+            const parsedSenderCount = rawSenderCountStr !== undefined && rawSenderCountStr !== ""
+              ? parseInt(rawSenderCountStr, 10)
+              : NaN;
+
+            let effectiveSenderCount: number | null = (!isNaN(parsedSenderCount) && parsedSenderCount > 0)
+              ? parsedSenderCount
+              : null;
+
+            if (effectiveSenderCount !== null) {
+              if (originId) gifterSenderCountCache.set(`origin:${originId}`, effectiveSenderCount);
+              if (userId && userId !== "0") gifterSenderCountCache.set(`uid:${userId}`, effectiveSenderCount);
+              if (loginName && loginName !== "twitch") gifterSenderCountCache.set(`login:${loginName.toLowerCase()}`, effectiveSenderCount);
+            } else if (msgId === 'subgift' || msgId === 'submysterygift' || msgId === 'communitypayforward') {
+              const cachedCount =
+                (originId ? gifterSenderCountCache.get(`origin:${originId}`) : undefined) ??
+                (userId && userId !== "0" ? gifterSenderCountCache.get(`uid:${userId}`) : undefined) ??
+                (loginName ? gifterSenderCountCache.get(`login:${loginName.toLowerCase()}`) : undefined);
+              if (cachedCount !== undefined && cachedCount > 0) {
+                effectiveSenderCount = cachedCount;
+              }
+            }
+
+            if (effectiveSenderCount !== null && effectiveSenderCount > 0) {
+              userNoticeParams['msg-param-sender-count'] = String(effectiveSenderCount);
+            } else if (userNoticeParams['msg-param-sender-count'] === '0' || userNoticeParams['msg-param-sender-count'] === '') {
+              delete userNoticeParams['msg-param-sender-count'];
+            }
+
+            const commentEventType = 'usernotice';
 
             const tdNoticeComment: any = {
               _id: parsed.tags.id || `usernotice-${chatSentTs}-${Math.random().toString(36).slice(2, 8)}`,
@@ -2534,7 +2666,7 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
               content_offset_seconds: contentOffsetSeconds,
               commenter: {
                 display_name: displayName,
-                _id: parsed.tags['user-id'] || "0",
+                _id: userId,
                 name: loginName,
                 type: "user",
                 bio: "",
@@ -2551,7 +2683,7 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
                 fragments,
                 is_action: false,
                 user_badges: parseBadges(parsed.tags.badges || ""),
-                user_color: parsed.tags.color || "#9146FF",
+                user_color: parsed.tags.color || null,
                 bits_spent: 0,
                 user_notice_params: userNoticeParams
               },
@@ -2572,7 +2704,7 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
                 recipient_user_login: parsed.tags['msg-param-recipient-user-name'] || null,
                 recipient_display_name: parsed.tags['msg-param-recipient-display-name'] || null,
                 mass_gift_count: parsed.tags['msg-param-mass-gift-count'] ? parseInt(parsed.tags['msg-param-mass-gift-count'], 10) : null,
-                sender_total_gifts: parsed.tags['msg-param-sender-count'] ? parseInt(parsed.tags['msg-param-sender-count'], 10) : null,
+                sender_total_gifts: effectiveSenderCount,
                 raid_viewer_count: parsed.tags['msg-param-viewerCount'] ? parseInt(parsed.tags['msg-param-viewerCount'], 10) : null,
                 raid_display_name: parsed.tags['msg-param-displayName'] || null,
                 milestone_category: parsed.tags['msg-param-category'] || null,
@@ -2761,6 +2893,10 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
     // Companion Twitch PubSub WebSocket Client for Predictions, Polls, Pinned Messages, Channel Points, Hype Trains & Raids
     const lastPredictionTracker = new Map<string, { sig: string; ts: number; status: string }>();
     const lastPollTracker = new Map<string, { sig: string; ts: number; status: string }>();
+    const activePinnedChatTracker = new Map<string, Record<string, any>>();
+    let latestActivePinId: string | null = null;
+    let activeHypeTrainState: Record<string, any> | null = null;
+    const gifterSenderCountCache = new Map<string, number>();
     const rewardMetadataCache = new Map<string, { title: string; cost: number; prompt: string; background_color: string }>();
     const lastRoomState: {
       emote_only?: boolean;
@@ -3011,7 +3147,6 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
         if (topic.startsWith('pinned-chat-updates-v1.')) {
           const d = inner?.data;
           if (!d) return;
-          const pinId = String(d.id || d.pin_id || `pin-${nowMs}`);
           const rawAction = inner.type === 'unpin-message'
             ? 'unpin-message'
             : inner.type === 'update-message'
@@ -3023,16 +3158,122 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
             ? 'update_pinned_message'
             : 'pin_message';
 
+          const incomingPinId = d.id || d.pin_id || null;
+          const pinId = String(incomingPinId || latestActivePinId || `pin-${nowMs}`);
+          const prevPinState = activePinnedChatTracker.get(pinId) || (latestActivePinId ? activePinnedChatTracker.get(latestActivePinId) : undefined);
+
           const msgObj = d.message || {};
           if (category === 'pin_message') {
             addLog(`[PubSub] Message pinned on @${channelLogin} by ${d.pinned_by?.display_name || 'Moderator'}: "${msgObj.content?.text || ''}"`);
           }
 
-          const pinType = d.type || msgObj.type || 'MOD_PIN';
-          const senderBadges = Array.isArray(msgObj.sender?.badges) ? msgObj.sender.badges.map((b: any) => ({
+          const hasSenderBadges = Array.isArray(msgObj.sender?.badges);
+          const senderBadges = hasSenderBadges ? msgObj.sender.badges.map((b: any) => ({
             _id: b.id || b._id || b.setID || "",
             version: String(b.version || "1")
-          })) : [];
+          })) : undefined;
+
+          if (senderBadges && senderBadges.length > 0) {
+            if (!curSession.usedTwitchBadges) {
+              curSession.usedTwitchBadges = new Map<string, Set<string>>();
+            }
+            for (const b of senderBadges) {
+              if (b._id && b.version) {
+                if (!curSession.usedTwitchBadges.has(b._id)) {
+                  curSession.usedTwitchBadges.set(b._id, new Set<string>());
+                }
+                curSession.usedTwitchBadges.get(b._id)!.add(b.version);
+              }
+            }
+          }
+
+          // Build delta fields only for properties actually present on this PubSub packet
+          const deltaData: Record<string, any> = {
+            action: rawAction,
+            pin_id: pinId
+          };
+
+          const rawPinType = d.type || msgObj.type;
+          if (rawPinType) {
+            deltaData.type = rawPinType;
+            deltaData.pin_type = rawPinType;
+          } else if (!prevPinState && category === 'pin_message') {
+            deltaData.type = 'MOD_PIN';
+            deltaData.pin_type = 'MOD_PIN';
+          }
+
+          if (msgObj.id !== undefined) deltaData.message_id = msgObj.id;
+          if (msgObj.content?.text !== undefined) deltaData.message_text = msgObj.content.text;
+          if (msgObj.sender?.id !== undefined) deltaData.sender_id = msgObj.sender.id;
+          if (msgObj.sender?.display_name !== undefined) deltaData.sender_display_name = msgObj.sender.display_name;
+          if (msgObj.sender !== undefined) {
+            deltaData.sender_color = msgObj.sender.chat_color || null;
+          }
+          if (senderBadges !== undefined) deltaData.sender_badges = senderBadges;
+          if (d.pinned_by?.id !== undefined) deltaData.pinned_by_id = d.pinned_by.id;
+          if (d.pinned_by?.display_name !== undefined) deltaData.pinned_by_display_name = d.pinned_by.display_name;
+          if (msgObj.starts_at !== undefined || d.starts_at !== undefined) {
+            deltaData.starts_at = msgObj.starts_at ?? d.starts_at;
+          } else if (!prevPinState && category === 'pin_message') {
+            deltaData.starts_at = Math.floor(nowMs / 1000);
+          }
+          if (msgObj.ends_at !== undefined || d.ends_at !== undefined) {
+            deltaData.ends_at = msgObj.ends_at ?? d.ends_at;
+          }
+          if (msgObj.updated_at !== undefined || d.updated_at !== undefined) {
+            deltaData.updated_at = msgObj.updated_at ?? d.updated_at;
+          } else {
+            deltaData.updated_at = Math.floor(nowMs / 1000);
+          }
+          if (d.pinned_by) {
+            deltaData.pinned_by = {
+              id: d.pinned_by.id,
+              display_name: d.pinned_by.display_name
+            };
+          }
+          if (d.unpinned_by) {
+            deltaData.unpinned_by = {
+              id: d.unpinned_by.id,
+              display_name: d.unpinned_by.display_name
+            };
+          }
+
+          const mergedData: Record<string, any> = prevPinState
+            ? { ...prevPinState, ...deltaData }
+            : deltaData;
+
+          // Keep nested message object synchronized with merged fields if message details exist
+          if (mergedData.message_id || msgObj.id || prevPinState?.message) {
+            const prevMsg = prevPinState?.message || {};
+            const prevSender = prevMsg.sender || {};
+            mergedData.message = {
+              ...prevMsg,
+              id: mergedData.message_id || prevMsg.id,
+              ...(mergedData.message_text !== undefined ? { text: mergedData.message_text } : {}),
+              ...(mergedData.sender_id || mergedData.sender_display_name || prevMsg.sender ? {
+                sender: {
+                  ...prevSender,
+                  ...(mergedData.sender_id !== undefined ? { id: mergedData.sender_id } : {}),
+                  ...(mergedData.sender_display_name !== undefined ? { display_name: mergedData.sender_display_name } : {}),
+                  chat_color: mergedData.sender_color !== undefined ? mergedData.sender_color : (prevSender.chat_color ?? null),
+                  ...(mergedData.sender_badges !== undefined ? { badges: mergedData.sender_badges } : {})
+                }
+              } : {}),
+              ...(mergedData.starts_at !== undefined ? { starts_at: mergedData.starts_at } : {}),
+              ...(mergedData.ends_at !== undefined ? { ends_at: mergedData.ends_at } : {}),
+              updated_at: mergedData.updated_at
+            };
+          }
+
+          if (category === 'unpin_message') {
+            activePinnedChatTracker.delete(pinId);
+            if (latestActivePinId === pinId) {
+              latestActivePinId = null;
+            }
+          } else {
+            activePinnedChatTracker.set(pinId, mergedData);
+            latestActivePinId = pinId;
+          }
 
           appendBroadcastEvent(channelLogin, {
             _id: `pin-${pinId}-${category}-${nowMs}`,
@@ -3043,44 +3284,7 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
             event_type: 'pinned_chat',
             category,
             action: rawAction,
-            data: {
-              action: rawAction,
-              pin_id: pinId,
-              type: pinType,
-              pin_type: pinType,
-              message_id: msgObj.id || null,
-              message_text: msgObj.content?.text || "",
-              sender_id: msgObj.sender?.id || null,
-              sender_display_name: msgObj.sender?.display_name || null,
-              sender_color: msgObj.sender?.chat_color || "#FFFFFF",
-              sender_badges: senderBadges,
-              pinned_by_id: d.pinned_by?.id || null,
-              pinned_by_display_name: d.pinned_by?.display_name || null,
-              starts_at: msgObj.starts_at || Math.floor(nowMs / 1000),
-              ends_at: msgObj.ends_at || null,
-              updated_at: msgObj.updated_at || Math.floor(nowMs / 1000),
-              pinned_by: d.pinned_by ? {
-                id: d.pinned_by.id,
-                display_name: d.pinned_by.display_name
-              } : null,
-              unpinned_by: d.unpinned_by ? {
-                id: d.unpinned_by.id,
-                display_name: d.unpinned_by.display_name
-              } : null,
-              message: msgObj.id ? {
-                id: msgObj.id,
-                text: msgObj.content?.text || "",
-                sender: msgObj.sender ? {
-                  id: msgObj.sender.id,
-                  display_name: msgObj.sender.display_name,
-                  chat_color: msgObj.sender.chat_color || "#FFFFFF",
-                  badges: senderBadges
-                } : null,
-                starts_at: msgObj.starts_at || nowMs,
-                ends_at: msgObj.ends_at || null,
-                updated_at: msgObj.updated_at || nowMs
-              } : null
-            }
+            data: mergedData
           });
           return;
         }
@@ -3148,27 +3352,76 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
           const rawType = String(inner?.type || 'hype-train-progression');
           const category = rawType.replace(/-/g, '_');
 
+          const deltaTrain: Record<string, any> = {
+            pubsub_type: rawType
+          };
+
+          const rawTrainId = d.id || d.progression?.id || d.train_id;
+          if (rawTrainId) {
+            deltaTrain.train_id = String(rawTrainId);
+          }
+
+          const rawLevel = d.progress?.level?.value ?? d.level;
+          if (rawLevel !== undefined && rawLevel !== null) {
+            deltaTrain.level = rawLevel;
+          }
+
+          const rawGoal = d.progress?.level?.goal ?? d.goal;
+          if (rawGoal !== undefined && rawGoal !== null) {
+            deltaTrain.goal = rawGoal;
+          }
+
+          const rawProgress = d.progress?.value ?? (typeof d.progress === 'number' ? d.progress : undefined) ?? d.value;
+          if (rawProgress !== undefined && rawProgress !== null) {
+            deltaTrain.progress = rawProgress;
+          }
+
+          const rawTotal = d.progress?.total ?? d.total;
+          if (rawTotal !== undefined && rawTotal !== null) {
+            deltaTrain.total = rawTotal;
+          }
+
+          if (d.started_at !== undefined) deltaTrain.started_at = d.started_at;
+          if (d.expires_at !== undefined) {
+            deltaTrain.expires_at = d.expires_at;
+            deltaTrain.ends_at = d.expires_at;
+          }
+          if (d.ended_at !== undefined) {
+            deltaTrain.ended_at = d.ended_at;
+            deltaTrain.ends_at = d.ended_at;
+          }
+          if (d.is_golden_kappa_train !== undefined) {
+            deltaTrain.is_golden_kappa = Boolean(d.is_golden_kappa_train);
+          }
+          if (d.source !== undefined && (d.user_id || d.user_login || d.user_display_name)) {
+            deltaTrain.conductor = {
+              source: d.source,
+              user_id: d.user_id || null,
+              user_login: d.user_login || null,
+              user_display_name: d.user_display_name || null,
+              participations: d.participations || null
+            };
+          }
+
+          const mergedTrainData: Record<string, any> = activeHypeTrainState
+            ? { ...activeHypeTrainState, ...deltaTrain }
+            : deltaTrain;
+
+          if (rawType === 'hype-train-end' || d.ended_at) {
+            activeHypeTrainState = null;
+          } else {
+            activeHypeTrainState = mergedTrainData;
+          }
+
           appendBroadcastEvent(channelLogin, {
-            _id: `hypetrain-${d.id || d.channel_id || twitchId}-${category}-${nowMs}`,
+            _id: `hypetrain-${mergedTrainData.train_id || d.channel_id || twitchId}-${category}-${nowMs}`,
             created_at: new Date(nowMs).toISOString(),
             content_offset_seconds: offsetSec,
             source: 'pubsub',
             type: 'hype_train',
             event_type: 'hype_train',
             category,
-            data: {
-              pubsub_type: rawType,
-              train_id: d.id || d.progression?.id || "",
-              level: d.progress?.level?.value ?? d.level ?? 1,
-              goal: d.progress?.level?.goal ?? d.goal ?? 0,
-              progress: d.progress?.value ?? d.value ?? 0,
-              total: d.progress?.total ?? d.total ?? 0,
-              started_at: d.started_at || null,
-              expires_at: d.expires_at || null,
-              ends_at: d.expires_at || d.ended_at || null,
-              ended_at: d.ended_at || null,
-              is_golden_kappa: Boolean(d.is_golden_kappa_train)
-            }
+            data: mergedTrainData
           });
           return;
         }
@@ -3303,6 +3556,10 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
       );
 
       if (result && result.backfillComments && result.backfillComments.length > 0) {
+        if (!session.usedFirstPartyEmotes) session.usedFirstPartyEmotes = new Map<string, string>();
+        if (!session.usedTwitchBadges) session.usedTwitchBadges = new Map<string, Set<string>>();
+        extractUsedEmotesAndBadgesFromComments(result.backfillComments, undefined, session.usedFirstPartyEmotes, session.usedTwitchBadges);
+
         let gapCount = 0;
         for (const comment of result.backfillComments) {
           if (!existingIds.has(comment._id)) {
@@ -3388,6 +3645,8 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
           if (session.thirdPartyEmotes) {
             standalonePayload.emotes = session.thirdPartyEmotes;
           }
+
+          await populateEmbeddedDataForChat(standalonePayload, channelLogin, streamerId);
 
           await fs.promises.writeFile(vodOutChatPath, JSON.stringify(standalonePayload, null, 2), 'utf8');
           addLog(`[VOD Chat] Successfully generated standalone paired chat: ${vodJsonOutputName} (${standaloneComments.length} messages, duration: ${standaloneDuration}s, streamer.id: ${streamerId}).`);

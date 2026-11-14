@@ -17,6 +17,7 @@ import {
   inspectMp4InitBuffer
 } from "./twitch";
 import { startLiveChatDownload, startChatRenderMultiple, repairChatJsonFile, resolveLiveChatBackfill, flushPendingChatWrites, readBroadcastEventsForChatFile, getEventsSidecarPath } from "./chat";
+import { fetchFirstPartyEmotesFromMap, fetchTwitchBadgesFromMap } from "./emotes";
 import { stitchVideoChunks } from "./video";
 
 export const DISK_WARNING_THRESHOLD_BYTES = 20 * 1024 * 1024 * 1024; // 20 GB
@@ -1958,10 +1959,15 @@ export async function executeResumeVodBackfill(
         session.chatStream.write(prefix + JSON.stringify(dummyMessage));
         session.commentsWritten = realUserCommentsCount + 1;
 
+        const [firstPartyEmotes, twitchBadges] = await Promise.all([
+          fetchFirstPartyEmotesFromMap(session.usedFirstPartyEmotes || new Map()),
+          fetchTwitchBadgesFromMap(channelLogin, session.twitchId, session.usedTwitchBadges || new Map())
+        ]);
+
         const embeddedData = {
           thirdParty: session.thirdPartyEmotes || [],
-          firstParty: [],
-          twitchBadges: []
+          firstParty: firstPartyEmotes,
+          twitchBadges
         };
         const capturedEvents = session.chatFilePath ? readBroadcastEventsForChatFile(session.chatFilePath) : [];
         session.chatStream.write('\n  ],\n  "events": ' + JSON.stringify(capturedEvents) + ',\n  "embeddedData": ' + JSON.stringify(embeddedData) + '\n}\n');
@@ -2294,7 +2300,7 @@ export async function executeResumeVodBackfill(
           const dirEntries = await fs.promises.readdir(sessionData.folderPath, { withFileTypes: true });
           const files = dirEntries.filter(e => e.isFile()).map(e => e.name);
           jsonFiles = files.filter(f => {
-            if (!f.endsWith('.json') || f.startsWith('session_')) return false;
+            if (!f.endsWith('.json') || f.startsWith('session_') || f.includes('_backup_')) return false;
             // Check if already rendered or rendering
             const base = f.replace('.json', '');
             const hasRendered = files.some(other => other.startsWith(`rendered_${base}`));

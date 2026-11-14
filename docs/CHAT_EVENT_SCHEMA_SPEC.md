@@ -2,7 +2,7 @@
 
 ## 1. Architecture & Backward-Compatibility Design
 
-**VOD Automator (`v5.1.0`)** captures the full spectrum of Twitch live chat and broadcast overlay events using two simultaneous WebSocket connections per active stream:
+**VOD Automator (`v5.2.4`)** captures the full spectrum of Twitch live chat and broadcast overlay events using two simultaneous WebSocket connections per active stream:
 1. **Twitch IRCv3 WebSocket (`wss://irc-ws.chat.twitch.tv:443`)** with `CAP REQ :twitch.tv/tags twitch.tv/commands`
 2. **Twitch PubSub Edge WebSocket (`wss://pubsub-edge.twitch.tv/v1`)** listening to public channel overlay topics (`predictions-channel-v1`, `polls`, `pinned-chat-updates-v1`, `community-points-channel-v1`, `hype-train-events-v1`, `raid`)
 
@@ -54,9 +54,9 @@ To guarantee **100% drop-in backward compatibility** with both **`ChatRenderCLI`
     /* Chronological Moderation & PubSub Overlay events (see Section 4) */
   ],
   "embeddedData": {
-    "thirdParty": [ /* 7TV, BTTV, FFZ, Giphy emotes */ ],
-    "firstParty": [],
-    "twitchBadges": []
+    "thirdParty": [ /* 7TV, BTTV, FFZ, Giphy emotes (base64 + dimensions) */ ],
+    "firstParty": [ /* 1st-party Twitch emotes used in comments[] (base64 + dimensions) */ ],
+    "twitchBadges": [ /* Channel & global Twitch chat badges used in comments[] (base64 versions) */ ]
   }
 }
 ```
@@ -66,11 +66,12 @@ To guarantee **100% drop-in backward compatibility** with both **`ChatRenderCLI`
 ## 3. Enriched `comments[]` Schema (`PRIVMSG` & `USERNOTICE`)
 
 Every entry in `comments[]` conforms to standard `TwitchDownloader` `Comment` schema, plus optional top-level and nested extension fields:
-- `"event_type"`: `"chat_message"` | `"channel_points_custom_reward_redemption"` | `"usernotice"` | `"announcement"` | `"raid"`
+- `"event_type"`: `"chat_message"` | `"channel_points_custom_reward_redemption"` | `"usernotice"`
 - `"first_msg"`: `boolean` (`true` when `first-msg=1`)
 - `"returning_chatter"`: `boolean` (`true` when `returning-chatter=1`)
-- `"user_notice_params"`: `Dictionary<string, string>` (Raw IRCv3 tags—also read natively by `TwitchDownloader` / `ChatRenderCLI` for `msg-id` banners)
+- `"user_notice_params"`: `Dictionary<string, string>` (Raw IRCv3 tags—also read natively by `TwitchDownloader` / `ChatRenderCLI` for `msg-id` banners and `msg-param-sender-count` lifetime gift counts)
 - `"event_data"`: Strongly-typed metadata object depending on `"event_type"`.
+- **`message.user_color`**: Set to `null` whenever a chatter has not chosen a custom Twitch color (`color=;`), allowing `ChatRenderCLI` and `TwitchDownloaderCLI` to assign deterministic colors from Twitch's 15-color `DefaultUsernameColors` palette instead of rendering usernames in solid white.
 
 ### 3.1 Enriched `PRIVMSG` (`event_type: "chat_message"` or `"channel_points_custom_reward_redemption"`)
 Captures standard messages plus First-Time Chatter, Returning Chatter, Channel Point Highlighted Messages, Custom Channel Point Redemptions (enriched with cached PubSub reward title, cost, and background color), Threaded Replies, Bits/Cheers, Power-Ups (Gigantified Emotes / Message Effects), Paid Hype Chat, and Shared Chat.
@@ -239,10 +240,10 @@ Captures Subscriptions (`sub`), Resubscriptions (`resub`), Gift Subscriptions (`
 | :--- | :--- | :--- |
 | `"sub"` | New subscription | `sub_plan` (`"Prime"`, `"1000"`, `"2000"`, `"3000"`), `sub_plan_name` |
 | `"resub"` | Resubscription | `cumulative_months`, `streak_months`, `sub_plan`, `user_message` |
-| `"subgift"` | Single gift sub to a recipient | `recipient_display_name`, `recipient_user_name`, `sub_plan`, `sender_total_gifts` |
+| `"subgift"` | Single gift sub to a recipient | `recipient_display_name`, `recipient_user_name`, `sub_plan`, `sender_total_gifts` (populated from `msg-param-sender-count` or parent `submysterygift` origin cache; `null` when unshared) |
 | `"submysterygift"` | Community bomb ("gifted X Tier 1 Subs!") | `mass_gift_count`, `sender_total_gifts`, `sub_plan` |
-| `"raid"` | Incoming raid notice in chat | `raid_display_name`, `raid_viewer_count` |
-| `"announcement"` | `/announce` banner | `announcement_color` (`"PRIMARY"`, `"BLUE"`, `"GREEN"`, `"ORANGE"`, `"PURPLE"`), `user_message` |
+| `"raid"` | Incoming raid notice in chat (`event_type: "usernotice"`, `notice_type: "raid"`) | `raid_display_name`, `raid_viewer_count` |
+| `"announcement"` | `/announce` banner (`event_type: "usernotice"`, `notice_type: "announcement"`) | `announcement_color` (`"PRIMARY"`, `"BLUE"`, `"GREEN"`, `"ORANGE"`, `"PURPLE"`), `user_message` |
 | `"viewermilestone"` | Watch streak shared in chat | `milestone_category` (`"watch-streak"`), `milestone_value` (streak count), `milestone_reward` (channel points earned) |
 
 ---
@@ -442,7 +443,8 @@ Every item in the top-level `"events": [...]` array carries both `"type"` and `"
 ```
 
 ### 4.8 `event_type: "hype_train"` & `event_type: "raid"`
-- **`hype_train`**: `data.pubsub_type` (`"hype-train-start"`, `"hype-train-progression"`, `"hype-train-level-up"`, `"hype-train-end"`), `data.level`, `data.goal`, `data.total`, `data.progress`, `data.ends_at`.
+- **`hype_train`**: `data.pubsub_type` (`"hype-train-start"`, `"hype-train-progression"`, `"hype-train-level-up"`, `"hype-train-conductor-update"`, `"hype-train-end"`), `data.level`, `data.goal`, `data.total`, `data.progress`, `data.ends_at`.
+  - **Stateful Delta Merging (`pinned_chat` & `hype_train`)**: When Twitch PubSub emits lightweight delta updates (such as `"update-message"` or `"unpin-message"` on `pinned-chat-updates-v1`, or `"hype-train-conductor-update"` / `"hype-train-end"` on `hype-train-events-v1`), VOD Automator merges the delta fields into the active in-memory overlay state and omits absent keys rather than overwriting `message_text`, `sender_display_name`, `goal`, or `progress` with `""` or `0`.
 - **`raid`**: `data.pubsub_type` (`"raid_update_v2"`, `"raid_go_v2"`, `"raid_cancel_v2"`), `data.target_login`, `data.target_display_name`, `data.viewer_count`.
 
 ---

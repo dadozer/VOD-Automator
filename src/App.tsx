@@ -962,7 +962,7 @@ export default function App() {
             </div>
             <div>
               <h1 className="font-bold text-base tracking-tight text-white leading-tight">VOD Automator</h1>
-              <p className="text-xs text-purple-400 font-mono font-medium">v5.2.3</p>
+              <p className="text-xs text-purple-400 font-mono font-medium">v5.2.5</p>
             </div>
           </div>
         </div>

@@ -186,6 +186,8 @@ export interface ActiveDownloadSession {
   commentsWritten: number;
   eventsWritten?: number;
   thirdPartyEmotes?: any[];
+  usedFirstPartyEmotes?: Map<string, string>;
+  usedTwitchBadges?: Map<string, Set<string>>;
   mediaPlaylistUrl: string;
   playlistPollInterval: NodeJS.Timeout | null;
   isPollingActive?: boolean;
