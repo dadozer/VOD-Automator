@@ -5,9 +5,18 @@ import checkDiskSpace from "check-disk-space";
 import { spawn, exec, execFile } from "child_process";
 import { state, addLog, updateTask, removeTask, scheduleStateSave, flushStateSync, LOG_FILE, LOG_ROTATED_FILE, cleanChannelName, PROJECT_ROOT, saveConfigAtomic, getResolvedSavePath, normalizeConfigSavePath, getChatRenderDimensionsForChatFile, getChatRenderDimensionsForGame } from "../services/state";
 import { stopActiveDownload, startMonitoring, stopMonitoringTimer, backfillVod, triggerFinalizeFlow, manualSpliceGame, overrideGameSwitchBuffer, formatTimestamp, executeResumeStitchGap, executeResumeVodBackfill, refreshMediaPlaylist } from "../services/download";
-import { stitchVideoChunks, abortAllFfmpegProcesses } from "../services/video";
-import { downloadVodChat, startChatRenderMultiple, startManualChatRender, resolveLiveChatBackfill, abortAllChatProcesses, abortChatProcess } from "../services/chat";
-import type { CaptureMode, GameResolutionProfile } from "../types";
+import { enqueueCompilationJob, abortAllFfmpegProcesses } from "../services/video";
+import { downloadVodChat, startChatRenderMultiple, startManualChatRender, resolveLiveChatBackfill, abortAllChatProcesses, abortChatProcess, refreshLiveChatAuth } from "../services/chat";
+import { hasChatSource } from "../services/chatCompiler";
+import {
+  registerSessionsPayloadBuilder,
+  subscribeSseClient,
+  emitSessionsDelta,
+  emitTasksDelta,
+  emitLogsCleared,
+  getConnectedSseClientCount,
+} from "../services/eventBus";
+import type { CaptureMode, CompilationJobSpec, GameResolutionProfile, SessionsDeltaPayload, Status } from "../types";
 
 export async function openFolderInOs(targetPath?: string): Promise<{ success: boolean; folderPath: string; error?: string }> {
   let resolved: string;
@@ -241,15 +250,16 @@ export function setupRoutes(app: express.Application) {
       }
     }
 
-    // If Twitch Browser OAuth Token or Client-ID changed, immediately refresh playlists for active live sessions
+    // If Twitch Browser OAuth Token or Client-ID changed, immediately refresh playlists & Hermes sockets for active live sessions
     const credentialsChanged =
       (state.config.browserOAuthToken || "") !== prevOAuthToken ||
       (state.config.browserClientId || "") !== prevClientId;
     if (credentialsChanged) {
       const activeKeys = Object.keys(state.activeDownloadSessions);
       for (const chKey of activeKeys) {
-        addLog(`[Config Update] Twitch authentication credentials updated. Refreshing live media playlist for @${chKey}...`);
+        addLog(`[Config Update] Twitch authentication credentials updated. Refreshing live media playlist and Hermes overlay socket for @${chKey}...`);
         refreshMediaPlaylist(chKey).catch(() => {});
+        refreshLiveChatAuth(chKey);
       }
     }
 
@@ -263,6 +273,7 @@ export function setupRoutes(app: express.Application) {
     } catch (err) {
       console.error("Failed to save config.json", err);
     }
+    emitSessionsDelta(true);
     res.json(state.config);
   });
 
@@ -299,13 +310,126 @@ export function setupRoutes(app: express.Application) {
   // Kick off initial background disk space check
   refreshDiskSpace();
 
+  const buildSessionsDeltaPayload = (): SessionsDeltaPayload => {
+    const now = Date.now();
+    if (now - cachedDiskSpace.lastCheck > 60000) {
+      refreshDiskSpace();
+    }
+
+    return {
+      isMonitoring: Boolean(state.config.isMonitoring),
+      monitoredChannels: state.monitoredChannels || [],
+      isLive: Object.keys(state.activeDownloadSessions).length > 0,
+      lastCheckTime: state.lastCheckTime,
+      systemHealth: {
+        diskFree: cachedDiskSpace.free,
+        diskTotal: cachedDiskSpace.size,
+        memoryUsed: process.memoryUsage().rss,
+        uptime: process.uptime(),
+      },
+      activeSessions: Object.values(state.activeDownloadSessions || {}).map(session => {
+        let pendingGameSwitch: any = undefined;
+        if (session.games && session.games.length > 1) {
+          const games = session.games;
+          for (let i = 0; i < games.length - 1; i++) {
+            if (!games[i].isExported) {
+              const nextGame = games[i + 1];
+              const bufferRequired = (state.config.gameSwitchBufferMins ?? 5) * 60;
+              const bufferElapsed = (session.videoDurationSeconds || 0) - nextGame.startTimeOffset;
+              const remaining = Math.max(0, Math.ceil(bufferRequired - bufferElapsed));
+              pendingGameSwitch = {
+                gameIndex: i,
+                previousGame: games[i].gameName,
+                currentGame: nextGame.gameName,
+                secondsRemaining: remaining,
+                totalBufferSeconds: bufferRequired
+              };
+              break;
+            }
+          }
+        }
+
+        const graceMins = (state.config.offlineGracePeriodMins !== undefined && state.config.offlineGracePeriodMins >= 1)
+          ? state.config.offlineGracePeriodMins
+          : 5;
+        const graceTotalSeconds = graceMins * 60;
+        let offlineGraceRemainingSeconds = graceTotalSeconds;
+        if (session.offlineDetectedAtMs) {
+          const elapsedSec = Math.floor((Date.now() - session.offlineDetectedAtMs) / 1000);
+          offlineGraceRemainingSeconds = Math.max(0, graceTotalSeconds - elapsedSec);
+        } else if (session.missingCount && session.missingCount > 0) {
+          const elapsedSec = session.missingCount * 15;
+          offlineGraceRemainingSeconds = Math.max(0, graceTotalSeconds - elapsedSec);
+        }
+
+        return {
+          channel: session.channel,
+          streamId: session.streamId,
+          startTime: session.startTime,
+          chunksDownloaded: session.chunksDownloaded,
+          videoDurationSeconds: session.videoDurationSeconds || 0,
+          missingCount: session.missingCount || 0,
+          offlineGraceRemainingSeconds,
+          offlineGraceTotalSeconds: graceTotalSeconds,
+          folderPath: session.folderPath,
+          currentTitle: session.currentTitle,
+          currentGame: session.currentGame,
+          viewersCount: session.viewersCount,
+          previewImageUrl: session.previewImageUrl,
+          autoRenderChat: session.autoRenderChat,
+          captureMode: session.captureMode || state.config.channelCaptureModes?.[cleanChannelName(session.channel)] || 'both',
+          highestSeq: session.highestSeq,
+          commentsWritten: session.commentsWritten || 0,
+          eventsWritten: session.eventsWritten || 0,
+          ircConnected: Boolean(session.ircConnected) || Boolean(session.chatWs && session.chatWs.readyState === 1),
+          hermesConnected: Boolean(session.hermesConnected) || Boolean(session.hermesWs && session.hermesWs.readyState === 1),
+          games: session.games || [],
+          pendingGameSwitch
+        };
+      })
+    };
+  };
+
+  const buildStatusSnapshot = (): Status => {
+    const sessionsPayload = buildSessionsDeltaPayload();
+    return {
+      ...sessionsPayload,
+      logs: state.logs,
+      activeTasks: Object.values(state.activeTasks),
+    };
+  };
+
+  registerSessionsPayloadBuilder(buildSessionsDeltaPayload);
+
+  // Periodic lightweight health/uptime SSE refresh every 15s when SSE clients are connected
+  setInterval(() => {
+    if (getConnectedSseClientCount() > 0) {
+      emitSessionsDelta(true);
+    }
+  }, 15_000).unref();
+
+  app.get("/api/events", (req, res) => {
+    const unsubscribe = subscribeSseClient(res, {
+      status: buildStatusSnapshot(),
+      config: state.config,
+    });
+    req.on("close", () => {
+      unsubscribe();
+    });
+  });
+
   app.get("/api/health", (req, res) => {
     const activeSessionsList = Object.values(state.activeDownloadSessions || {});
     const activeCount = activeSessionsList.length;
-    const connectedWsCount = activeSessionsList.filter(
-      (s) => s.chatWs && s.chatWs.readyState === 1
+    const chatCapableSessions = activeSessionsList.filter(s => s.captureMode !== 'video_only');
+    const chatCapableCount = chatCapableSessions.length;
+    const connectedWsCount = chatCapableSessions.filter(
+      (s) => Boolean(s.ircConnected) || Boolean(s.chatWs && s.chatWs.readyState === 1)
     ).length;
-    const wsConnected = activeCount === 0 ? true : connectedWsCount === activeCount;
+    const connectedHermesCount = chatCapableSessions.filter(
+      (s) => Boolean(s.hermesConnected) || Boolean(s.hermesWs && s.hermesWs.readyState === 1)
+    ).length;
+    const wsConnected = chatCapableCount === 0 ? true : connectedWsCount === chatCapableCount;
 
     return res.status(200).json({
       status: "ok",
@@ -313,93 +437,22 @@ export function setupRoutes(app: express.Application) {
       isMonitoring: Boolean(state.config.isMonitoring),
       lastCheckTime: state.lastCheckTime || null,
       activeSessions: activeCount,
+      sseClients: getConnectedSseClientCount(),
       wsConnected,
       chatSockets: {
-        active: activeCount,
+        active: chatCapableCount,
         connected: connectedWsCount,
+      },
+      hermesSockets: {
+        active: chatCapableCount,
+        connected: connectedHermesCount,
       },
     });
   });
 
   app.get("/api/status", async (req, res) => {
     try {
-      // Non-blocking refresh if cache is older than 60s
-      const now = Date.now();
-      if (now - cachedDiskSpace.lastCheck > 60000) {
-        refreshDiskSpace();
-      }
-
-      return res.json({
-        isMonitoring: state.config.isMonitoring,
-        monitoredChannels: state.monitoredChannels || [],
-        isLive: Object.keys(state.activeDownloadSessions).length > 0,
-        logs: state.logs,
-        activeTasks: Object.values(state.activeTasks),
-        lastCheckTime: state.lastCheckTime,
-        systemHealth: {
-          diskFree: cachedDiskSpace.free,
-          diskTotal: cachedDiskSpace.size,
-          memoryUsed: process.memoryUsage().rss,
-          uptime: process.uptime(),
-        },
-        activeSessions: Object.values(state.activeDownloadSessions || {}).map(session => {
-          let pendingGameSwitch: any = undefined;
-          if (session.games && session.games.length > 1) {
-            const games = session.games;
-            for (let i = 0; i < games.length - 1; i++) {
-              if (!games[i].isExported) {
-                const nextGame = games[i + 1];
-                const bufferRequired = ((state.config as any).gameSwitchBufferMins ?? (state.config as any).gameSegmentBufferMinutes ?? 5) * 60;
-                const bufferElapsed = (session.videoDurationSeconds || 0) - nextGame.startTimeOffset;
-                const remaining = Math.max(0, Math.ceil(bufferRequired - bufferElapsed));
-                pendingGameSwitch = {
-                  gameIndex: i,
-                  previousGame: games[i].gameName,
-                  currentGame: nextGame.gameName,
-                  secondsRemaining: remaining,
-                  totalBufferSeconds: bufferRequired
-                };
-                break;
-              }
-            }
-          }
-
-          const graceMins = (state.config.offlineGracePeriodMins !== undefined && state.config.offlineGracePeriodMins >= 1)
-            ? state.config.offlineGracePeriodMins
-            : 5;
-          const graceTotalSeconds = graceMins * 60;
-          let offlineGraceRemainingSeconds = graceTotalSeconds;
-          if (session.offlineDetectedAtMs) {
-            const elapsedSec = Math.floor((Date.now() - session.offlineDetectedAtMs) / 1000);
-            offlineGraceRemainingSeconds = Math.max(0, graceTotalSeconds - elapsedSec);
-          } else if (session.missingCount && session.missingCount > 0) {
-            const elapsedSec = session.missingCount * 15;
-            offlineGraceRemainingSeconds = Math.max(0, graceTotalSeconds - elapsedSec);
-          }
-
-          return {
-            channel: session.channel,
-            streamId: session.streamId,
-            startTime: session.startTime,
-            chunksDownloaded: session.chunksDownloaded,
-            videoDurationSeconds: session.videoDurationSeconds || 0,
-            missingCount: session.missingCount || 0,
-            offlineGraceRemainingSeconds,
-            offlineGraceTotalSeconds: graceTotalSeconds,
-            folderPath: session.folderPath,
-            currentTitle: session.currentTitle,
-            currentGame: session.currentGame,
-            viewersCount: session.viewersCount,
-            previewImageUrl: session.previewImageUrl,
-            autoRenderChat: session.autoRenderChat,
-            captureMode: session.captureMode || state.config.channelCaptureModes?.[cleanChannelName(session.channel)] || 'both',
-            commentsWritten: session.commentsWritten || 0,
-            eventsWritten: session.eventsWritten || 0,
-            games: session.games || [],
-            pendingGameSwitch
-          };
-        })
-      });
+      return res.json(buildStatusSnapshot());
     } catch (err: any) {
       console.error("[API Error] Failed to compute /api/status:", err);
       return res.status(500).json({ error: "Failed to compute status", message: err?.message || String(err) });
@@ -429,6 +482,7 @@ export function setupRoutes(app: express.Application) {
     } catch (err) {
       console.error("Failed to save config.json", err);
     }
+    emitSessionsDelta(true);
 
     return res.json({ 
       success: true, 
@@ -566,9 +620,21 @@ export function setupRoutes(app: express.Application) {
           try {
             const stat = await fs.promises.stat(fullPath);
             const files = await fs.promises.readdir(fullPath);
-            const chatFiles = files.filter(
-              f => f.endsWith(".json") && !f.startsWith("session_") && !f.includes("_backup_")
+            const activeFolderPaths = new Set(
+              Object.values(state.activeDownloadSessions || {}).map(s => path.resolve(s.folderPath))
             );
+            const isFolderActivelyRecording = activeFolderPaths.has(path.resolve(fullPath));
+            const chatFileSet = new Set(
+              files.filter(f => f.endsWith(".json") && !f.startsWith("session_") && !f.includes("_backup_"))
+            );
+            if (!isFolderActivelyRecording) {
+              for (const f of files) {
+                if (f.endsWith(".comments.jsonl")) {
+                  chatFileSet.add(f.replace(/\.comments\.jsonl$/i, ".json"));
+                }
+              }
+            }
+            const chatFiles = Array.from(chatFileSet);
             const liveChunkCount = files.filter(f => /^seq_(\d+)\.ts$/.test(f)).length;
             const vodChunkCount = files.filter(f => /^vod_seq_(\d+)\.ts$/.test(f)).length;
             const mp4Files = files.filter(f => f.endsWith(".mp4") && f !== "init.mp4" && f !== "vod_init.mp4");
@@ -624,7 +690,12 @@ export function setupRoutes(app: express.Application) {
         state.activeTasks[taskId].folderPath = resolved;
       }
 
-      stitchVideoChunks(resolved, 'all', taskId)
+      enqueueCompilationJob({
+        kind: 'folder_recovery',
+        taskId,
+        preserveTaskOnSuccess: true,
+        folderPath: resolved,
+      })
         .then((outputs) => {
           updateTask(taskId, `Recovery Complete (${path.basename(resolved)})`, "Successfully stitched video segments.", "success", false, [
             { label: "Open Folder", value: "open_folder" },
@@ -686,7 +757,13 @@ export function setupRoutes(app: express.Application) {
     try {
       if (fs.existsSync(task.folderPath)) {
         const files = fs.readdirSync(task.folderPath);
-        const jsonFiles = files.filter(f => f.endsWith('.json') && !f.startsWith('session_'));
+        const jsonSet = new Set(files.filter(f => f.endsWith('.json') && !f.startsWith('session_') && !f.includes('_backup_')));
+        for (const f of files) {
+          if (f.endsWith('.comments.jsonl')) {
+            jsonSet.add(f.replace(/\.comments\.jsonl$/i, '.json'));
+          }
+        }
+        const jsonFiles = Array.from(jsonSet);
         const fileDetails = jsonFiles.map(f => {
           const fullPath = path.join(task.folderPath!, f);
           const resolved = getChatRenderDimensionsForChatFile(fullPath, task.gameName || task.currentGameName);
@@ -752,6 +829,12 @@ export function setupRoutes(app: express.Application) {
         (task.channelLogin ? state.config.channelCaptureModes?.[cleanChannelName(task.channelLogin)] : undefined) ||
         'both';
 
+      const promptCtx = task.promptContext || {};
+      const chapters = promptCtx.chapters ?? task.chapters;
+      const chapterRawStartOffset = promptCtx.chapterRawStartOffset ?? task.chapterRawStartOffset;
+      const currentGameStartOffset = promptCtx.currentGameStartOffset ?? task.currentGameStartOffset;
+      const currentGameName = promptCtx.currentGameName ?? task.currentGameName;
+
       if (action === 'backfill_full' || action === 'yes') {
         addLog(`[Backfill] User accepted Full backfill (mode: ${captureMode}).`);
         if (captureMode !== 'video_only') {
@@ -765,7 +848,7 @@ export function setupRoutes(app: express.Application) {
         if (captureMode !== 'chat_only') {
           backfillVod(task.channelLogin!, task.streamId!, task.folderPath!, {
             mode: 'full',
-            chapters: task.chapters
+            chapters
           }).catch(err => {
             addLog(`[Backfill] Unhandled error: ${err.message}`);
           });
@@ -774,12 +857,12 @@ export function setupRoutes(app: express.Application) {
       } else if (action === 'backfill_current_game') {
         const bufferMins = (state.config.gameSwitchBufferMins ?? 5);
         const bufferSec = bufferMins * 60;
-        const rawOffset = task.chapterRawStartOffset ?? task.currentGameStartOffset ?? 0;
-        const finalStartOffset = task.currentGameStartOffset ?? Math.max(0, rawOffset - bufferSec);
+        const rawOffset = chapterRawStartOffset ?? currentGameStartOffset ?? 0;
+        const finalStartOffset = currentGameStartOffset ?? Math.max(0, rawOffset - bufferSec);
 
-        addLog(`[Backfill] User accepted Current Game Only backfill (${task.currentGameName || 'Current Game'}, mode: ${captureMode}) from ${formatTimestamp(finalStartOffset)} (${bufferMins}m buffer applied).`);
+        addLog(`[Backfill] User accepted Current Game Only backfill (${currentGameName || 'Current Game'}, mode: ${captureMode}) from ${formatTimestamp(finalStartOffset)} (${bufferMins}m buffer applied).`);
         if (captureMode !== 'video_only') {
-          const chatPromise = resolveLiveChatBackfill(task.channelLogin!, 'current_game', finalStartOffset, task.currentGameName).catch(err => {
+          const chatPromise = resolveLiveChatBackfill(task.channelLogin!, 'current_game', finalStartOffset, currentGameName).catch(err => {
             addLog(`[Chat Backfill Error] ${err.message}`);
           });
           if (state.activeDownloadSessions[task.channelLogin!]) {
@@ -790,7 +873,7 @@ export function setupRoutes(app: express.Application) {
           backfillVod(task.channelLogin!, task.streamId!, task.folderPath!, {
             mode: 'current_game',
             startOffsetSec: finalStartOffset,
-            gameName: task.currentGameName
+            gameName: currentGameName
           }).catch(err => {
             addLog(`[Backfill] Unhandled error: ${err.message}`);
           });
@@ -810,13 +893,15 @@ export function setupRoutes(app: express.Application) {
 
     if (taskId.startsWith('prompt_resume_gap_')) {
       const channel = task.channelLogin || '';
+      const promptCtx = task.promptContext || {};
+      const preGapSeq = promptCtx.preGapHighestSeq ?? task.preGapHighestSeq;
+      const resumeSeq = promptCtx.resumptionSeq ?? task.resumptionSeq;
       if (action === 'resume_stitch_gap') {
         executeResumeStitchGap(channel).catch(err => {
           addLog(`[Recovery Error] ${err.message}`);
         });
       } else {
-        // Option 2 (resume_vod_backfill or dismiss/default)
-        executeResumeVodBackfill(channel, task.preGapHighestSeq, task.resumptionSeq).catch(err => {
+        executeResumeVodBackfill(channel, preGapSeq, resumeSeq).catch(err => {
           addLog(`[Recovery Error] ${err.message}`);
         });
       }
@@ -858,14 +943,21 @@ export function setupRoutes(app: express.Application) {
       }
       const newTaskId = `stitch_${Date.now()}`;
       updateTask(newTaskId, "Stitching Video", "Scanning sequence files...", "running", false, undefined);
-      if (state.activeTasks[newTaskId]) {
-        state.activeTasks[newTaskId].games = task.games;
-        state.activeTasks[newTaskId].chatFilePath = task.chatFilePath;
-        state.activeTasks[newTaskId].videoDurationSeconds = task.videoDurationSeconds;
-        state.activeTasks[newTaskId].folderPath = task.folderPath;
-        state.activeTasks[newTaskId].channelLogin = task.channelLogin;
-      }
-      stitchVideoChunks(task.folderPath, 'live', newTaskId).then(() => {
+      const retrySpec: CompilationJobSpec = task.retrySpec
+        ? { ...task.retrySpec, taskId: newTaskId, preserveTaskOnSuccess: true }
+        : {
+            kind: 'live_segment',
+            taskId: newTaskId,
+            preserveTaskOnSuccess: true,
+            folderPath: task.folderPath,
+            channelLogin: task.channelLogin || '',
+            captureMode: task.captureMode || 'both',
+            games: task.games || [],
+            chatFilePath: task.chatFilePath,
+            videoDurationSeconds: task.videoDurationSeconds,
+          };
+
+      enqueueCompilationJob(retrySpec).then(() => {
         updateTask(newTaskId, "Stitching Video", "Stitching Complete.", "success", false, [
           { label: "Open Folder", value: "open_folder" },
           { label: "Close", value: "dismiss" }
@@ -873,7 +965,7 @@ export function setupRoutes(app: express.Application) {
       }).catch(err => {
         addLog(`[Stitch] Unhandled error during retry stitch: ${err.message}`);
       });
-      removeTask(taskId); // Remove the error task, stitchVideoChunks will use newTaskId
+      removeTask(taskId);
       return res.json({ success: true });
     }
 
@@ -959,20 +1051,20 @@ export function setupRoutes(app: express.Application) {
       trimmedPath = path.join(baseSavePath, afterDownloads);
     }
     
-    // Check direct path first
-    if (!fs.existsSync(trimmedPath)) {
+    // Check direct path or corresponding unsealed .comments.jsonl journal first
+    if (!hasChatSource(trimmedPath)) {
       // If relative, check against PROJECT_ROOT and baseSavePath
       if (!path.isAbsolute(trimmedPath)) {
         const rootCombined = path.resolve(PROJECT_ROOT, trimmedPath);
         const saveCombined = path.resolve(baseSavePath, trimmedPath);
-        if (fs.existsSync(rootCombined)) {
+        if (hasChatSource(rootCombined)) {
           trimmedPath = rootCombined;
-        } else if (fs.existsSync(saveCombined)) {
+        } else if (hasChatSource(saveCombined)) {
           trimmedPath = saveCombined;
         }
       }
 
-      if (!fs.existsSync(trimmedPath) && fs.existsSync(baseSavePath)) {
+      if (!hasChatSource(trimmedPath) && fs.existsSync(baseSavePath)) {
         // Try searching one level deep in subdirectories of savePath
         try {
           const subEntries = fs.readdirSync(baseSavePath, { withFileTypes: true });
@@ -980,7 +1072,7 @@ export function setupRoutes(app: express.Application) {
           for (const sub of subEntries) {
             if (sub.isDirectory()) {
               const subCombined = path.join(baseSavePath, sub.name, path.basename(trimmedPath));
-              if (fs.existsSync(subCombined)) {
+              if (hasChatSource(subCombined)) {
                 trimmedPath = subCombined;
                 found = true;
                 break;
@@ -993,7 +1085,7 @@ export function setupRoutes(app: express.Application) {
         } catch (e) {
           return res.status(404).json({ error: `File not found: "${trimmedPath}"` });
         }
-      } else if (!fs.existsSync(trimmedPath)) {
+      } else if (!hasChatSource(trimmedPath)) {
         return res.status(404).json({ error: `File not found: "${trimmedPath}". Please verify that the file exists.` });
       }
     }
@@ -1030,6 +1122,7 @@ export function setupRoutes(app: express.Application) {
       state.config.isMonitoring = state.monitoredChannels.length > 0;
       startMonitoring();
       addLog(`Started monitoring channel: @${cleaned}`);
+      emitSessionsDelta(true);
       return res.json({ status: "ok", monitoredChannels: state.monitoredChannels });
     }
 
@@ -1043,6 +1136,7 @@ export function setupRoutes(app: express.Application) {
     state.monitoredChannels = cleanedTargets;
     startMonitoring();
     addLog(`Started monitoring channels: ${state.monitoredChannels.join(', ')}`);
+    emitSessionsDelta(true);
     res.json({ status: "ok", monitoredChannels: state.monitoredChannels });
   });
 
@@ -1069,6 +1163,7 @@ export function setupRoutes(app: express.Application) {
       } else {
         addLog(`Stopped monitoring for @${cleaned}`);
       }
+      emitSessionsDelta(true);
       return res.json({ status: "ok", monitoredChannels: state.monitoredChannels });
     }
 
@@ -1090,6 +1185,7 @@ export function setupRoutes(app: express.Application) {
       addLog("Stopped monitoring");
     }
     state.monitoredChannels = [];
+    emitSessionsDelta(true);
     res.json({ status: "ok" });
   });
 
@@ -1123,6 +1219,9 @@ export function setupRoutes(app: express.Application) {
       state.activeTasks = {};
       state.logs = [];
       state.monitoredChannels = [];
+      emitLogsCleared();
+      emitTasksDelta(() => [], true);
+      emitSessionsDelta(true);
 
       // 7. Flush state synchronously to state.json to avoid ghost restorations
       flushStateSync();

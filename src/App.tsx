@@ -1,205 +1,143 @@
-import React, { useState, useEffect, useRef, useMemo } from "react";
-import axios from "axios";
-import { Settings, Play, Square, Activity, Terminal, Folder, Bell, RefreshCw, Clock, Key, Download, AlertTriangle, HardDrive, Cpu, Gamepad2, Users, Check, ArrowDown, Layers, MessageSquare, Trash2, X, CheckCircle2, AlertCircle, Film, Sparkles, Edit2, Plus, Tv, Scissors, Eye, EyeOff, Search, Wrench, RotateCcw } from "lucide-react";
-import { motion, AnimatePresence } from "motion/react";
-import type { Config, Status } from "./types";
-
-interface RecentFolderItem {
-  name: string;
-  folderPath: string;
-  updatedAt: number;
-  chatFiles: string[];
-  liveChunkCount: number;
-  vodChunkCount: number;
-  mp4Files: string[];
-}
-
-function formatBytes(bytes: number, decimals = 2) {
-  if (bytes === 0) return '0 Bytes';
-  const k = 1024;
-  const dm = decimals < 0 ? 0 : decimals;
-  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
-}
-
-function formatUptime(seconds: number) {
-  const d = Math.floor(seconds / (3600*24));
-  const h = Math.floor(seconds % (3600*24) / 3600);
-  const m = Math.floor(seconds % 3600 / 60);
-  
-  if (d > 0) return `${d}d ${h}h`;
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m ${Math.floor(seconds % 60)}s`;
-}
-
-function cleanChannel(channel: string): string {
-  if (!channel) return "";
-  let cleaned = channel.toLowerCase().trim().replace(/^@/, "");
-  try {
-    const urlString = cleaned.startsWith("http") ? cleaned : `https://${cleaned}`;
-    const url = new URL(urlString);
-    if (url.hostname.includes("twitch.tv")) {
-      cleaned = url.pathname.split("/").filter(Boolean)[0] || cleaned;
-    }
-  } catch (e) {}
-  cleaned = cleaned.replace(/^(https?:\/\/)?(www\.)?twitch\.tv\//, "").split("?")[0].replace(/\/$/, "").replace(/[^a-z0-9_]/g, "");
-  return cleaned.trim();
-}
+import React, { useCallback, useRef, useState } from "react";
+import { AnimatePresence } from "motion/react";
+import { RefreshCw } from "lucide-react";
+import { vodApi } from "./api/client";
+import { useTelemetryStream } from "./hooks/useTelemetryStream";
+import { cleanChannel, resolveClientGameProfile } from "./utils/formatters";
+import { Sidebar, type AppTab } from "./components/Sidebar";
+import { LivestreamMonitorView } from "./components/LivestreamMonitorView";
+import { SettingsView } from "./components/SettingsView";
+import { SystemLogView } from "./components/SystemLogView";
+import {
+  TaskRenderModal,
+  type RenderDialogState,
+} from "./components/modals/TaskRenderModal";
+import { ManualRenderModal } from "./components/modals/ManualRenderModal";
+import {
+  QuickGameProfileModal,
+  type QuickGameProfileModalState,
+} from "./components/modals/QuickGameProfileModal";
+import { RecoverFolderModal } from "./components/modals/RecoverFolderModal";
+import {
+  SpliceModal,
+  type ClipScopeType,
+  type SpliceActionType,
+} from "./components/modals/SpliceModal";
+import {
+  CancelRenderModal,
+  RebootConfirmModal,
+  StopRecordingModal,
+  ToastBanner,
+  UnsavedSettingsModal,
+  type ToastMessageState,
+} from "./components/modals/ConfirmModals";
+import type {
+  ActiveTask,
+  CaptureMode,
+  Config,
+  RecentFolderItem,
+} from "./types";
 
 export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
-  const [status, setStatus] = useState<Status | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<"dashboard" | "settings" | "logs">("dashboard");
-  const [settingsTab, setSettingsTab] = useState<"general" | "render" | "render_appearance">("general");
   const [channelsInput, setChannelsInput] = useState<string>("");
   const [isConfigDirty, setIsConfigDirty] = useState<boolean>(false);
-  const [pendingTabSwitch, setPendingTabSwitch] = useState<"dashboard" | "settings" | "logs" | null>(null);
-  const [showOAuthToken, setShowOAuthToken] = useState<boolean>(false);
-  const [timeSinceCheck, setTimeSinceCheck] = useState<number>(0);
-  const [renderDialog, setRenderDialog] = useState<{ taskId: string, channelLogin: string, folderPath: string, width: number, height: number, files?: {filename: string, width: number, height: number, enabled?: boolean, gameName?: string, matchedProfile?: string, isCustomProfile?: boolean}[] } | null>(null);
-  const [pendingTaskActions, setPendingTaskActions] = useState<Record<string, string>>({});
+  const [activeTab, setActiveTab] = useState<AppTab>("dashboard");
+  const [pendingTabSwitch, setPendingTabSwitch] = useState<AppTab | null>(null);
+
+  const [isSavingConfig, setIsSavingConfig] = useState<boolean>(false);
+  const [saveStatusMessage, setSaveStatusMessage] = useState<{
+    type: "success" | "error";
+    text: string;
+  } | null>(null);
+  const [isResetting, setIsResetting] = useState<boolean>(false);
+
+  const [togglingChannelMap, setTogglingChannelMap] = useState<Record<string, boolean>>({});
   const [forceStitchingChannels, setForceStitchingChannels] = useState<Record<string, boolean>>({});
-  const [isSavingConfig, setIsSavingConfig] = useState(false);
-  const [saveStatusMessage, setSaveStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [isResetting, setIsResetting] = useState(false);
-  const [isSubmittingRender, setIsSubmittingRender] = useState(false);
+  const [isManualSplicing, setIsManualSplicing] = useState<Record<string, boolean>>({});
+  const [isOverridingBuffer, setIsOverridingBuffer] = useState<Record<string, boolean>>({});
+  const [pendingTaskActions, setPendingTaskActions] = useState<Record<string, string>>({});
+  const [isDismissingCompleted, setIsDismissingCompleted] = useState<boolean>(false);
+
+  // Modal states
+  const [renderDialog, setRenderDialog] = useState<RenderDialogState | null>(null);
+  const [isSubmittingRender, setIsSubmittingRender] = useState<boolean>(false);
+
   const [manualRenderDialog, setManualRenderDialog] = useState<boolean>(false);
   const [manualRenderPath, setManualRenderPath] = useState<string>("");
-  const [manualRenderWidth, setManualRenderWidth] = useState<number>(350);
-  const [manualRenderHeight, setManualRenderHeight] = useState<number>(800);
+  const [manualRenderWidth, setManualRenderWidth] = useState<number | string>(350);
+  const [manualRenderHeight, setManualRenderHeight] = useState<number | string>(800);
   const [manualRenderMatchedProfile, setManualRenderMatchedProfile] = useState<string | null>(null);
   const [isStartingManualRender, setIsStartingManualRender] = useState<boolean>(false);
-  const [manualRenderMsg, setManualRenderMsg] = useState<{ type: 'success' | 'error', text: string } | null>(null);
-  const [quickGameProfileModal, setQuickGameProfileModal] = useState<{ gameName: string; width: number | string; height: number | string; hasExistingProfile: boolean } | null>(null);
+  const [manualRenderMsg, setManualRenderMsg] = useState<{
+    type: "success" | "error";
+    text: string;
+  } | null>(null);
+
+  const [quickGameProfileModal, setQuickGameProfileModal] =
+    useState<QuickGameProfileModalState | null>(null);
   const [isSavingQuickGameProfile, setIsSavingQuickGameProfile] = useState<boolean>(false);
-  const [newProfileGameName, setNewProfileGameName] = useState<string>("");
-  const [newProfileWidth, setNewProfileWidth] = useState<string>("640");
-  const [newProfileHeight, setNewProfileHeight] = useState<string>("936");
+
   const [recentFolders, setRecentFolders] = useState<RecentFolderItem[]>([]);
   const [isLoadingRecentFolders, setIsLoadingRecentFolders] = useState<boolean>(false);
   const [recoverFolderDialog, setRecoverFolderDialog] = useState<boolean>(false);
   const [recoverFolderPath, setRecoverFolderPath] = useState<string>("");
   const [isStartingRecovery, setIsStartingRecovery] = useState<boolean>(false);
-  const [recoverFolderMsg, setRecoverFolderMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [logSearchQuery, setLogSearchQuery] = useState<string>("");
-  const [logCategory, setLogCategory] = useState<'all' | 'errors' | 'video' | 'chat'>('all');
-  const [autoScrollLogs, setAutoScrollLogs] = useState(true);
-  const logEndRef = useRef<HTMLDivElement>(null);
-  const logContainerRef = useRef<HTMLDivElement>(null);
-  const toastTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [recoverFolderMsg, setRecoverFolderMsg] = useState<{
+    type: "success" | "error";
+    text: string;
+  } | null>(null);
 
-  const formatDuration = (seconds: number) => {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-    return `${h > 0 ? h + ':' : ''}${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-  };
+  const [stopConfirmChannel, setStopConfirmChannel] = useState<string | null>(null);
+  const [showRebootConfirm, setShowRebootConfirm] = useState<boolean>(false);
+  const [manualSpliceChannel, setManualSpliceChannel] = useState<string | null>(null);
+  const [cancelRenderConfirmTask, setCancelRenderConfirmTask] = useState<ActiveTask | null>(null);
 
-  const fetchConfig = async () => {
-    try {
-      const res = await fetch("/api/config");
-      if (!res.ok) return;
-      const contentType = res.headers.get("content-type");
-      if (!contentType || !contentType.includes("application/json")) return;
-      const data = await res.json();
-      if (data && typeof data === 'object') {
-        setConfig(data);
-        setChannelsInput(data.channels ? data.channels.join(', ') : "");
-        setIsConfigDirty(false);
-      }
-    } catch (err) {
-      console.warn("Failed to fetch configuration", err);
-    }
-  };
+  const [toastMessage, setToastMessage] = useState<ToastMessageState | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const fetchStatus = async () => {
-    try {
-      const res = await fetch("/api/status");
-      if (!res.ok) return;
-      const contentType = res.headers.get("content-type");
-      if (!contentType || !contentType.includes("application/json")) return;
-      const data = await res.json();
-      if (data && typeof data === 'object') {
-        setStatus(data);
-      }
-    } catch (err) {
-      console.warn("Failed to fetch status", err);
-    }
-  };
-
-  useEffect(() => {
-    const init = async () => {
-      await fetchConfig();
-      await fetchStatus();
-      setLoading(false);
-    };
-    init();
-
-    let interval: NodeJS.Timeout | null = setInterval(fetchStatus, 5000);
-
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        if (interval) {
-          clearInterval(interval);
-          interval = null;
-        }
-      } else {
-        fetchStatus();
-        if (!interval) {
-          interval = setInterval(fetchStatus, 5000);
-        }
-      }
-    };
-
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-
-    return () => {
-      if (interval) clearInterval(interval);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
+  const syncDraftFromServerConfig = useCallback((nextConfig: Config) => {
+    setConfig(nextConfig);
+    setChannelsInput(nextConfig.channels ? nextConfig.channels.join(", ") : "");
+    setIsConfigDirty(false);
   }, []);
 
-  useEffect(() => {
-    const timer = setInterval(() => {
-      if (status?.lastCheckTime) {
-        setTimeSinceCheck(Math.floor((Date.now() - status.lastCheckTime) / 1000));
-      } else {
-        setTimeSinceCheck(0);
+  const {
+    status,
+    setStatus,
+    loading,
+    sseConnected,
+    refreshStatus,
+    refreshConfig,
+  } = useTelemetryStream({
+    isConfigDirty,
+    onServerConfigSynced: syncDraftFromServerConfig,
+  });
+
+  const showToast = useCallback(
+    (
+      text: string,
+      type: "success" | "info" | "error" = "info",
+      title?: string
+    ) => {
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
       }
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [status?.lastCheckTime]);
-
-  useEffect(() => {
-    // Only auto-scroll down if user is already at the bottom and autoScrollLogs is true
-    if (autoScrollLogs && logContainerRef.current) {
-      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-    }
-  }, [status?.logs, autoScrollLogs]);
-
-  const handleLogScroll = () => {
-    if (!logContainerRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
-    // If within 40px of bottom, consider user engaged in bottom view
-    const isAtBottom = scrollHeight - scrollTop - clientHeight < 40;
-    setAutoScrollLogs(isAtBottom);
-  };
-
-  const scrollToBottomLogs = () => {
-    if (logContainerRef.current) {
-      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-      setAutoScrollLogs(true);
-    }
-  };
+      setToastMessage({ text, type, title });
+      toastTimerRef.current = setTimeout(() => {
+        setToastMessage(null);
+        toastTimerRef.current = null;
+      }, 4000);
+    },
+    []
+  );
 
   const updateDraftConfig = (nextConfig: Config) => {
     setConfig(nextConfig);
     setIsConfigDirty(true);
   };
 
-  const handleTabSelect = (targetTab: "dashboard" | "settings" | "logs") => {
+  const handleTabSelect = (targetTab: AppTab) => {
     if (activeTab === "settings" && isConfigDirty && targetTab !== "settings") {
       setPendingTabSwitch(targetTab);
       return;
@@ -213,36 +151,28 @@ export default function App() {
     setSaveStatusMessage(null);
     try {
       const parsedChannels = channelsInput
-        .split(',')
+        .split(",")
         .map(cleanChannel)
         .filter(Boolean)
         .slice(0, 2);
 
-      const configToSave = {
+      const updatedConfig = await vodApi.saveConfig({
         ...config,
-        channels: parsedChannels
-      };
-
-      const res = await fetch("/api/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(configToSave),
+        channels: parsedChannels,
       });
-      if (res.ok) {
-        const updatedConfig = await res.json();
-        setConfig(updatedConfig);
-        setChannelsInput((updatedConfig.channels || []).join(', '));
-        setIsConfigDirty(false);
-        setSaveStatusMessage({ type: 'success', text: "Settings saved successfully!" });
-        await fetchStatus();
-        setTimeout(() => setSaveStatusMessage(null), 3000);
-        return true;
-      } else {
-        setSaveStatusMessage({ type: 'error', text: "Failed to save settings." });
-        return false;
-      }
-    } catch (err) {
-      setSaveStatusMessage({ type: 'error', text: "Failed to save settings." });
+      syncDraftFromServerConfig(updatedConfig);
+      setSaveStatusMessage({
+        type: "success",
+        text: "Settings saved successfully!",
+      });
+      await refreshStatus();
+      setTimeout(() => setSaveStatusMessage(null), 3000);
+      return true;
+    } catch {
+      setSaveStatusMessage({
+        type: "error",
+        text: "Failed to save settings.",
+      });
       return false;
     } finally {
       setIsSavingConfig(false);
@@ -254,208 +184,76 @@ export default function App() {
     await saveConfigInternal();
   };
 
-  const [stopConfirmChannel, setStopConfirmChannel] = useState<string | null>(null);
-  const [showRebootConfirm, setShowRebootConfirm] = useState<boolean>(false);
-  const [manualSpliceChannel, setManualSpliceChannel] = useState<string | null>(null);
-  const [spliceAction, setSpliceAction] = useState<'append_previous' | 'extract_clip' | 'split_new_part' | 'await_next_game'>('split_new_part');
-  const [clipScope, setClipScope] = useState<'whole_game' | 'custom_duration'>('custom_duration');
-  const [clipMinutes, setClipMinutes] = useState<number>(5.0);
-  const [awaitLeadingBufferInput, setAwaitLeadingBufferInput] = useState<string>("10");
-  const [isManualSplicing, setIsManualSplicing] = useState<Record<string, boolean>>({});
-  const [isOverridingBuffer, setIsOverridingBuffer] = useState<Record<string, boolean>>({});
-  const [editingChannelIndex, setEditingChannelIndex] = useState<number | null>(null);
-  const [tempChannelName, setTempChannelName] = useState<string>("");
-  const [togglingChannelMap, setTogglingChannelMap] = useState<Record<string, boolean>>({});
-  const [cancelRenderConfirmTask, setCancelRenderConfirmTask] = useState<any>(null);
-  const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'info' | 'error'; title?: string } | null>(null);
-
-  const showToast = (text: string, type: 'success' | 'info' | 'error' = 'info', title?: string) => {
-    if (toastTimerRef.current) {
-      clearTimeout(toastTimerRef.current);
-    }
-    setToastMessage({ text, type, title });
-    toastTimerRef.current = setTimeout(() => {
-      setToastMessage(null);
-      toastTimerRef.current = null;
-    }, 4000);
-  };
-
-  const executeReset = async () => {
-    if (isResetting) return;
-    setIsResetting(true);
-    try {
-      const res = await fetch("/api/reset", { method: "POST" });
-      if (res.ok) {
-        showToast("Program rebooted and all active background tasks cleared.", "success", "Emergency Reset");
-        await fetchStatus();
-      } else {
-        showToast("Failed to reboot program.", "error", "Emergency Reset");
-      }
-    } catch (err: any) {
-      showToast(`Failed to reboot program: ${err?.message || "network error"}`, "error", "Emergency Reset");
-    } finally {
-      setIsResetting(false);
-    }
-  };
-
-  const formatGraceCountdown = (sec?: number) => {
-    if (sec === undefined || sec <= 0) return "0m 00s";
-    const mins = Math.floor(sec / 60);
-    const remainingSec = Math.floor(sec % 60);
-    return `${mins}m ${String(remainingSec).padStart(2, '0')}s`;
-  };
-
   const handleOpenFolder = async (folderPath?: string) => {
     try {
-      const res = await axios.post('/api/open-folder', { folderPath });
-      const targetFolder = res.data?.folderPath || folderPath || 'Downloads';
-      
+      const res = await vodApi.openFolder(folderPath);
+      const targetFolder = res?.folderPath || folderPath || "Downloads";
       if (navigator.clipboard && targetFolder) {
         navigator.clipboard.writeText(targetFolder).catch(() => {});
       }
-
       showToast(
         `Opening folder: ${targetFolder} (path copied to clipboard)`,
-        'info',
-        'File Manager'
+        "info",
+        "File Manager"
       );
     } catch (err: any) {
-      console.error("Failed to open folder", err);
       showToast(
-        `Could not open folder: ${err.message}`,
-        'error',
-        'File Manager'
+        `Could not open folder: ${err?.message || "unknown error"}`,
+        "error",
+        "File Manager"
       );
     }
   };
 
-  const executeManualSplice = async (
-    channel: string,
-    action: 'append_previous' | 'extract_clip' | 'split_new_part' | 'await_next_game' = 'split_new_part',
-    scope?: 'whole_game' | 'custom_duration',
-    mins?: number,
-    leadingBufferMinutes?: number
-  ) => {
-    setIsManualSplicing(prev => ({ ...prev, [channel]: true }));
+  const handleAssignOrRenameChannel = async (slotIndex: number, rawName: string) => {
+    const trimmed = cleanChannel(rawName);
+    if (!trimmed || !config) return;
+
+    const currentList = (config.channels || []).map(cleanChannel).filter(Boolean);
+    const slots: (string | null)[] = [currentList[0] || null, currentList[1] || null];
+    slots[slotIndex] = trimmed;
+    const filtered = Array.from(
+      new Set(slots.filter((c): c is string => Boolean(c)))
+    ).slice(0, 2);
+
+    const nextConfig = { ...config, channels: filtered };
+    setConfig(nextConfig);
+    setChannelsInput(filtered.join(", "));
+
     try {
-      const res = await axios.post("/api/channels/splice-game", {
-        channel,
-        action,
-        clipScope: scope,
-        clipMinutes: mins,
-        leadingBufferMinutes
-      });
-      if (res.data?.success) {
-        showToast(
-          action === 'await_next_game'
-            ? `Outgoing game ended for @${channel}. Recording into next game while awaiting Twitch category update.`
-            : `Manual splice initiated for @${channel}.`,
-          "success",
-          "Video Splice"
-        );
-        await fetchStatus();
-      }
-    } catch (err: any) {
-      showToast(err.response?.data?.error || err.message || "Failed to trigger manual splice", "error", "Video Splice");
-    } finally {
-      setIsManualSplicing(prev => {
-        const copy = { ...prev };
-        delete copy[channel];
-        return copy;
-      });
+      const saved = await vodApi.saveConfig(nextConfig);
+      setConfig(saved);
+      setChannelsInput((saved.channels || []).join(", "));
+      await refreshStatus();
+    } catch (err) {
+      console.error("Failed to persist updated channels", err);
     }
   };
 
-  const handleOverrideBuffer = async (channel: string, gameIndex?: number) => {
-    setIsOverridingBuffer(prev => ({ ...prev, [channel]: true }));
-    try {
-      const res = await axios.post("/api/channels/override-buffer", { channel, gameIndex });
-      if (res.data?.success) {
-        showToast(`Skipped transition buffer for @${channel}. Splicing now...`, "success", "Game Switch");
-        await fetchStatus();
-      }
-    } catch (err: any) {
-      showToast(err.response?.data?.error || err.message || "Failed to override buffer", "error", "Game Switch");
-    } finally {
-      setIsOverridingBuffer(prev => {
-        const copy = { ...prev };
-        delete copy[channel];
-        return copy;
-      });
-    }
-  };
-
-  const startEditingChannel = (index: number, currentName: string) => {
-    setEditingChannelIndex(index);
-    setTempChannelName(currentName);
-  };
-
-  const commitChannelName = async (index: number) => {
-    const trimmed = cleanChannel(tempChannelName);
-    if (trimmed && config) {
-      const currentList = (config.channels || []).map(cleanChannel).filter(Boolean);
-      const slots: (string | null)[] = [currentList[0] || null, currentList[1] || null];
-      slots[index] = trimmed;
-      const filtered = Array.from(new Set(slots.filter((c): c is string => Boolean(c)))).slice(0, 2);
-
-      const newConfig = { ...config, channels: filtered };
-      setConfig(newConfig);
-      setChannelsInput(filtered.join(', '));
-      setEditingChannelIndex(null);
-      setTempChannelName("");
-
-      try {
-        const res = await fetch("/api/config", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(newConfig),
-        });
-        if (res.ok) {
-          const saved = await res.json();
-          setConfig(saved);
-          setChannelsInput((saved.channels || []).join(', '));
-          await fetchStatus();
-        }
-      } catch (err) {
-        console.error("Failed to persist updated channels", err);
-      }
-    } else {
-      setEditingChannelIndex(null);
-      setTempChannelName("");
-    }
-  };
-
-  const clearChannelSlot = async (index: number) => {
+  const handleClearChannelSlot = async (slotIndex: number) => {
     if (!config) return;
     const currentList = (config.channels || []).map(cleanChannel).filter(Boolean);
     const slots: (string | null)[] = [currentList[0] || null, currentList[1] || null];
-    const removedChannel = slots[index];
-    slots[index] = null;
+    const removedChannel = slots[slotIndex];
+    slots[slotIndex] = null;
     const filtered = slots.filter((c): c is string => Boolean(c));
 
-    const newConfig = { ...config, channels: filtered };
-    setConfig(newConfig);
-    setChannelsInput(filtered.join(', '));
-    if (editingChannelIndex === index) {
-      setEditingChannelIndex(null);
-      setTempChannelName("");
-    }
+    const nextConfig = { ...config, channels: filtered };
+    setConfig(nextConfig);
+    setChannelsInput(filtered.join(", "));
 
     try {
-      const res = await fetch("/api/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(newConfig),
-      });
-      if (res.ok) {
-        const saved = await res.json();
-        setConfig(saved);
-        setChannelsInput((saved.channels || []).join(', '));
-        if (removedChannel) {
-          showToast(`Removed @${removedChannel} from monitored slots.`, "info", "Channel Removed");
-        }
-        await fetchStatus();
+      const saved = await vodApi.saveConfig(nextConfig);
+      setConfig(saved);
+      setChannelsInput((saved.channels || []).join(", "));
+      if (removedChannel) {
+        showToast(
+          `Removed @${removedChannel} from monitored slots.`,
+          "info",
+          "Channel Removed"
+        );
       }
+      await refreshStatus();
     } catch (err) {
       console.error("Failed to clear channel slot", err);
     }
@@ -463,38 +261,37 @@ export default function App() {
 
   const executeToggleChannelMonitoring = async (channel: string) => {
     if (!config || !status || togglingChannelMap[channel]) return;
-
     const cleaned = cleanChannel(channel);
     if (!cleaned) return;
+
     const monitoredList = (status.monitoredChannels || []).map(cleanChannel);
     const activeSession = status.activeSessions?.find(
-      s => cleanChannel(s.channel) === cleaned
+      (s) => cleanChannel(s.channel) === cleaned
     );
     const isLive = Boolean(activeSession);
     const isRunning = monitoredList.includes(cleaned) || isLive;
 
-    setTogglingChannelMap(prev => ({ ...prev, [channel]: true, [cleaned]: true }));
-    const endpoint = isRunning ? "/api/stop" : "/api/start";
+    setTogglingChannelMap((prev) => ({
+      ...prev,
+      [channel]: true,
+      [cleaned]: true,
+    }));
 
     try {
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel: cleaned, channels: config.channels })
-      });
-
-      if (res.ok) {
-        await fetchStatus();
+      if (isRunning) {
+        await vodApi.stopMonitoring({ channel: cleaned });
       } else {
-        const data = await res.json().catch(() => ({}));
-        showToast(data.error || "Action failed", "error", "Stream Monitor");
-        await fetchStatus();
+        await vodApi.startMonitoring({
+          channel: cleaned,
+          channels: config.channels,
+        });
       }
+      await refreshStatus();
     } catch (err: any) {
-      showToast("Action failed: " + (err?.message || "network error"), "error", "Stream Monitor");
-      await fetchStatus();
+      showToast(err?.message || "Action failed", "error", "Stream Monitor");
+      await refreshStatus();
     } finally {
-      setTogglingChannelMap(prev => {
+      setTogglingChannelMap((prev) => {
         const copy = { ...prev };
         delete copy[channel];
         delete copy[cleaned];
@@ -503,149 +300,37 @@ export default function App() {
     }
   };
 
-  const toggleChannelMonitoring = async (channel: string) => {
+  const toggleChannelMonitoring = (channel: string) => {
     if (!config || !status || togglingChannelMap[channel]) return;
-
     const cleaned = cleanChannel(channel);
     if (!cleaned) return;
+
     const monitoredList = (status.monitoredChannels || []).map(cleanChannel);
     const activeSession = status.activeSessions?.find(
-      s => cleanChannel(s.channel) === cleaned
+      (s) => cleanChannel(s.channel) === cleaned
     );
     const isLive = Boolean(activeSession);
     const isRunning = monitoredList.includes(cleaned) || isLive;
 
-    // Only prompt confirmation if actively recording live
     if (isRunning && isLive) {
       setStopConfirmChannel(channel);
       return;
     }
 
-    await executeToggleChannelMonitoring(channel);
-  };
-
-  const handleTaskAction = async (taskId: string, action: string) => {
-    if (pendingTaskActions[taskId]) return;
-
-    if (action === 'open_folder') {
-      const task = status?.activeTasks.find(t => t.id === taskId);
-      handleOpenFolder((task as any)?.folderPath);
-      return;
-    }
-
-    if (action === 'render_chat') {
-      const task = status?.activeTasks.find(t => t.id === taskId);
-      if (task && (task as any).folderPath) {
-        const channelLogin = (task as any).channelLogin || "stream";
-        axios.get(`/api/tasks/${taskId}/chat-files`).then(res => {
-          const fetchedFiles = res.data.files || [];
-          const fileDetails = res.data.fileDetails || [];
-          const defaultW = (config as any)?.chatRender?.width || 350;
-          const defaultH = (config as any)?.chatRender?.height || 800;
-          const mappedFiles = fileDetails.length > 0
-            ? fileDetails.map((d: any) => ({
-                filename: d.filename,
-                width: d.width || defaultW,
-                height: d.height || defaultH,
-                enabled: true,
-                gameName: d.gameName,
-                matchedProfile: d.matchedProfile,
-                isCustomProfile: Boolean(d.isCustomProfile),
-              }))
-            : fetchedFiles.map((f: string) => ({
-                filename: f,
-                width: defaultW,
-                height: defaultH,
-                enabled: true,
-              }));
-          setRenderDialog({
-            taskId,
-            channelLogin,
-            folderPath: (task as any).folderPath,
-            width: mappedFiles[0]?.width || defaultW,
-            height: mappedFiles[0]?.height || defaultH,
-            files: mappedFiles
-          });
-        }).catch(err => {
-          console.error("Failed to fetch chat files", err);
-          setRenderDialog({
-            taskId,
-            channelLogin,
-            folderPath: (task as any).folderPath,
-            width: (config as any)?.chatRender?.width || 350,
-            height: (config as any)?.chatRender?.height || 800
-          });
-        });
-      } else {
-        showToast("Task is missing its recording folder path.", "error", "Chat Render");
-      }
-      return;
-    }
-
-    setPendingTaskActions(prev => ({ ...prev, [taskId]: action }));
-
-    // Optimistically dismiss task card if user clicked dismiss, close, or no
-    if (action === 'dismiss' || action === 'no' || action === 'close') {
-      setStatus(prev => prev ? {
-        ...prev,
-        activeTasks: prev.activeTasks.filter(t => t.id !== taskId)
-      } : null);
-    }
-
-    try {
-      await axios.post(`/api/tasks/${taskId}/action`, { action });
-      await fetchStatus();
-    } catch (err: any) {
-      console.error("Failed to send task action", err);
-      showToast(err.response?.data?.error || err.message || "Failed to execute task action", "error", "Task Queue");
-      await fetchStatus();
-    } finally {
-      setPendingTaskActions(prev => {
-        const copy = { ...prev };
-        delete copy[taskId];
-        return copy;
-      });
-    }
-  };
-
-  const [isDismissingCompleted, setIsDismissingCompleted] = useState(false);
-
-  const handleDismissCompletedTasks = async () => {
-    if (isDismissingCompleted) return;
-    const completedTasks = (status?.activeTasks || []).filter(t => 
-      t.status === 'success' || (!t.actionRequired && t.status !== 'running') || (t.actions && t.actions.some(a => a.value === 'dismiss') && t.status !== 'running')
-    );
-    if (completedTasks.length === 0) return;
-
-    setIsDismissingCompleted(true);
-    // Optimistically remove from state
-    setStatus(prev => prev ? {
-      ...prev,
-      activeTasks: prev.activeTasks.filter(t => !completedTasks.some(c => c.id === t.id))
-    } : null);
-
-    try {
-      await axios.post('/api/tasks/dismiss-completed');
-      await fetchStatus();
-    } catch (err) {
-      console.error("Failed to dismiss completed tasks", err);
-      await fetchStatus();
-    } finally {
-      setIsDismissingCompleted(false);
-    }
+    executeToggleChannelMonitoring(channel);
   };
 
   const forceStitch = async (channel: string) => {
     if (forceStitchingChannels[channel]) return;
-    setForceStitchingChannels(prev => ({ ...prev, [channel]: true }));
+    setForceStitchingChannels((prev) => ({ ...prev, [channel]: true }));
     try {
-      await axios.post("/api/force-stitch", { channel });
-      await fetchStatus();
+      await vodApi.forceStitch(channel);
+      await refreshStatus();
     } catch (err) {
       console.error("Failed to force stitch:", err);
-      await fetchStatus();
+      await refreshStatus();
     } finally {
-      setForceStitchingChannels(prev => {
+      setForceStitchingChannels((prev) => {
         const copy = { ...prev };
         delete copy[channel];
         return copy;
@@ -656,63 +341,333 @@ export default function App() {
   const toggleAutoRender = async (channel: string, currentVal: boolean) => {
     const cleaned = cleanChannel(channel);
     const newVal = !currentVal;
-    
-    // Optimistic toggle in status activeSessions
-    setStatus(prev => prev ? {
-      ...prev,
-      activeSessions: prev.activeSessions.map(s => cleanChannel(s.channel) === cleaned ? { ...s, autoRenderChat: newVal } : s)
-    } : null);
 
-    // Optimistic toggle in config.channelAutoRender
-    setConfig(prev => prev ? {
-      ...prev,
-      channelAutoRender: {
-        ...(prev.channelAutoRender || {}),
-        [cleaned]: newVal
-      }
-    } : null);
+    setStatus((prev) =>
+      prev
+        ? {
+            ...prev,
+            activeSessions: prev.activeSessions.map((s) =>
+              cleanChannel(s.channel) === cleaned
+                ? { ...s, autoRenderChat: newVal }
+                : s
+            ),
+          }
+        : null
+    );
+    setConfig((prev) =>
+      prev
+        ? {
+            ...prev,
+            channelAutoRender: {
+              ...(prev.channelAutoRender || {}),
+              [cleaned]: newVal,
+            },
+          }
+        : null
+    );
 
     try {
-      const res = await axios.post(`/api/sessions/${cleaned}/auto-render`, { enabled: newVal });
-      if (res.data && res.data.config && !isConfigDirty) {
-        setConfig(res.data.config);
+      const res = await vodApi.toggleSessionAutoRender(cleaned, newVal);
+      if (res.config && !isConfigDirty) {
+        setConfig(res.config);
       }
-      await fetchStatus();
+      await refreshStatus();
     } catch (err) {
       console.error("Failed to toggle auto-render", err);
-      await fetchStatus();
+      await refreshStatus();
+    }
+  };
+
+  const setChannelCaptureMode = async (
+    channel: string,
+    captureMode: CaptureMode
+  ) => {
+    const cleaned = cleanChannel(channel);
+    if (!cleaned) return;
+
+    setConfig((prev) =>
+      prev
+        ? {
+            ...prev,
+            channelCaptureModes: {
+              ...(prev.channelCaptureModes || {}),
+              [cleaned]: captureMode,
+            },
+          }
+        : null
+    );
+
+    try {
+      const res = await vodApi.setSessionCaptureMode(cleaned, captureMode);
+      if (res.config && !isConfigDirty) {
+        setConfig(res.config);
+      }
+      const modeLabel =
+        captureMode === "video_only"
+          ? "Video Only"
+          : captureMode === "chat_only"
+          ? "Chat Only"
+          : "Video + Chat";
+      showToast(
+        `Capture mode for @${cleaned} set to ${modeLabel}.`,
+        "info",
+        "Capture Mode"
+      );
+      await refreshStatus();
+    } catch (err: any) {
+      showToast(
+        err?.message || "Failed to update capture mode",
+        "error",
+        "Capture Mode"
+      );
+      await refreshConfig();
+      await refreshStatus();
+    }
+  };
+
+  const executeManualSplice = async (
+    channel: string,
+    action: SpliceActionType = "split_new_part",
+    scope?: ClipScopeType,
+    mins?: number,
+    leadingBufferMinutes?: number
+  ) => {
+    setIsManualSplicing((prev) => ({ ...prev, [channel]: true }));
+    try {
+      const res = await vodApi.spliceGame({
+        channel,
+        action,
+        clipScope: scope,
+        clipMinutes: mins,
+        leadingBufferMinutes,
+      });
+      if (res?.success) {
+        showToast(
+          action === "await_next_game"
+            ? `Outgoing game ended for @${channel}. Recording into next game while awaiting Twitch category update.`
+            : `Manual splice initiated for @${channel}.`,
+          "success",
+          "Video Splice"
+        );
+        await refreshStatus();
+      }
+    } catch (err: any) {
+      showToast(
+        err?.message || "Failed to trigger manual splice",
+        "error",
+        "Video Splice"
+      );
+    } finally {
+      setIsManualSplicing((prev) => {
+        const copy = { ...prev };
+        delete copy[channel];
+        return copy;
+      });
+    }
+  };
+
+  const handleOverrideBuffer = async (channel: string, gameIndex?: number) => {
+    setIsOverridingBuffer((prev) => ({ ...prev, [channel]: true }));
+    try {
+      const res = await vodApi.overrideBuffer(channel, gameIndex);
+      if (res?.success) {
+        showToast(
+          `Skipped transition buffer for @${channel}. Splicing now...`,
+          "success",
+          "Game Switch"
+        );
+        await refreshStatus();
+      }
+    } catch (err: any) {
+      showToast(
+        err?.message || "Failed to override buffer",
+        "error",
+        "Game Switch"
+      );
+    } finally {
+      setIsOverridingBuffer((prev) => {
+        const copy = { ...prev };
+        delete copy[channel];
+        return copy;
+      });
+    }
+  };
+
+  const handleTaskAction = async (taskId: string, action: string) => {
+    if (pendingTaskActions[taskId]) return;
+
+    if (action === "open_folder") {
+      const task = status?.activeTasks.find((t) => t.id === taskId);
+      handleOpenFolder(task?.folderPath);
+      return;
+    }
+
+    if (action === "render_chat") {
+      const task = status?.activeTasks.find((t) => t.id === taskId);
+      if (task && task.folderPath) {
+        const channelLogin = task.channelLogin || "stream";
+        const defaultW = config?.chatRender?.width || 350;
+        const defaultH = config?.chatRender?.height || 800;
+        vodApi
+          .getTaskChatFiles(taskId)
+          .then((res) => {
+            const fetchedFiles = res.files || [];
+            const fileDetails = res.fileDetails || [];
+            const mappedFiles =
+              fileDetails.length > 0
+                ? fileDetails.map((d) => ({
+                    filename: d.filename,
+                    width: d.width || defaultW,
+                    height: d.height || defaultH,
+                    enabled: true,
+                    gameName: d.gameName,
+                    matchedProfile: d.matchedProfile,
+                    isCustomProfile: Boolean(d.isCustomProfile),
+                  }))
+                : fetchedFiles.map((f) => ({
+                    filename: f,
+                    width: defaultW,
+                    height: defaultH,
+                    enabled: true,
+                  }));
+            setRenderDialog({
+              taskId,
+              channelLogin,
+              folderPath: task.folderPath!,
+              width: mappedFiles[0]?.width || defaultW,
+              height: mappedFiles[0]?.height || defaultH,
+              files: mappedFiles,
+            });
+          })
+          .catch(() => {
+            setRenderDialog({
+              taskId,
+              channelLogin,
+              folderPath: task.folderPath!,
+              width: defaultW,
+              height: defaultH,
+            });
+          });
+      } else {
+        showToast(
+          "Task is missing its recording folder path.",
+          "error",
+          "Chat Render"
+        );
+      }
+      return;
+    }
+
+    setPendingTaskActions((prev) => ({ ...prev, [taskId]: action }));
+
+    if (action === "dismiss" || action === "no" || action === "close") {
+      setStatus((prev) =>
+        prev
+          ? {
+              ...prev,
+              activeTasks: prev.activeTasks.filter((t) => t.id !== taskId),
+            }
+          : null
+      );
+    }
+
+    try {
+      await vodApi.runTaskAction(taskId, { action });
+      await refreshStatus();
+    } catch (err: any) {
+      showToast(
+        err?.message || "Failed to execute task action",
+        "error",
+        "Task Queue"
+      );
+      await refreshStatus();
+    } finally {
+      setPendingTaskActions((prev) => {
+        const copy = { ...prev };
+        delete copy[taskId];
+        return copy;
+      });
+    }
+  };
+
+  const handleDismissCompletedTasks = async () => {
+    if (isDismissingCompleted) return;
+    const completedTasks = (status?.activeTasks || []).filter(
+      (t) =>
+        t.status === "success" ||
+        (!t.actionRequired && t.status !== "running") ||
+        (t.actions &&
+          t.actions.some((a) => a.value === "dismiss") &&
+          t.status !== "running")
+    );
+    if (completedTasks.length === 0) return;
+
+    setIsDismissingCompleted(true);
+    setStatus((prev) =>
+      prev
+        ? {
+            ...prev,
+            activeTasks: prev.activeTasks.filter(
+              (t) => !completedTasks.some((c) => c.id === t.id)
+            ),
+          }
+        : null
+    );
+
+    try {
+      await vodApi.dismissCompletedTasks();
+      await refreshStatus();
+    } catch {
+      await refreshStatus();
+    } finally {
+      setIsDismissingCompleted(false);
     }
   };
 
   const submitRenderChat = async () => {
     if (!renderDialog || isSubmittingRender) return;
-    if (renderDialog.files && renderDialog.files.length > 0 && renderDialog.files.filter(f => f.enabled !== false).length === 0) {
-      showToast("Please select at least one chat file to render.", "error", "Chat Render");
+    if (
+      renderDialog.files &&
+      renderDialog.files.length > 0 &&
+      renderDialog.files.filter((f) => f.enabled !== false).length === 0
+    ) {
+      showToast(
+        "Please select at least one chat file to render.",
+        "error",
+        "Chat Render"
+      );
       return;
     }
     setIsSubmittingRender(true);
     try {
       const activeSegments = renderDialog.files
         ? renderDialog.files
-            .filter(f => f.enabled !== false)
-            .map(f => ({
-              ...f,
+            .filter((f) => f.enabled !== false)
+            .map((f) => ({
+              filename: f.filename,
               width: parseInt(String(f.width), 10) || 350,
               height: parseInt(String(f.height), 10) || 800,
             }))
         : undefined;
-      await axios.post(`/api/tasks/${renderDialog.taskId}/action`, { 
-        action: 'render_chat', 
-        width: parseInt(String(renderDialog.width), 10) || 350, 
+      await vodApi.runTaskAction(renderDialog.taskId, {
+        action: "render_chat",
+        width: parseInt(String(renderDialog.width), 10) || 350,
         height: parseInt(String(renderDialog.height), 10) || 800,
-        segments: activeSegments
+        segments: activeSegments,
       });
       setRenderDialog(null);
-      showToast(`Started chat render for @${renderDialog.channelLogin}.`, "success", "Chat Render");
-      await fetchStatus();
+      showToast(
+        `Started chat render for @${renderDialog.channelLogin}.`,
+        "success",
+        "Chat Render"
+      );
+      await refreshStatus();
     } catch (err: any) {
-      console.error("Failed to start chat render", err);
-      showToast(err.response?.data?.error || err.message || "Failed to start chat render", "error", "Chat Render");
+      showToast(
+        err?.message || "Failed to start chat render",
+        "error",
+        "Chat Render"
+      );
     } finally {
       setIsSubmittingRender(false);
     }
@@ -721,68 +676,21 @@ export default function App() {
   const fetchRecentFolders = async () => {
     setIsLoadingRecentFolders(true);
     try {
-      const res = await axios.get("/api/recent-folders");
-      if (res.data && Array.isArray(res.data.folders)) {
-        setRecentFolders(res.data.folders);
+      const res = await vodApi.getRecentFolders();
+      if (res && Array.isArray(res.folders)) {
+        setRecentFolders(res.folders);
       }
-    } catch (err) {
-      console.warn("Failed to load recent folders", err);
+    } catch {
+      // Ignore folder scan error
     } finally {
       setIsLoadingRecentFolders(false);
     }
   };
 
-  const setChannelCaptureMode = async (channel: string, captureMode: 'both' | 'video_only' | 'chat_only') => {
-    const cleaned = cleanChannel(channel);
-    if (!cleaned) return;
-
-    setConfig(prev => prev ? {
-      ...prev,
-      channelCaptureModes: {
-        ...(prev.channelCaptureModes || {}),
-        [cleaned]: captureMode
-      }
-    } : null);
-
-    try {
-      const res = await axios.post(`/api/sessions/${cleaned}/capture-mode`, { mode: captureMode, captureMode });
-      if (res.data && res.data.config && !isConfigDirty) {
-        setConfig(res.data.config);
-      }
-      const modeLabel = captureMode === 'video_only' ? 'Video Only' : captureMode === 'chat_only' ? 'Chat Only' : 'Video + Chat';
-      showToast(`Capture mode for @${cleaned} set to ${modeLabel}.`, "info", "Capture Mode");
-      await fetchStatus();
-    } catch (err: any) {
-      showToast(err.response?.data?.error || err.message || "Failed to update capture mode", "error", "Capture Mode");
-      await fetchConfig();
-      await fetchStatus();
-    }
-  };
-
-  const resolveClientGameProfile = (gameName?: string | null) => {
-    const defaultW = (config as any)?.chatRender?.width || 350;
-    const defaultH = (config as any)?.chatRender?.height || 800;
-    const profiles: { gameName: string; width: number; height: number }[] = Array.isArray((config as any)?.chatRender?.gameProfiles)
-      ? (config as any).chatRender.gameProfiles
-      : [];
-    if (!gameName || profiles.length === 0) {
-      return { width: defaultW, height: defaultH, matchedProfile: undefined as string | undefined, isCustomProfile: false };
-    }
-    const cleanTarget = gameName.trim().toLowerCase();
-    const baseTarget = cleanTarget.replace(/\s+part\s+\d+$/i, '').trim();
-    const match = profiles.find(p => {
-      const pName = (p.gameName || '').trim().toLowerCase();
-      return pName === cleanTarget || pName === baseTarget;
-    });
-    if (match) {
-      return { width: match.width, height: match.height, matchedProfile: match.gameName, isCustomProfile: true };
-    }
-    return { width: defaultW, height: defaultH, matchedProfile: undefined as string | undefined, isCustomProfile: false };
-  };
-
   const openQuickGameProfile = (gameName: string) => {
-    const baseGameName = gameName.replace(/\s+Part\s+\d+$/i, '').trim() || gameName.trim();
-    const resolved = resolveClientGameProfile(baseGameName);
+    const baseGameName =
+      gameName.replace(/\s+Part\s+\d+$/i, "").trim() || gameName.trim();
+    const resolved = resolveClientGameProfile(config, baseGameName);
     setQuickGameProfileModal({
       gameName: baseGameName,
       width: resolved.width,
@@ -795,38 +703,60 @@ export default function App() {
     if (!quickGameProfileModal || isSavingQuickGameProfile) return;
     setIsSavingQuickGameProfile(true);
     try {
-      const rawW = parseInt(String(quickGameProfileModal.width), 10) || ((config as any)?.chatRender?.width || 350);
-      const rawH = parseInt(String(quickGameProfileModal.height), 10) || ((config as any)?.chatRender?.height || 800);
+      const rawW =
+        parseInt(String(quickGameProfileModal.width), 10) ||
+        config?.chatRender?.width ||
+        350;
+      const rawH =
+        parseInt(String(quickGameProfileModal.height), 10) ||
+        config?.chatRender?.height ||
+        800;
       const clampedW = Math.max(100, Math.min(7680, rawW));
       const clampedH = Math.max(100, Math.min(7680, rawH));
       const evenW = clampedW % 2 !== 0 ? clampedW + 1 : clampedW;
       const evenH = clampedH % 2 !== 0 ? clampedH + 1 : clampedH;
 
-      const res = await axios.post('/api/game-profiles', {
+      const res = await vodApi.saveGameProfile({
         gameName: quickGameProfileModal.gameName,
         width: evenW,
         height: evenH,
         remove,
       });
 
-      if (res.data && Array.isArray(res.data.gameProfiles)) {
-        setConfig(prev => prev ? {
-          ...prev,
-          chatRender: {
-            ...prev.chatRender,
-            gameProfiles: res.data.gameProfiles,
-          }
-        } : null);
+      if (res && Array.isArray(res.gameProfiles)) {
+        setConfig((prev) =>
+          prev
+            ? {
+                ...prev,
+                chatRender: {
+                  ...prev.chatRender!,
+                  gameProfiles: res.gameProfiles,
+                },
+              }
+            : null
+        );
       }
 
       if (remove) {
-        showToast(`Reset "${quickGameProfileModal.gameName}" to default chat render dimensions.`, "info", "Game Profile");
+        showToast(
+          `Reset "${quickGameProfileModal.gameName}" to default chat render dimensions.`,
+          "info",
+          "Game Profile"
+        );
       } else {
-        showToast(`Saved ${evenW}×${evenH} render profile for "${quickGameProfileModal.gameName}".`, "success", "Game Profile");
+        showToast(
+          `Saved ${evenW}×${evenH} render profile for "${quickGameProfileModal.gameName}".`,
+          "success",
+          "Game Profile"
+        );
       }
       setQuickGameProfileModal(null);
     } catch (err: any) {
-      showToast(err.response?.data?.error || err.message || "Failed to save game profile", "error", "Game Profile");
+      showToast(
+        err?.message || "Failed to save game profile",
+        "error",
+        "Game Profile"
+      );
     } finally {
       setIsSavingQuickGameProfile(false);
     }
@@ -838,11 +768,15 @@ export default function App() {
       return;
     }
     try {
-      const res = await axios.post('/api/chat-file-profile', { filePath: filePath.trim() });
-      if (res.data && res.data.width && res.data.height) {
-        setManualRenderWidth(res.data.width);
-        setManualRenderHeight(res.data.height);
-        setManualRenderMatchedProfile(res.data.isCustomProfile ? (res.data.matchedProfile || res.data.gameName || 'Custom Profile') : null);
+      const res = await vodApi.getChatFileProfile(filePath.trim());
+      if (res && res.width && res.height) {
+        setManualRenderWidth(res.width);
+        setManualRenderHeight(res.height);
+        setManualRenderMatchedProfile(
+          res.isCustomProfile
+            ? res.matchedProfile || res.gameName || "Custom Profile"
+            : null
+        );
       }
     } catch {
       setManualRenderMatchedProfile(null);
@@ -851,8 +785,8 @@ export default function App() {
 
   const openManualRenderModal = () => {
     setManualRenderPath("");
-    setManualRenderWidth((config as any)?.chatRender?.width || 350);
-    setManualRenderHeight((config as any)?.chatRender?.height || 800);
+    setManualRenderWidth(config?.chatRender?.width || 350);
+    setManualRenderHeight(config?.chatRender?.height || 800);
     setManualRenderMatchedProfile(null);
     setManualRenderMsg(null);
     setManualRenderDialog(true);
@@ -861,29 +795,41 @@ export default function App() {
 
   const submitManualRender = async () => {
     if (!manualRenderPath.trim()) {
-      setManualRenderMsg({ type: 'error', text: 'Please enter or select a JSON file path.' });
+      setManualRenderMsg({
+        type: "error",
+        text: "Please enter or select a JSON file path.",
+      });
       return;
     }
     setIsStartingManualRender(true);
     setManualRenderMsg(null);
     try {
-      const res = await axios.post('/api/render/manual', {
+      const res = await vodApi.startManualRender({
         filePath: manualRenderPath.trim(),
         width: parseInt(String(manualRenderWidth), 10) || 350,
-        height: parseInt(String(manualRenderHeight), 10) || 800
+        height: parseInt(String(manualRenderHeight), 10) || 800,
       });
-      if (res.data && res.data.success) {
-        setManualRenderMsg({ type: 'success', text: res.data.message || 'Render initiated!' });
+      if (res?.success) {
+        setManualRenderMsg({
+          type: "success",
+          text: res.message || "Render initiated!",
+        });
         setTimeout(() => {
           setManualRenderDialog(false);
           setActiveTab("dashboard");
         }, 1200);
       } else {
-        setManualRenderMsg({ type: 'error', text: res.data?.error || 'Failed to start render' });
+        setManualRenderMsg({
+          type: "error",
+          text: res?.error || "Failed to start render",
+        });
       }
-      await fetchStatus();
+      await refreshStatus();
     } catch (err: any) {
-      setManualRenderMsg({ type: 'error', text: err.response?.data?.error || err.message || 'Error triggering manual render' });
+      setManualRenderMsg({
+        type: "error",
+        text: err?.message || "Error triggering manual render",
+      });
     } finally {
       setIsStartingManualRender(false);
     }
@@ -898,51 +844,63 @@ export default function App() {
 
   const submitRecoverFolder = async () => {
     if (!recoverFolderPath.trim()) {
-      setRecoverFolderMsg({ type: 'error', text: 'Please select or enter a session folder path.' });
+      setRecoverFolderMsg({
+        type: "error",
+        text: "Please select or enter a session folder path.",
+      });
       return;
     }
     setIsStartingRecovery(true);
     setRecoverFolderMsg(null);
     try {
-      const res = await axios.post('/api/recover-folder-video', {
-        folderPath: recoverFolderPath.trim()
-      });
-      if (res.data && res.data.success) {
-        setRecoverFolderMsg({ type: 'success', text: `Recovery started for ${res.data.folderPath}` });
+      const res = await vodApi.recoverFolderVideo(recoverFolderPath.trim());
+      if (res?.success) {
+        setRecoverFolderMsg({
+          type: "success",
+          text: `Recovery started for ${res.folderPath}`,
+        });
         setTimeout(() => {
           setRecoverFolderDialog(false);
           setActiveTab("dashboard");
         }, 1000);
       } else {
-        setRecoverFolderMsg({ type: 'error', text: res.data?.error || 'Failed to start folder recovery' });
+        setRecoverFolderMsg({
+          type: "error",
+          text: res?.error || "Failed to start folder recovery",
+        });
       }
-      await fetchStatus();
+      await refreshStatus();
     } catch (err: any) {
-      setRecoverFolderMsg({ type: 'error', text: err.response?.data?.error || err.message || 'Failed to trigger folder video recovery' });
+      setRecoverFolderMsg({
+        type: "error",
+        text: err?.message || "Failed to trigger folder video recovery",
+      });
     } finally {
       setIsStartingRecovery(false);
     }
   };
 
-  const monitoredChannelsList = (status?.monitoredChannels || []).map(cleanChannel);
-  const channelsToDisplay = useMemo(() => {
-    const configured = (config?.channels || []).map(cleanChannel).filter(Boolean);
-    const result: (string | null)[] = [configured[0] || null, configured[1] || null];
-    // Include active sessions if any are finishing up or orphaned
-    if (status?.activeSessions) {
-      for (const s of status.activeSessions) {
-        const cleaned = cleanChannel(s.channel);
-        if (cleaned && !result.includes(cleaned)) {
-          result.push(cleaned);
-        }
-      }
+  const executeReset = async () => {
+    if (isResetting) return;
+    setIsResetting(true);
+    try {
+      await vodApi.emergencyReset();
+      showToast(
+        "Program rebooted and all active background tasks cleared.",
+        "success",
+        "Emergency Reset"
+      );
+      await refreshStatus();
+    } catch (err: any) {
+      showToast(
+        `Failed to reboot program: ${err?.message || "network error"}`,
+        "error",
+        "Emergency Reset"
+      );
+    } finally {
+      setIsResetting(false);
     }
-    return result;
-  }, [config?.channels, status?.activeSessions]);
-  const configuredSlotsCount = useMemo(
-    () => channelsToDisplay.filter((c): c is string => Boolean(c)).length,
-    [channelsToDisplay]
-  );
+  };
 
   if (loading) {
     return (
@@ -952,3357 +910,195 @@ export default function App() {
     );
   }
 
+  const defaultRenderW = config?.chatRender?.width || 350;
+  const defaultRenderH = config?.chatRender?.height || 800;
+  const spliceActiveSession = manualSpliceChannel
+    ? status?.activeSessions.find(
+        (s) => cleanChannel(s.channel) === cleanChannel(manualSpliceChannel)
+      )
+    : undefined;
+
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-[#e0e0e0] font-sans selection:bg-purple-500/30">
-      <div className="fixed left-0 top-0 bottom-0 w-68 bg-[#111111] border-r border-white/5 flex flex-col">
-        <div className="px-5 py-4 border-b border-white/5 relative">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-purple-600 rounded-lg flex items-center justify-center shadow-md shadow-purple-500/20">
-              <Activity className="w-4.5 h-4.5 text-white" />
-            </div>
-            <div>
-              <h1 className="font-bold text-base tracking-tight text-white leading-tight">VOD Automator</h1>
-              <p className="text-xs text-purple-400 font-mono font-medium">v5.2.5</p>
-            </div>
-          </div>
-        </div>
-
-        <nav className="flex-1 px-3 py-4 space-y-1.5 overflow-y-auto">
-          <button onClick={() => handleTabSelect("dashboard")} className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all cursor-pointer ${activeTab === "dashboard" ? "bg-purple-600/10 text-purple-400 border border-purple-500/20" : "text-gray-400 hover:bg-white/5 hover:text-white border border-transparent"}`}>
-            <Tv className="w-4.5 h-4.5" />
-            <span>Livestream Monitor</span>
-          </button>
-          <button onClick={() => handleTabSelect("settings")} className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-sm font-semibold transition-all cursor-pointer ${activeTab === "settings" ? "bg-purple-600/10 text-purple-400 border border-purple-500/20" : "text-gray-400 hover:bg-white/5 hover:text-white border border-transparent"}`}>
-            <span className="flex items-center gap-2.5">
-              <Settings className="w-4.5 h-4.5" />
-              <span>Settings</span>
-            </span>
-            {isConfigDirty && (
-              <span className="w-2 h-2 rounded-full bg-amber-400" title="Unsaved settings changes" />
-            )}
-          </button>
-          <button onClick={() => handleTabSelect("logs")} className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all cursor-pointer ${activeTab === "logs" ? "bg-purple-600/10 text-purple-400 border border-purple-500/20" : "text-gray-400 hover:bg-white/5 hover:text-white border border-transparent"}`}>
-            <Terminal className="w-4.5 h-4.5" />
-            <span>System Log</span>
-          </button>
-        </nav>
-
-        {/* System Health Relocated to Bottom Left Sidebar */}
-        <div className="p-4 border-t border-white/5 bg-black/25 space-y-3 shrink-0">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-bold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
-              <HardDrive className="w-4 h-4 text-purple-400" />
-              System Health
-            </span>
-            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              Online
-            </span>
-          </div>
-
-          {status?.systemHealth ? (
-            <div className="space-y-2.5 text-sm">
-              {/* Storage */}
-              <div className="bg-[#161618] border border-white/5 rounded-lg p-2.5">
-                <div className="flex items-center justify-between text-gray-300 mb-1.5">
-                  <span className="text-xs text-gray-400">Disk Free</span>
-                  <span className="font-mono font-bold text-white text-xs">{formatBytes(status.systemHealth.diskFree)}</span>
-                </div>
-                {status.systemHealth.diskTotal > 0 && (
-                  <div className="w-full bg-white/10 h-1.5 rounded-full overflow-hidden">
-                    <div 
-                      className={`h-full rounded-full ${
-                        status.systemHealth.diskFree < 5 * 1024 * 1024 * 1024
-                          ? 'bg-red-500'
-                          : status.systemHealth.diskFree < 20 * 1024 * 1024 * 1024
-                            ? 'bg-amber-500'
-                            : 'bg-emerald-500'
-                      }`}
-                      style={{ width: `${Math.max(0, 100 - (status.systemHealth.diskFree / status.systemHealth.diskTotal) * 100)}%` }}
-                    />
-                  </div>
-                )}
-              </div>
-
-              {/* Memory & Uptime inline metrics */}
-              <div className="grid grid-cols-2 gap-2 font-mono text-xs">
-                <div className="bg-[#161618] border border-white/5 rounded-lg p-2">
-                  <div className="text-[11px] text-gray-500 uppercase">Memory</div>
-                  <div className="font-semibold text-gray-200 truncate mt-0.5">{formatBytes(status.systemHealth.memoryUsed)}</div>
-                </div>
-                <div className="bg-[#161618] border border-white/5 rounded-lg p-2">
-                  <div className="text-[11px] text-gray-500 uppercase">Uptime</div>
-                  <div className="font-semibold text-gray-200 truncate mt-0.5">{formatUptime(status.systemHealth.uptime)}</div>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="text-xs text-gray-500 font-mono py-1">Telemetry loading...</div>
-          )}
-        </div>
-      </div>
+      <Sidebar
+        activeTab={activeTab}
+        isConfigDirty={isConfigDirty}
+        sseConnected={sseConnected}
+        systemHealth={status?.systemHealth}
+        onSelectTab={handleTabSelect}
+      />
 
       <main className="ml-68 p-6 max-w-5xl mx-auto">
         <AnimatePresence>
           {activeTab === "dashboard" && (
-            <motion.div key="dashboard" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="space-y-6">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div>
-                  <h2 className="text-3xl font-bold text-white tracking-tight">Livestream Monitor</h2>
-                  <p className="text-sm text-gray-400 mt-0.5">Livestream video and chat recording</p>
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={openRecoverFolderModal}
-                    className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-200 border border-white/10 hover:border-purple-500/30 transition-all cursor-pointer"
-                    title="Stitch uncompiled raw .ts segments in an existing recording folder"
-                  >
-                    <Wrench className="w-3.5 h-3.5 text-purple-400" />
-                    <span>Recover Folder Video</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={openManualRenderModal}
-                    className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-200 border border-white/10 hover:border-purple-500/30 transition-all cursor-pointer"
-                    title="Render any downloaded chat JSON file with ChatRenderCLI / TwitchDownloaderCLI"
-                  >
-                    <Film className="w-3.5 h-3.5 text-purple-400" />
-                    <span>Manual Chat Render</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleOpenFolder()}
-                    className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-200 border border-white/10 hover:border-white/20 transition-all cursor-pointer"
-                    title="Open root downloads folder in OS file explorer"
-                  >
-                    <Folder className="w-3.5 h-3.5 text-purple-400" />
-                    <span>Open Downloads</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* ========================================================================= */}
-              {/* PER-STREAM MONITOR CARDS (SINGLE-COLUMN STACK WITH IN-PLACE EDITING)       */}
-              {/* ========================================================================= */}
-              <div className="space-y-3.5">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h3 className="text-base font-bold text-white tracking-tight flex items-center gap-2">
-                      <Tv className="w-4.5 h-4.5 text-purple-400" />
-                      Monitored Streams ({configuredSlotsCount}/2)
-                    </h3>
-                    <p className="text-sm text-gray-400 mt-0.5">Configure capture mode prior to broadcast, or pause monitoring to rename or clear a channel slot</p>
-                  </div>
-                </div>
-
-                {channelsToDisplay.map((channelName, idx) => {
-                  if (!channelName) {
-                    const isEditingThisSlot = editingChannelIndex === idx;
-                    return (
-                      <div
-                        key={`empty-slot-${idx}`}
-                        className="bg-[#111113]/80 border border-dashed border-white/15 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition-all hover:border-purple-500/30"
-                      >
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div className="w-9 h-9 rounded-lg bg-white/5 border border-white/10 flex items-center justify-center shrink-0">
-                            <Plus className="w-4 h-4 text-purple-400" />
-                          </div>
-                          <div className="min-w-0">
-                            {isEditingThisSlot ? (
-                              <div className="flex items-center gap-2 flex-wrap">
-                                <span className="text-purple-400 font-bold text-sm">@</span>
-                                <input
-                                  type="text"
-                                  autoFocus
-                                  value={tempChannelName}
-                                  onChange={e => setTempChannelName(e.target.value)}
-                                  onKeyDown={e => {
-                                    if (e.key === "Enter") commitChannelName(idx);
-                                    if (e.key === "Escape") {
-                                      setEditingChannelIndex(null);
-                                      setTempChannelName("");
-                                    }
-                                  }}
-                                  placeholder="twitch_username"
-                                  className="bg-black/60 border border-purple-500/60 rounded-lg px-3 py-1.5 text-sm font-bold text-white focus:outline-none w-48"
-                                />
-                                <button
-                                  type="button"
-                                  onClick={() => commitChannelName(idx)}
-                                  className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-semibold uppercase tracking-wider cursor-pointer"
-                                >
-                                  Save Slot
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setEditingChannelIndex(null);
-                                    setTempChannelName("");
-                                  }}
-                                  className="px-2.5 py-1.5 bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white rounded-lg text-xs font-semibold cursor-pointer"
-                                >
-                                  Cancel
-                                </button>
-                              </div>
-                            ) : (
-                              <>
-                                <div className="flex items-center gap-2">
-                                  <h4 className="text-sm font-bold text-gray-200 tracking-tight">
-                                    Unassigned Stream Slot #{idx + 1}
-                                  </h4>
-                                  <span className="text-[11px] px-2 py-0.5 rounded-full bg-white/5 text-gray-400 border border-white/10 uppercase tracking-wider font-semibold">
-                                    Empty
-                                  </span>
-                                </div>
-                                <p className="text-xs text-gray-500 mt-0.5">
-                                  Assign a Twitch channel handle to monitor a {idx === 0 ? "primary" : "second"} broadcast slot.
-                                </p>
-                              </>
-                            )}
-                          </div>
-                        </div>
-
-                        {!isEditingThisSlot && (
-                          <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
-                            <button
-                              type="button"
-                              onClick={() => startEditingChannel(idx, "")}
-                              className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold uppercase tracking-wider bg-purple-600/20 hover:bg-purple-600 text-purple-300 hover:text-white border border-purple-500/30 transition-all cursor-pointer"
-                            >
-                              <Plus className="w-3.5 h-3.5" />
-                              <span>Assign Channel</span>
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  }
-
-                  const cleaned = cleanChannel(channelName);
-                  const isChannelMonitored = monitoredChannelsList.includes(cleaned);
-                  const activeSession = (status?.activeSessions || []).find(
-                    s => cleanChannel(s.channel) === cleaned
-                  );
-                  const isLive = Boolean(activeSession);
-                  const isRunning = isChannelMonitored || isLive;
-                  const isToggling = Boolean(togglingChannelMap[channelName] || togglingChannelMap[cleaned]);
-
-                  return (
-                    <div 
-                      key={idx} 
-                      className={`bg-[#111113] border rounded-xl overflow-hidden shadow-md transition-all ${
-                        isLive 
-                          ? "border-red-500/30" 
-                          : isRunning 
-                          ? "border-purple-500/20" 
-                          : "border-white/10 opacity-85"
-                      }`}
-                    >
-                      {/* Top Bar for Each Stream Card */}
-                      <div className="px-4 py-3 bg-white/[0.02] border-b border-white/5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${
-                            isLive 
-                              ? "bg-red-500 animate-ping" 
-                              : isRunning 
-                              ? "bg-emerald-400 animate-pulse" 
-                              : "bg-gray-600"
-                          }`} />
-
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              {/* In-place Editable Handle (only when monitoring is paused) */}
-                              {!isRunning ? (
-                                editingChannelIndex === idx ? (
-                                  <div className="flex items-center gap-1.5">
-                                    <span className="text-purple-400 font-bold text-sm">@</span>
-                                    <input
-                                      type="text"
-                                      autoFocus
-                                      value={tempChannelName}
-                                      onChange={e => setTempChannelName(e.target.value)}
-                                      onBlur={() => commitChannelName(idx)}
-                                      onKeyDown={e => {
-                                        if (e.key === "Enter") commitChannelName(idx);
-                                        if (e.key === "Escape") setEditingChannelIndex(null);
-                                      }}
-                                      className="bg-black/60 border border-purple-500/60 rounded px-2.5 py-1 text-sm font-bold text-white focus:outline-none w-36"
-                                    />
-                                    <button
-                                      onClick={() => commitChannelName(idx)}
-                                      className="p-1 hover:bg-white/10 rounded text-emerald-400 cursor-pointer"
-                                      title="Save name"
-                                    >
-                                      <Check className="w-4 h-4" />
-                                    </button>
-                                  </div>
-                                ) : (
-                                  <div className="flex items-center gap-1">
-                                    <button
-                                      onClick={() => startEditingChannel(idx, channelName)}
-                                      className="group flex items-center gap-1.5 px-2 py-0.5 rounded-lg hover:bg-white/5 border border-transparent hover:border-white/10 transition-colors cursor-pointer"
-                                      title="Click to rename stream"
-                                    >
-                                      <h4 className="text-base font-bold text-white tracking-tight">
-                                        @{channelName}
-                                      </h4>
-                                      <Edit2 className="w-3.5 h-3.5 text-gray-500 group-hover:text-purple-400 transition-colors" />
-                                    </button>
-                                    {idx < 2 && (
-                                      <button
-                                        type="button"
-                                        onClick={() => clearChannelSlot(idx)}
-                                        className="p-1 rounded-lg text-gray-500 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
-                                        title="Clear this channel slot"
-                                      >
-                                        <Trash2 className="w-3.5 h-3.5" />
-                                      </button>
-                                    )}
-                                  </div>
-                                )
-                              ) : (
-                                <h4 className="text-base font-bold text-white tracking-tight">
-                                  @{channelName}
-                                </h4>
-                              )}
-
-                              {/* Status Pill */}
-                              {isLive ? (
-                                <>
-                                  <span className="text-xs px-2.5 py-0.5 rounded-full bg-red-500/10 text-red-400 font-bold border border-red-500/25 uppercase tracking-wider animate-pulse flex items-center gap-1.5">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
-                                    Recording Live
-                                  </span>
-                                  {activeSession && (
-                                    <span className="text-xs px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-gray-300 font-mono font-medium flex items-center gap-1.5">
-                                      <Clock className="w-3 h-3 text-purple-400" />
-                                      Started {new Date(activeSession.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                    </span>
-                                  )}
-                                </>
-                              ) : isRunning ? (
-                                <span className="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 font-bold border border-emerald-500/20 uppercase tracking-wider">
-                                  Monitoring Active
-                                </span>
-                              ) : (
-                                <span className="text-xs px-2.5 py-0.5 rounded-full bg-white/5 text-gray-400 font-bold border border-white/10 uppercase tracking-wider">
-                                  Paused
-                                </span>
-                              )}
-
-                              {/* If Live: Game & Viewer Count IN LINE */}
-                              {isLive && activeSession && (
-                                <div className="flex items-center gap-2 text-sm flex-wrap">
-                                  {activeSession.currentGame && (() => {
-                                    const gameProfile = resolveClientGameProfile(activeSession.currentGame);
-                                    return (
-                                      <button
-                                        type="button"
-                                        onClick={() => openQuickGameProfile(activeSession.currentGame!)}
-                                        className="group inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/20 hover:border-purple-500/40 text-purple-300 font-medium transition-all cursor-pointer"
-                                        title={`Click to set or edit chat render resolution profile for "${activeSession.currentGame}" (Currently ${gameProfile.width}×${gameProfile.height}${gameProfile.isCustomProfile ? ' custom profile' : ' default'})`}
-                                      >
-                                        <Gamepad2 className="w-3.5 h-3.5 text-purple-400" />
-                                        <span>{activeSession.currentGame}</span>
-                                        <span className={`text-[11px] font-mono px-1.5 py-0.2 rounded ${
-                                          gameProfile.isCustomProfile
-                                            ? "bg-purple-500/30 text-purple-200 border border-purple-400/40"
-                                            : "bg-black/40 text-gray-400 group-hover:text-gray-200"
-                                        }`}>
-                                          {gameProfile.width}×{gameProfile.height}
-                                        </span>
-                                        <Edit2 className="w-3 h-3 text-purple-400/60 group-hover:text-purple-300 transition-colors" />
-                                      </button>
-                                    );
-                                  })()}
-                                  {activeSession.viewersCount !== undefined && activeSession.viewersCount > 0 && (
-                                    <span className="inline-flex items-center gap-1.5 text-gray-300 bg-black/40 px-2.5 py-0.5 rounded-md border border-white/5 font-mono">
-                                      <Users className="w-3.5 h-3.5 text-red-400" />
-                                      {activeSession.viewersCount.toLocaleString()}
-                                    </span>
-                                  )}
-                                  {(() => {
-                                    const activeMode = activeSession.captureMode || config?.channelCaptureModes?.[cleaned] || 'both';
-                                    const modeLabel = activeMode === 'video_only' ? 'Video Only' : activeMode === 'chat_only' ? 'Chat Only' : 'Video + Chat';
-                                    return (
-                                      <span
-                                        className="inline-flex items-center gap-1 text-[11px] font-mono font-semibold uppercase tracking-wider px-2 py-0.5 rounded-md bg-white/5 text-gray-300 border border-white/10"
-                                        title="Capture mode is locked while a broadcast is actively recording"
-                                      >
-                                        {modeLabel}
-                                      </span>
-                                    );
-                                  })()}
-                                </div>
-                              )}
-                            </div>
-
-                            {/* Stream Subtitle */}
-                            <p className="text-xs text-gray-500 mt-0.5 font-mono">
-                              {isLive 
-                                ? (activeSession?.captureMode === 'chat_only' ? "Live IRC + PubSub chat capture • Click game badge to set render resolution" : "Source resolution • Click game badge to set render resolution") 
-                                : isRunning 
-                                ? `Last check: ${timeSinceCheck}s ago` 
-                                : "Monitoring paused • Click handle above to edit"}
-                            </p>
-                          </div>
-                        </div>
-
-                        {/* Individual Channel Controls */}
-                        <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
-                          <button
-                            type="button"
-                            onClick={() => handleOpenFolder(activeSession?.folderPath)}
-                            className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white border border-white/10 transition-colors cursor-pointer"
-                            title={activeSession?.folderPath ? `Open session folder (${activeSession.folderPath})` : "Open downloads folder"}
-                          >
-                            <Folder className="w-4 h-4 text-purple-400" />
-                          </button>
-                          <button
-                            onClick={() => toggleChannelMonitoring(channelName)}
-                            disabled={isToggling}
-                            className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-semibold uppercase tracking-wider transition-all cursor-pointer ${
-                              isToggling ? "opacity-75 cursor-wait " : ""
-                            }${
-                              isRunning
-                                ? "bg-red-500/15 text-red-400 border border-red-500/30 hover:bg-red-500/25"
-                                : "bg-purple-600 text-white hover:bg-purple-500 shadow-md shadow-purple-900/30"
-                            }`}
-                          >
-                            {isToggling ? (
-                              <>
-                                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                                <span>{isRunning ? "Stopping..." : "Starting..."}</span>
-                              </>
-                            ) : isRunning ? (
-                              <>
-                                <Square className="w-3.5 h-3.5 fill-current" />
-                                <span>Stop</span>
-                              </>
-                            ) : (
-                              <>
-                                <Play className="w-3.5 h-3.5 fill-current" />
-                                <span>Start</span>
-                              </>
-                            )}
-                          </button>
-                        </div>
-                      </div>
-
-                      {/* Card Body: Live State vs Stream Offline State */}
-                      {isLive && activeSession ? (
-                        <div className="p-4 space-y-3.5">
-                          {/* Compact metrics strip */}
-                          {(() => {
-                            const activeMode = activeSession.captureMode || config?.channelCaptureModes?.[cleaned] || 'both';
-                            return (
-                              <div className="grid grid-cols-3 gap-2.5">
-                                <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between">
-                                  <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold">Video Segments</span>
-                                  {activeMode === 'chat_only' ? (
-                                    <span className="text-xs font-mono text-gray-500 uppercase">Off (Chat Only)</span>
-                                  ) : (
-                                    <span className="text-sm sm:text-base font-bold text-white font-mono">{activeSession.chunksDownloaded?.toLocaleString() || "0"}</span>
-                                  )}
-                                </div>
-                                <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between">
-                                  <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold">Duration</span>
-                                  <span className="text-sm sm:text-base font-bold text-white font-mono">{formatDuration(activeSession.videoDurationSeconds || 0)}</span>
-                                </div>
-                                <div className="bg-black/30 border border-white/5 rounded-lg px-3 py-2 flex items-center justify-between gap-2">
-                                  <span className="text-xs text-gray-400 uppercase tracking-wider font-semibold flex items-center gap-1.5">
-                                    <MessageSquare className="w-3.5 h-3.5 text-purple-400" />
-                                    Chat & Events
-                                  </span>
-                                  {activeMode === 'video_only' ? (
-                                    <span className="text-xs font-mono text-gray-500 uppercase">Off (Video Only)</span>
-                                  ) : (
-                                    <div className="flex items-center gap-1.5 font-mono">
-                                      <span className="text-sm sm:text-base font-bold text-white" title="Chat Messages & Notices">
-                                        {(activeSession.commentsWritten || 0).toLocaleString()}
-                                      </span>
-                                      {(activeSession.eventsWritten || 0) > 0 && (
-                                        <span
-                                          className="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/30"
-                                          title="Captured Broadcast & Moderation Events (Predictions, Polls, Pins, Redemptions, Timeouts, Mode Changes)"
-                                        >
-                                          +{(activeSession.eventsWritten || 0).toLocaleString()}
-                                        </span>
-                                      )}
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })()}
-
-                          {/* Offline warning if missing chunks */}
-                          {activeSession.missingCount !== undefined && activeSession.missingCount > 0 && (
-                            <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg flex flex-wrap items-center justify-between gap-3 text-sm">
-                              <div className="flex items-center gap-2.5 text-amber-400">
-                                <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400" />
-                                <div>
-                                  <span className="font-bold text-white">Stream offline detected. </span>
-                                  <span className="text-amber-200/90">
-                                    Grace period: <span className="font-mono font-semibold text-amber-300">{formatGraceCountdown((activeSession as any).offlineGraceRemainingSeconds)}</span> remaining before automatic finalization.
-                                  </span>
-                                </div>
-                              </div>
-                              <button 
-                                disabled={Boolean(forceStitchingChannels[activeSession.channel])}
-                                className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold uppercase tracking-wider rounded-lg border transition-all border-amber-500/40 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 hover:text-white cursor-pointer shadow-sm ${
-                                  forceStitchingChannels[activeSession.channel] ? "opacity-75 cursor-wait" : ""
-                                }`} 
-                                onClick={() => forceStitch(activeSession.channel)}
-                                title="Immediately conclude this broadcast and finalize recording now"
-                              >
-                                <CheckCircle2 className="w-3.5 h-3.5" />
-                                <span>{forceStitchingChannels[activeSession.channel] ? "Finalizing..." : "Finalize Recording"}</span>
-                              </button>
-                            </div>
-                          )}
-
-                          {/* Interactive Game Switch Notification Banner with Buffer Override */}
-                          {activeSession.pendingGameSwitch && (
-                            <div className="p-3 bg-purple-500/10 border border-purple-500/30 rounded-lg flex flex-wrap items-center justify-between gap-3 text-sm">
-                              <div className="flex items-center gap-2.5">
-                                <div className="w-8 h-8 rounded-lg bg-purple-500/20 border border-purple-500/30 flex items-center justify-center shrink-0">
-                                  <Scissors className="w-4 h-4 text-purple-400" />
-                                </div>
-                                <div>
-                                  <div className="font-semibold text-white flex items-center gap-2">
-                                    <span>Game Switch Detected:</span>
-                                    <span className="text-gray-400 line-through text-xs sm:text-sm">{activeSession.pendingGameSwitch.previousGame}</span>
-                                    <span className="text-purple-400">&rarr;</span>
-                                    <span className="text-purple-300 font-bold text-xs sm:text-sm">{activeSession.pendingGameSwitch.currentGame}</span>
-                                  </div>
-                                  <p className="text-xs text-purple-300/80 mt-0.5">
-                                    Buffering transition ({activeSession.pendingGameSwitch.secondsRemaining}s remaining before automatic splice)
-                                  </p>
-                                </div>
-                              </div>
-                              <button
-                                type="button"
-                                disabled={Boolean(isOverridingBuffer[activeSession.channel])}
-                                onClick={() => handleOverrideBuffer(activeSession.channel, activeSession.pendingGameSwitch?.gameIndex)}
-                                className={`flex items-center gap-1.5 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-bold uppercase tracking-wider transition-all shadow-md shadow-purple-900/30 cursor-pointer ${
-                                  isOverridingBuffer[activeSession.channel] ? "opacity-75 cursor-wait" : ""
-                                }`}
-                                title="Override buffer and immediately trigger game segment splice"
-                              >
-                                <Scissors className="w-3.5 h-3.5" />
-                                <span>{isOverridingBuffer[activeSession.channel] ? "Splicing..." : "Splice Immediately"}</span>
-                              </button>
-                            </div>
-                          )}
-
-                          {/* Awaiting Twitch Category Update Indicator Banner */}
-                          {(() => {
-                            const latestGame = activeSession.games && activeSession.games.length > 0
-                              ? activeSession.games[activeSession.games.length - 1]
-                              : null;
-                            if (!latestGame?.isAwaitingNextGame) return null;
-                            const effectiveLeadMins = latestGame.customLeadingBufferMins ?? (((config as any)?.gameSwitchBufferMins ?? 5) * 2);
-                            return (
-                              <div className="p-3 bg-cyan-500/10 border border-cyan-500/30 rounded-lg flex flex-wrap items-center justify-between gap-3 text-sm">
-                                <div className="flex items-center gap-2.5">
-                                  <div className="w-8 h-8 rounded-lg bg-cyan-500/20 border border-cyan-500/30 flex items-center justify-center shrink-0">
-                                    <Clock className="w-4 h-4 text-cyan-400 animate-pulse" />
-                                  </div>
-                                  <div>
-                                    <div className="font-semibold text-white flex items-center gap-2 flex-wrap">
-                                      <span>Awaiting Twitch Category Update</span>
-                                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
-                                        Fallback: {latestGame.gameName}
-                                      </span>
-                                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-white/5 text-gray-300 border border-white/10">
-                                        {effectiveLeadMins}m lead buffer
-                                      </span>
-                                    </div>
-                                    <p className="text-xs text-cyan-200/80 mt-0.5">
-                                      Recording into next game segment. Will automatically adopt the new game name as soon as the broadcaster updates their Twitch category.
-                                    </p>
-                                  </div>
-                                </div>
-                              </div>
-                            );
-                          })()}
-
-                          {/* Stream Options & Actions Footer */}
-                          <div className="pt-2.5 flex flex-wrap items-center justify-between gap-3 text-sm border-t border-white/5">
-                            {(() => {
-                              const isVideoOnly = (activeSession.captureMode || config?.channelCaptureModes?.[cleaned] || 'both') === 'video_only';
-                              const isChecked = isLive && activeSession ? (activeSession.autoRenderChat || false) : (config?.channelAutoRender?.[cleaned] ?? config?.autoRenderChat ?? false);
-                              return (
-                                <label
-                                  className={`flex items-center gap-2.5 transition-opacity ${
-                                    isVideoOnly
-                                      ? "opacity-40 cursor-not-allowed text-gray-500"
-                                      : "cursor-pointer text-gray-400 hover:text-gray-300"
-                                  }`}
-                                  title={isVideoOnly ? "Chat capture and rendering are disabled in Video Only mode" : "Automatically render chat video when each game segment, VOD backfill, clip, or broadcast finishes"}
-                                >
-                                  <input 
-                                    type="checkbox" 
-                                    disabled={isVideoOnly}
-                                    checked={isChecked} 
-                                    onChange={() => {
-                                      if (!isVideoOnly) {
-                                        toggleAutoRender(channelName, isChecked);
-                                      }
-                                    }} 
-                                    className="w-4 h-4 rounded border-white/20 bg-black/40 text-purple-600 focus:ring-0 disabled:cursor-not-allowed" 
-                                  />
-                                  <span className="text-sm">Auto-render chat segments</span>
-                                </label>
-                              );
-                            })()}
-
-                            <div className="flex items-center gap-2">
-                              <button
-                                type="button"
-                                disabled={Boolean(isManualSplicing[activeSession.channel])}
-                                onClick={() => {
-                                  const defaultBuf = (config as any)?.gameSwitchBufferMins ?? 5;
-                                  setAwaitLeadingBufferInput(String(defaultBuf * 2));
-                                  setSpliceAction('split_new_part');
-                                  setManualSpliceChannel(activeSession.channel);
-                                }}
-                                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white border border-white/10 hover:border-purple-500/40 transition-all cursor-pointer ${
-                                  isManualSplicing[activeSession.channel] ? "opacity-75 cursor-wait" : ""
-                                }`}
-                                title="Cut game segment, extract a standalone highlight clip, or append to previous game"
-                              >
-                                <Scissors className="w-3.5 h-3.5 text-purple-400" />
-                                <span>{isManualSplicing[activeSession.channel] ? "Cutting..." : "Splice Game Segment"}</span>
-                              </button>
-                            </div>
-                          </div>
-                        </div>
-                      ) : (
-                        /* Revised Idle Polling State */
-                        <div className="px-4 py-3 bg-black/20 flex flex-wrap items-center justify-between gap-3 text-sm">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <span className="w-2 h-2 rounded-full bg-gray-500 shrink-0" />
-                            <span className="font-semibold text-gray-300">Stream Offline.</span>
-                            <span className="text-gray-400">Recording will start when broadcast begins.</span>
-                            {!isChannelMonitored && (
-                              <span className="text-xs text-purple-400 font-mono ml-1">
-                                (Click handle above to edit)
-                              </span>
-                            )}
-                          </div>
-
-                          <div className="flex flex-wrap items-center gap-3 ml-auto">
-                            {/* Per-Channel Capture Mode Selector (editable while offline / not recording live) */}
-                            {(() => {
-                              const currentMode = config?.channelCaptureModes?.[cleaned] || 'both';
-                              const isVideoOnly = currentMode === 'video_only';
-                              const isChecked = config?.channelAutoRender?.[cleaned] ?? config?.autoRenderChat ?? false;
-                              return (
-                                <>
-                                  <div className="inline-flex items-center bg-[#18181b] border border-white/10 rounded-lg p-0.5" title="Select what to record for this channel before the broadcast begins">
-                                    {([
-                                      { id: 'both', label: 'Video + Chat' },
-                                      { id: 'video_only', label: 'Video Only' },
-                                      { id: 'chat_only', label: 'Chat Only' }
-                                    ] as const).map(opt => (
-                                      <button
-                                        key={opt.id}
-                                        type="button"
-                                        onClick={() => setChannelCaptureMode(channelName, opt.id)}
-                                        className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-all cursor-pointer ${
-                                          currentMode === opt.id
-                                            ? "bg-purple-600 text-white shadow-sm"
-                                            : "text-gray-400 hover:text-white"
-                                        }`}
-                                      >
-                                        {opt.label}
-                                      </button>
-                                    ))}
-                                  </div>
-
-                                  <label
-                                    className={`flex items-center gap-2 shrink-0 transition-opacity ${
-                                      isVideoOnly
-                                        ? "opacity-40 cursor-not-allowed text-gray-500"
-                                        : "cursor-pointer text-gray-400 hover:text-gray-300"
-                                    }`}
-                                    title={isVideoOnly ? "Chat capture and rendering are disabled in Video Only mode" : "Automatically render chat video when each game segment, VOD backfill, clip, or broadcast finishes"}
-                                  >
-                                    <input 
-                                      type="checkbox" 
-                                      disabled={isVideoOnly}
-                                      checked={isChecked} 
-                                      onChange={() => {
-                                        if (!isVideoOnly) {
-                                          toggleAutoRender(channelName, isChecked);
-                                        }
-                                      }} 
-                                      className="w-4 h-4 rounded border-white/20 bg-black/40 text-purple-600 focus:ring-0 disabled:cursor-not-allowed" 
-                                    />
-                                    <span className="text-xs sm:text-sm">Auto-render chat segments</span>
-                                  </label>
-                                </>
-                              );
-                            })()}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-
-              {/* Unified Activity & Task Queue (Phase 2 - Concept 1) */}
-              {status?.activeTasks && status.activeTasks.length > 0 && (() => {
-                const totalCount = status.activeTasks.length;
-                const completedCount = status.activeTasks.filter(t => 
-                  t.status === 'success' || (!t.actionRequired && t.status !== 'running') || (t.actions && t.actions.some(a => a.value === 'dismiss') && t.status !== 'running')
-                ).length;
-                const actionRequiredCount = status.activeTasks.filter(t => t.actionRequired && t.status !== 'success' && t.status !== 'running' && !t.id.startsWith('render_')).length;
-
-                return (
-                  <div className="bg-[#111113] border border-white/10 rounded-xl overflow-hidden shadow-md">
-                    {/* Header */}
-                    <div className="px-4 py-3 border-b border-white/5 bg-white/[0.02] flex items-center justify-between flex-wrap gap-2.5">
-                      <div className="flex items-center gap-2.5">
-                        <div className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
-                          <Layers className="w-4 h-4 text-purple-400" />
-                        </div>
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <h3 className="text-base font-bold text-white tracking-tight">Activity & Task Queue</h3>
-                            <span className="text-xs px-2 py-0.5 rounded-full bg-white/10 text-gray-300 font-mono">
-                              {totalCount}
-                            </span>
-                            {actionRequiredCount > 0 && (
-                              <span className="text-xs px-2.5 py-0.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-300 font-medium">
-                                {actionRequiredCount} action{actionRequiredCount > 1 ? 's' : ''} needed
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-xs text-gray-400 mt-0.5">Live background exports, segment stitching, and chat processing</p>
-                        </div>
-                      </div>
-
-                      {completedCount > 0 && (
-                        <button
-                          onClick={handleDismissCompletedTasks}
-                          disabled={isDismissingCompleted}
-                          className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-semibold bg-white/5 hover:bg-white/10 text-gray-300 border border-white/10 hover:border-white/20 transition-all cursor-pointer"
-                          title="Clear all completed tasks"
-                        >
-                          {isDismissingCompleted ? (
-                            <RefreshCw className="w-4 h-4 animate-spin text-purple-400" />
-                          ) : (
-                            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                          )}
-                          <span>Dismiss Completed ({completedCount})</span>
-                        </button>
-                      )}
-                    </div>
-
-                    {/* Task List */}
-                    <div className="divide-y divide-white/5">
-                      {status.activeTasks.map((task) => {
-                        const isPending = Boolean(pendingTaskActions[task.id]);
-                        const isSuccess = task.status === 'success';
-                        const isError = task.status === 'error';
-                        const isRunning = task.status === 'running';
-                        const isActionReq = Boolean(task.actionRequired && task.status !== 'success' && !isRunning && !task.id.startsWith('render_'));
-
-                        // Parse percentage if present in progress text
-                        const percentMatch = task.progressText?.match(/(\d+)%/);
-                        const percentVal = percentMatch ? parseInt(percentMatch[1], 10) : null;
-
-                        return (
-                          <div
-                            key={task.id}
-                            className={`px-4 py-3.5 transition-colors ${
-                              isActionReq 
-                                ? "bg-amber-500/[0.03] hover:bg-amber-500/[0.06]" 
-                                : isSuccess
-                                ? "bg-emerald-500/[0.02] hover:bg-emerald-500/[0.04]"
-                                : isError
-                                ? "bg-red-500/[0.02] hover:bg-red-500/[0.04]"
-                                : "hover:bg-white/[0.02]"
-                            }`}
-                          >
-                            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-                              {/* Left details */}
-                              <div className="space-y-1.5 min-w-0 flex-1">
-                                <div className="flex flex-wrap items-center gap-2">
-                                  {/* Status Pill */}
-                                  {isRunning && (
-                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-purple-500/10 border border-purple-500/20 text-purple-300 text-xs font-semibold uppercase tracking-wider">
-                                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-purple-400" />
-                                      {task.name.toLowerCase().includes('stitch') ? 'Stitching' : task.name.toLowerCase().includes('render') ? 'Rendering' : task.name.toLowerCase().includes('backfill') ? 'Backfilling' : 'Processing'}
-                                    </span>
-                                  )}
-                                  {isActionReq && (
-                                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-semibold uppercase tracking-wider">
-                                      <AlertCircle className="w-3.5 h-3.5" />
-                                      Action Required
-                                    </span>
-                                  )}
-                                  {isSuccess && (
-                                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-semibold uppercase tracking-wider">
-                                      <CheckCircle2 className="w-3.5 h-3.5" />
-                                      Completed
-                                    </span>
-                                  )}
-                                  {isError && (
-                                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-red-500/15 border border-red-500/30 text-red-300 text-xs font-semibold uppercase tracking-wider">
-                                      <AlertTriangle className="w-3.5 h-3.5" />
-                                      Error
-                                    </span>
-                                  )}
-
-                                  {/* Channel Badge */}
-                                  {task.channelLogin && (
-                                    <span className="text-sm font-mono font-medium text-gray-300 bg-white/5 px-2.5 py-0.5 rounded border border-white/5">
-                                      @{task.channelLogin}
-                                    </span>
-                                  )}
-
-                                  <h4 className="text-base font-bold text-white tracking-tight truncate">
-                                    {task.name}
-                                  </h4>
-                                </div>
-
-                                <p className="text-sm text-gray-400 font-mono flex flex-wrap items-center gap-2">
-                                  <span>{task.progressText}</span>
-                                  {task.expiresAt && task.expiresAt > Date.now() && (
-                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30 animate-pulse">
-                                      <Clock className="w-3 h-3" />
-                                      Auto-selecting in {Math.max(1, Math.round((task.expiresAt - Date.now()) / 1000))}s
-                                    </span>
-                                  )}
-                                </p>
-
-                                {/* Progress bar for running tasks */}
-                                {isRunning && percentVal !== null && (
-                                  <div className="pt-1 max-w-md">
-                                    <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
-                                      <div 
-                                        className="h-full bg-gradient-to-r from-purple-500 to-purple-400 rounded-full transition-all duration-300"
-                                        style={{ width: `${percentVal}%` }}
-                                      />
-                                    </div>
-                                  </div>
-                                )}
-                              </div>
-
-                              {/* Action Buttons */}
-                              {task.actions && task.actions.length > 0 && (
-                                <div className="flex flex-wrap items-center gap-2 self-start md:self-center shrink-0">
-                                  {task.actions.map((action) => {
-                                    const isActionPending = pendingTaskActions[task.id] === action.value;
-                                    const isPrimary = action.value === 'render_chat' || action.value === 'yes' || action.value === 'retry_stitch' || action.value === 'backfill_full' || action.value === 'resume_vod_backfill';
-                                    const isHighlight = action.value === 'backfill_current_game' || action.value === 'resume_stitch_gap';
-                                    const isCancel = action.value === 'cancel_render' || action.value === 'cancel';
-                                    const isDismiss = action.value === 'dismiss' || action.value === 'close' || action.value === 'no' || action.value === 'backfill_none';
-                                    const isOpenFolder = action.value === 'open_folder';
-
-                                    return (
-                                      <button
-                                        key={action.value}
-                                        disabled={isPending}
-                                        onClick={() => {
-                                          if (action.value === 'cancel_render' || (action.value === 'cancel' && task.id.startsWith('render_'))) {
-                                            setCancelRenderConfirmTask(task);
-                                          } else {
-                                            handleTaskAction(task.id, action.value);
-                                          }
-                                        }}
-                                        className={`flex items-center gap-1.5 px-3 py-2 text-sm font-semibold rounded-lg transition-all border cursor-pointer ${
-                                          isPrimary
-                                            ? "bg-purple-600 hover:bg-purple-500 text-white border-purple-500/40 shadow-md shadow-purple-900/20"
-                                            : isHighlight
-                                            ? "bg-purple-500/20 hover:bg-purple-500/30 text-purple-200 border-purple-500/40"
-                                            : isCancel
-                                            ? "bg-red-500/10 hover:bg-red-500/20 text-red-300 hover:text-red-200 border-red-500/30"
-                                            : isDismiss
-                                            ? "bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white border-white/10"
-                                            : "bg-white/5 hover:bg-white/10 text-gray-300 border-white/10"
-                                        } ${isPending ? "opacity-60 cursor-not-allowed" : ""}`}
-                                      >
-                                        {isActionPending ? (
-                                          <RefreshCw className="w-4 h-4 animate-spin" />
-                                        ) : action.value === 'backfill_full' || action.value === 'resume_vod_backfill' ? (
-                                          <Download className="w-4 h-4" />
-                                        ) : action.value === 'backfill_current_game' ? (
-                                          <Gamepad2 className="w-4 h-4" />
-                                        ) : action.value === 'resume_stitch_gap' ? (
-                                          <Scissors className="w-4 h-4" />
-                                        ) : isPrimary && action.value === 'render_chat' ? (
-                                          <MessageSquare className="w-4 h-4" />
-                                        ) : isPrimary && action.value === 'yes' ? (
-                                          <Play className="w-4 h-4 fill-current" />
-                                        ) : isPrimary && action.value === 'retry_stitch' ? (
-                                          <RefreshCw className="w-4 h-4" />
-                                        ) : isOpenFolder ? (
-                                          <Folder className="w-4 h-4" />
-                                        ) : isCancel || isDismiss ? (
-                                          <X className="w-4 h-4" />
-                                        ) : null}
-                                        <span>{action.label}</span>
-                                      </button>
-                                    );
-                                  })}
-                                </div>
-                              )}
-
-                              {/* Passive dismiss for completed/error task with no explicit buttons */}
-                              {(!task.actions || task.actions.length === 0) && !isRunning && (
-                                <button
-                                  onClick={() => handleTaskAction(task.id, 'dismiss')}
-                                  className="flex items-center gap-1.5 px-3 py-2 text-sm font-semibold rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white border border-white/10 self-start md:self-center shrink-0 transition-all cursor-pointer"
-                                  title="Dismiss task"
-                                >
-                                  <X className="w-4 h-4" />
-                                  <span>Dismiss</span>
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {renderDialog && (
-                <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-                  <div className="bg-[#141416] border border-white/10 p-6 rounded-xl max-w-md w-full space-y-4 max-h-[85vh] overflow-y-auto shadow-2xl">
-                    <div>
-                      <h3 className="text-lg font-bold text-white tracking-tight">Render Chat Video</h3>
-                      <p className="text-sm text-gray-400 mt-0.5">Configure dimensions for {renderDialog.channelLogin}</p>
-                    </div>
-
-                    {(!renderDialog.files || renderDialog.files.length === 0) ? (
-                      <div className="grid grid-cols-2 gap-3">
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Width</label>
-                          <input
-                            type="number"
-                            value={renderDialog.width ?? ""}
-                            onChange={e => setRenderDialog({...renderDialog, width: e.target.value as any})}
-                            onBlur={e => setRenderDialog({...renderDialog, width: parseInt(e.target.value, 10) || ((config as any)?.chatRender?.width || 350)})}
-                            className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Height</label>
-                          <input
-                            type="number"
-                            value={renderDialog.height ?? ""}
-                            onChange={e => setRenderDialog({...renderDialog, height: e.target.value as any})}
-                            onBlur={e => setRenderDialog({...renderDialog, height: parseInt(e.target.value, 10) || ((config as any)?.chatRender?.height || 800)})}
-                            className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="space-y-3">
-                        {renderDialog.files.map((file, idx) => (
-                          <div key={idx} className={`bg-[#1c1c1f] p-3.5 rounded-lg border ${file.enabled === false ? 'border-red-500/30 opacity-50' : 'border-white/5'} space-y-3 transition-opacity`}>
-                            <div className="flex items-center justify-between gap-2.5">
-                              <div className="flex items-center gap-2.5 min-w-0">
-                                <input 
-                                  type="checkbox" 
-                                  checked={file.enabled !== false} 
-                                  onChange={e => {
-                                    const newFiles = [...renderDialog.files!];
-                                    newFiles[idx].enabled = e.target.checked;
-                                    setRenderDialog({...renderDialog, files: newFiles});
-                                  }}
-                                  className="w-4 h-4 rounded text-purple-500 bg-[#242428] border-white/10 shrink-0"
-                                />
-                                <p className="text-sm font-medium text-white truncate" title={file.filename}>{file.filename}</p>
-                              </div>
-                              {file.isCustomProfile && (
-                                <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 shrink-0" title={`Matched Per-Game Profile: ${file.matchedProfile || file.gameName}`}>
-                                  {file.matchedProfile || file.gameName} Profile
-                                </span>
-                              )}
-                            </div>
-                            <div className="grid grid-cols-2 gap-3">
-                              <div className="space-y-1.5">
-                                <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Width</label>
-                                <input
-                                  type="number"
-                                  value={file.width ?? ""}
-                                  onChange={e => {
-                                    const newFiles = [...renderDialog.files!];
-                                    newFiles[idx].width = e.target.value as any;
-                                    setRenderDialog({...renderDialog, files: newFiles});
-                                  }}
-                                  onBlur={e => {
-                                    const newFiles = [...renderDialog.files!];
-                                    newFiles[idx].width = parseInt(e.target.value, 10) || ((config as any)?.chatRender?.width || 350);
-                                    setRenderDialog({...renderDialog, files: newFiles});
-                                  }}
-                                  className="w-full bg-[#242428] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                                />
-                              </div>
-                              <div className="space-y-1.5">
-                                <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Height</label>
-                                <input
-                                  type="number"
-                                  value={file.height ?? ""}
-                                  onChange={e => {
-                                    const newFiles = [...renderDialog.files!];
-                                    newFiles[idx].height = e.target.value as any;
-                                    setRenderDialog({...renderDialog, files: newFiles});
-                                  }}
-                                  onBlur={e => {
-                                    const newFiles = [...renderDialog.files!];
-                                    newFiles[idx].height = parseInt(e.target.value, 10) || ((config as any)?.chatRender?.height || 800);
-                                    setRenderDialog({...renderDialog, files: newFiles});
-                                  }}
-                                  className="w-full bg-[#242428] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                                />
-                              </div>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    <div className="flex justify-end gap-3 pt-3.5 border-t border-white/10">
-                      <button 
-                        onClick={() => setRenderDialog(null)} 
-                        disabled={isSubmittingRender}
-                        className="px-4 py-2 text-sm font-semibold text-gray-400 hover:text-white rounded-lg transition-colors cursor-pointer"
-                      >
-                        Cancel
-                      </button>
-                      <button 
-                        onClick={submitRenderChat} 
-                        disabled={isSubmittingRender || Boolean(renderDialog.files && renderDialog.files.length > 0 && renderDialog.files.filter(f => f.enabled !== false).length === 0)}
-                        className={`flex items-center gap-2 px-4.5 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-semibold uppercase tracking-wider transition-colors shadow-md shadow-purple-900/30 cursor-pointer ${
-                          isSubmittingRender || Boolean(renderDialog.files && renderDialog.files.length > 0 && renderDialog.files.filter(f => f.enabled !== false).length === 0) ? "opacity-50 cursor-not-allowed" : ""
-                        }`}
-                      >
-                        {isSubmittingRender && <RefreshCw className="w-4 h-4 animate-spin" />}
-                        {isSubmittingRender ? "Starting..." : "Start Render"}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </motion.div>
+            <LivestreamMonitorView
+              config={config}
+              status={status}
+              togglingChannelMap={togglingChannelMap}
+              forceStitchingChannels={forceStitchingChannels}
+              isOverridingBuffer={isOverridingBuffer}
+              isManualSplicing={isManualSplicing}
+              pendingTaskActions={pendingTaskActions}
+              isDismissingCompleted={isDismissingCompleted}
+              onOpenRecoverFolderModal={openRecoverFolderModal}
+              onOpenManualRenderModal={openManualRenderModal}
+              onOpenFolder={handleOpenFolder}
+              onAssignOrRenameChannel={handleAssignOrRenameChannel}
+              onClearChannelSlot={handleClearChannelSlot}
+              onToggleChannelMonitoring={toggleChannelMonitoring}
+              onOpenQuickGameProfile={openQuickGameProfile}
+              onForceStitch={forceStitch}
+              onOverrideBuffer={handleOverrideBuffer}
+              onToggleAutoRender={toggleAutoRender}
+              onSetCaptureMode={setChannelCaptureMode}
+              onOpenSpliceModal={(channel) => setManualSpliceChannel(channel)}
+              onTaskAction={handleTaskAction}
+              onConfirmCancelRender={(task) => setCancelRenderConfirmTask(task)}
+              onDismissCompletedTasks={handleDismissCompletedTasks}
+            />
           )}
 
           {activeTab === "settings" && (
-            <motion.div key="settings" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="space-y-6">
-              <div>
-                <h2 className="text-3xl font-bold text-white tracking-tight">Settings</h2>
-                <p className="text-sm text-gray-400 mt-0.5">Configure stream monitoring, automated game splicing, per-game render profiles, and chat overlay preferences.</p>
-              </div>
-
-              <div className="flex flex-wrap gap-x-6 gap-y-2 border-b border-white/10 pb-2">
-                <button onClick={() => setSettingsTab('general')} className={`pb-1.5 text-sm font-semibold uppercase tracking-wider transition-colors cursor-pointer ${settingsTab === 'general' ? 'border-b-2 border-purple-500 text-purple-400' : 'text-gray-400 hover:text-white border-b-2 border-transparent'}`}>General</button>
-                <button onClick={() => setSettingsTab('render')} className={`pb-1.5 text-sm font-semibold uppercase tracking-wider transition-colors cursor-pointer ${settingsTab === 'render' ? 'border-b-2 border-purple-500 text-purple-400' : 'text-gray-400 hover:text-white border-b-2 border-transparent'}`}>Render: Video &amp; Output</button>
-                <button onClick={() => setSettingsTab('render_appearance')} className={`pb-1.5 text-sm font-semibold uppercase tracking-wider transition-colors cursor-pointer ${settingsTab === 'render_appearance' ? 'border-b-2 border-purple-500 text-purple-400' : 'text-gray-400 hover:text-white border-b-2 border-transparent'}`}>Render: Chat &amp; Events</button>
-              </div>
-
-              <form onSubmit={handleSaveConfig} className="space-y-5">
-                {settingsTab === 'general' && (
-                  <>
-                    <div className="bg-blue-500/10 border border-blue-500/20 p-4 rounded-xl flex gap-3.5">
-                      <Key className="w-5 h-5 text-blue-400 shrink-0 mt-0.5" />
-                      <div>
-                        <h4 className="text-sm font-bold text-blue-400">How to get your OAuth Token</h4>
-                        <p className="text-sm text-blue-200/70 mt-1 leading-relaxed">
-                          1. Go to Twitch.tv and log in.<br/>
-                          2. Press F12 to open Developer Tools, go to the <b>Application</b> tab (or Storage).<br/>
-                          3. Under <b>Cookies</b>, find the cookie named <code>auth-token</code> and paste its value below.
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Browser OAuth Token</label>
-                        <div className="relative">
-                          <input
-                            type={showOAuthToken ? "text" : "password"}
-                            value={config?.browserOAuthToken || ""}
-                            onChange={(e) => updateDraftConfig({ ...config!, browserOAuthToken: e.target.value })}
-                            className="w-full bg-[#141416] border border-white/10 rounded-lg pl-3 pr-10 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            placeholder="e.g. a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5 (30-char auth-token)"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setShowOAuthToken(prev => !prev)}
-                            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white p-1 rounded cursor-pointer"
-                            title={showOAuthToken ? "Hide OAuth token" : "Show OAuth token"}
-                          >
-                            {showOAuthToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                          </button>
-                        </div>
-                        <p className="text-xs text-gray-500">Raw 30-character alphanumeric value from your Twitch <code>auth-token</code> cookie.</p>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Browser Client ID</label>
-                        <input
-                          type="text"
-                          value={config?.browserClientId || ""}
-                          onChange={(e) => updateDraftConfig({ ...config!, browserClientId: e.target.value })}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-gray-400"
-                          placeholder="kimne78kx3ncx6brgo4mv6wki5h1ko"
-                        />
-                        <p className="text-xs text-gray-500">Usually you don't need to change this.</p>
-                      </div>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Default Channels (comma separated)</label>
-                      <div className="relative">
-                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 font-semibold text-sm">twitch.tv/</span>
-                        <input
-                          type="text"
-                          value={channelsInput}
-                          onChange={(e) => {
-                            setChannelsInput(e.target.value);
-                            const parsed = e.target.value.split(',').map(cleanChannel).filter(Boolean).slice(0, 2);
-                            updateDraftConfig({ ...config!, channels: parsed });
-                          }}
-                          className="w-full bg-[#141416] border border-white/10 rounded-lg pl-24 pr-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          placeholder="username1, username2"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div className="space-y-1.5">
-                        <div className="flex items-center justify-between">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Save Path</label>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <input
-                            type="text"
-                            value={config?.savePath || ""}
-                            onChange={(e) => updateDraftConfig({ ...config!, savePath: e.target.value })}
-                            className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            placeholder="downloads"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => handleOpenFolder(config?.savePath)}
-                            className="flex items-center gap-1.5 px-3 py-2.5 bg-white/5 hover:bg-white/10 text-gray-200 border border-white/10 rounded-lg text-xs font-semibold shrink-0 transition-colors cursor-pointer"
-                            title="Open save path folder in OS file explorer"
-                          >
-                            <Folder className="w-4 h-4 text-purple-400" />
-                            <span>Open</span>
-                          </button>
-                        </div>
-                        <p className="text-xs text-gray-500">
-                          Relative to program root folder (default: downloads), or an absolute path.
-                        </p>
-                      </div>
-                      <div className="space-y-2.5 flex flex-col justify-end pb-1">
-                        <label className="flex items-center gap-2.5 cursor-pointer group">
-                          <input
-                            type="checkbox"
-                            checked={config?.autoStartMonitoring ?? true}
-                            onChange={(e) => updateDraftConfig({ ...config!, autoStartMonitoring: e.target.checked })}
-                            className="w-4.5 h-4.5 rounded border-white/20 bg-[#141416] text-purple-600 focus:ring-0 focus:ring-offset-0"
-                          />
-                          <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">Start monitoring automatically on launch</span>
-                        </label>
-                        <label className="flex items-center gap-2.5 cursor-pointer group">
-                          <input
-                            type="checkbox"
-                            checked={(config as any)?.autoRenderChat ?? false}
-                            onChange={(e) => updateDraftConfig({ ...config!, autoRenderChat: e.target.checked } as any)}
-                            className="w-4.5 h-4.5 rounded border-white/20 bg-[#141416] text-purple-600 focus:ring-0 focus:ring-offset-0"
-                          />
-                          <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">Auto-render chat segments by default (game switches, backfills &amp; stream end)</span>
-                        </label>
-                      </div>
-                    </div>
-                    
-                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div className="space-y-1.5">
-                         <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
-                            <Clock className="w-4 h-4 text-purple-400" /> Game Switch Buffer (Minutes)
-                         </label>
-                         <p className="text-xs text-gray-500">Time buffered before and after a mid-stream game switch or long-broadcast splice</p>
-                         <input
-                            type="number"
-                            min="0"
-                            max="60"
-                            value={(config as any)?.gameSwitchBufferMins ?? 5}
-                            onChange={(e) => updateDraftConfig({ ...config!, gameSwitchBufferMins: e.target.value } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseInt(e.target.value, 10);
-                              const cleanVal = Number.isFinite(parsed) ? Math.max(0, Math.min(60, parsed)) : 5;
-                              updateDraftConfig({ ...config!, gameSwitchBufferMins: cleanVal } as any);
-                            }}
-                            className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                         />
-                      </div>
-                      <div className="space-y-1.5">
-                         <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
-                            <Clock className="w-4 h-4 text-purple-400" /> Reconnect Grace Period (Minutes)
-                         </label>
-                         <p className="text-xs text-gray-500">Time to keep session alive during streamer disconnects before finalizing</p>
-                         <input
-                            type="number"
-                            min="1"
-                            max="60"
-                            value={(config as any)?.offlineGracePeriodMins ?? 5}
-                            onChange={(e) => updateDraftConfig({ ...config!, offlineGracePeriodMins: e.target.value } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseInt(e.target.value, 10);
-                              const cleanVal = Number.isFinite(parsed) ? Math.max(1, Math.min(60, parsed)) : 5;
-                              updateDraftConfig({ ...config!, offlineGracePeriodMins: cleanVal } as any);
-                            }}
-                            className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                         />
-                      </div>
-                    </div>
-
-                    {/* Extended Stream / Single Game Autosplice */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
-                      <div className="flex items-start justify-between gap-4">
-                        <div className="space-y-1">
-                          <label htmlFor="autosplice-toggle" className="text-sm font-semibold text-white flex items-center gap-2 cursor-pointer">
-                            <Scissors className="w-4 h-4 text-purple-400" />
-                            Extended Stream / Single Game Autosplice
-                          </label>
-                          <p className="text-xs text-gray-400 leading-relaxed">
-                            Automatically splices broadcasts that stay on the same game for an extended duration into manageable video segments, then triggers stitching and chat rendering.
-                          </p>
-                        </div>
-                        <label className="relative inline-flex items-center cursor-pointer shrink-0 mt-0.5">
-                          <input
-                            id="autosplice-toggle"
-                            type="checkbox"
-                            checked={(config as any)?.longGameAutospliceEnabled ?? true}
-                            onChange={(e) => updateDraftConfig({ ...config!, longGameAutospliceEnabled: e.target.checked } as any)}
-                            className="sr-only peer"
-                          />
-                          <div className="w-11 h-6 bg-white/10 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-purple-600"></div>
-                        </label>
-                      </div>
-
-                      {((config as any)?.longGameAutospliceEnabled ?? true) && (
-                        <div className="pt-3 border-t border-white/5 space-y-3">
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <div className="space-y-1.5">
-                              <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
-                                <Clock className="w-3.5 h-3.5 text-purple-400" /> Trigger Threshold (Hours)
-                              </label>
-                              <p className="text-xs text-gray-500">Duration on the same game before triggering a splice (0.25h steps)</p>
-                              <input
-                                type="number"
-                                step="0.25"
-                                min="0.25"
-                                max="72"
-                                value={(config as any)?.longGameAutospliceTriggerHours ?? 9}
-                                onChange={(e) => updateDraftConfig({ ...config!, longGameAutospliceTriggerHours: e.target.value } as any)}
-                                onBlur={(e) => {
-                                  const parsed = parseFloat(e.target.value);
-                                  const val = Number.isFinite(parsed) ? Math.max(0.25, Math.min(72, parsed)) : 9;
-                                  const curCut = parseFloat(String((config as any)?.longGameAutospliceCutHours ?? 8)) || 8;
-                                  updateDraftConfig({
-                                    ...config!,
-                                    longGameAutospliceTriggerHours: val,
-                                    longGameAutospliceCutHours: curCut > val ? val : curCut
-                                  } as any);
-                                }}
-                                className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                              />
-                            </div>
-                            <div className="space-y-1.5">
-                              <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
-                                <Scissors className="w-3.5 h-3.5 text-purple-400" /> Splice Cut Point (Hours)
-                              </label>
-                              <p className="text-xs text-gray-500">Timestamp where segment is cut (must be &le; trigger threshold)</p>
-                              <input
-                                type="number"
-                                step="0.25"
-                                min="0.25"
-                                max={(config as any)?.longGameAutospliceTriggerHours ?? 9}
-                                value={(config as any)?.longGameAutospliceCutHours ?? 8}
-                                onChange={(e) => updateDraftConfig({ ...config!, longGameAutospliceCutHours: e.target.value } as any)}
-                                onBlur={(e) => {
-                                  const trigger = parseFloat(String((config as any)?.longGameAutospliceTriggerHours ?? 9)) || 9;
-                                  const parsed = parseFloat(e.target.value);
-                                  const rawVal = Number.isFinite(parsed) ? Math.max(0.25, parsed) : 8;
-                                  const val = Math.min(trigger, rawVal);
-                                  updateDraftConfig({
-                                    ...config!,
-                                    longGameAutospliceCutHours: val
-                                  } as any);
-                                }}
-                                className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                              />
-                            </div>
-                          </div>
-                          
-                          <div className="px-3 py-2 bg-purple-500/10 border border-purple-500/20 rounded-lg text-xs text-purple-300 flex items-center gap-2">
-                            <Clock className="w-4 h-4 shrink-0 text-purple-400" />
-                            <span>
-                              Active Policy: When a stream stays on one game for <strong>{(config as any)?.longGameAutospliceTriggerHours ?? 9}h</strong>, a splice is cut at the <strong>{(config as any)?.longGameAutospliceCutHours ?? 8}h</strong> mark (with <strong>{(config as any)?.gameSwitchBufferMins ?? 5} min</strong> buffer on both sides).
-                            </span>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
-
-                {settingsTab === 'render' && (
-                  <div className="space-y-6">
-                    {/* Binary Path */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-3">
-                      <div>
-                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Renderer Binary Path</h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Supports both <code className="text-purple-300">ChatRenderCLI.exe</code> (high-speed v2.0-extended renderer) and legacy <code className="text-gray-300">TwitchDownloaderCLI.exe</code>. If both exist in the same folder, <code className="text-purple-300">ChatRenderCLI.exe</code> is preferred automatically.
-                        </p>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">ChatRenderCLI / TwitchDownloaderCLI Path</label>
-                        <input
-                          type="text"
-                          value={(config as any)?.tdPath || ""}
-                          onChange={(e) => updateDraftConfig({ ...config!, tdPath: e.target.value } as any)}
-                          className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          placeholder="TwitchDownloader\ChatRenderCLI.exe (or absolute path)"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Video Dimensions & Encoding */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
-                      <div>
-                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Video Dimensions &amp; Encoding</h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Canvas dimensions are automatically rounded to even pixel multiples for planar YUV420p / YUVA420p encoding compatibility.
-                        </p>
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Default Width (px)</label>
-                          <input
-                            type="number"
-                            min="100"
-                            max="7680"
-                            step="2"
-                            value={(config as any)?.chatRender?.width ?? 350}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, width: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseInt(e.target.value, 10);
-                              const rawVal = Number.isFinite(parsed) && parsed > 0 ? Math.max(100, Math.min(7680, parsed)) : 350;
-                              const cleanVal = rawVal % 2 !== 0 ? rawVal + 1 : rawVal;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, width: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Default Height (px)</label>
-                          <input
-                            type="number"
-                            min="100"
-                            max="7680"
-                            step="2"
-                            value={(config as any)?.chatRender?.height ?? 800}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, height: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseInt(e.target.value, 10);
-                              const rawVal = Number.isFinite(parsed) && parsed > 0 ? Math.max(100, Math.min(7680, parsed)) : 800;
-                              const cleanVal = rawVal % 2 !== 0 ? rawVal + 1 : rawVal;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, height: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Framerate (FPS)</label>
-                          <input
-                            type="number"
-                            min="1"
-                            max="240"
-                            value={(config as any)?.chatRender?.framerate ?? 60}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, framerate: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseInt(e.target.value, 10);
-                              const cleanVal = Number.isFinite(parsed) && parsed > 0 ? Math.max(1, Math.min(240, parsed)) : 60;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, framerate: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">File Format</label>
-                          <select
-                            value={(config as any)?.chatRender?.format || "mp4"}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, format: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                          >
-                            <option value="mp4">MP4 (.mp4)</option>
-                            <option value="webm">WEBM (.webm) - Transparent for VP9</option>
-                            <option value="mov">MOV (.mov) - Transparent for ProRes</option>
-                            <option value="mkv">MKV (.mkv)</option>
-                          </select>
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Codec</label>
-                          <select
-                            value={(config as any)?.chatRender?.codec || "h264"}
-                            onChange={(e) => {
-                              const newCodec = e.target.value;
-                              let newFormat = (config as any)?.chatRender?.format || "mp4";
-                              if ((newCodec === "vp9" || newCodec === "vp8") && newFormat !== "webm" && newFormat !== "mkv") {
-                                newFormat = "webm";
-                              } else if (newCodec === "prores" && newFormat !== "mov" && newFormat !== "mkv") {
-                                newFormat = "mov";
-                              }
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, codec: newCodec, format: newFormat } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                          >
-                            <option value="vp9">VP9 (Transparent, ~98% Smaller WebM)</option>
-                            <option value="prores">ProRes (Transparent, Master MOV)</option>
-                            <option value="h264">H264 (Standard)</option>
-                            <option value="hevc">HEVC / H265</option>
-                            <option value="vp8">VP8</option>
-                          </select>
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Update Rate (seconds)</label>
-                          <input
-                            type="number"
-                            step="0.05"
-                            min="0"
-                            value={(config as any)?.chatRender?.updateRate ?? 0.2}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, updateRate: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseFloat(e.target.value);
-                              const cleanVal = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0.2;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, updateRate: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                          <p className="text-xs text-gray-500">Time in seconds between chat scroll frame updates (`0` = every frame).</p>
-                        </div>
-                      </div>
-
-                      {/* Per-Game Chat Render Resolution Profiles */}
-                      <div className="pt-4 border-t border-white/10 space-y-3">
-                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                          <div>
-                            <h5 className="text-xs font-bold text-purple-300 uppercase tracking-wider flex items-center gap-1.5">
-                              <Gamepad2 className="w-3.5 h-3.5 text-purple-400" />
-                              Per-Game Resolution Profiles
-                            </h5>
-                            <p className="text-xs text-gray-400 mt-0.5">
-                              Override `Default Width × Default Height` for specific games (case-insensitive exact match). You can also click any live game badge on the Livestream Monitor to set its profile on the fly.
-                            </p>
-                          </div>
-                        </div>
-
-                        {Array.isArray((config as any)?.chatRender?.gameProfiles) && (config as any).chatRender.gameProfiles.length > 0 ? (
-                          <div className="space-y-2">
-                            {((config as any).chatRender.gameProfiles as { gameName: string; width: number; height: number }[]).map((prof, pIdx) => (
-                              <div key={`${prof.gameName}-${pIdx}`} className="bg-[#0a0a0c] border border-white/10 rounded-lg p-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                                <div className="flex items-center gap-2 min-w-0 flex-1">
-                                  <Gamepad2 className="w-4 h-4 text-purple-400 shrink-0" />
-                                  <input
-                                    type="text"
-                                    value={prof.gameName}
-                                    onChange={(e) => {
-                                      const next = [...((config as any).chatRender.gameProfiles || [])];
-                                      next[pIdx] = { ...next[pIdx], gameName: e.target.value };
-                                      updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
-                                    }}
-                                    className="bg-[#141416] border border-white/10 rounded px-2.5 py-1 text-xs sm:text-sm font-semibold text-white focus:outline-none focus:border-purple-500/50 w-full max-w-xs"
-                                  />
-                                </div>
-                                <div className="flex items-center gap-2 shrink-0">
-                                  <div className="flex items-center gap-1.5">
-                                    <span className="text-[11px] text-gray-400 uppercase font-mono">W</span>
-                                    <input
-                                      type="number"
-                                      min="100"
-                                      max="7680"
-                                      step="2"
-                                      value={prof.width}
-                                      onChange={(e) => {
-                                        const next = [...((config as any).chatRender.gameProfiles || [])];
-                                        next[pIdx] = { ...next[pIdx], width: e.target.value as any };
-                                        updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
-                                      }}
-                                      onBlur={(e) => {
-                                        const parsed = parseInt(e.target.value, 10);
-                                        const rawVal = Number.isFinite(parsed) && parsed > 0 ? Math.max(100, Math.min(7680, parsed)) : 350;
-                                        const cleanVal = rawVal % 2 !== 0 ? rawVal + 1 : rawVal;
-                                        const next = [...((config as any).chatRender.gameProfiles || [])];
-                                        next[pIdx] = { ...next[pIdx], width: cleanVal };
-                                        updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
-                                      }}
-                                      className="w-20 bg-[#141416] border border-white/10 rounded px-2 py-1 text-xs sm:text-sm font-mono text-white focus:outline-none focus:border-purple-500/50"
-                                    />
-                                  </div>
-                                  <span className="text-gray-500 font-mono">×</span>
-                                  <div className="flex items-center gap-1.5">
-                                    <span className="text-[11px] text-gray-400 uppercase font-mono">H</span>
-                                    <input
-                                      type="number"
-                                      min="100"
-                                      max="7680"
-                                      step="2"
-                                      value={prof.height}
-                                      onChange={(e) => {
-                                        const next = [...((config as any).chatRender.gameProfiles || [])];
-                                        next[pIdx] = { ...next[pIdx], height: e.target.value as any };
-                                        updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
-                                      }}
-                                      onBlur={(e) => {
-                                        const parsed = parseInt(e.target.value, 10);
-                                        const rawVal = Number.isFinite(parsed) && parsed > 0 ? Math.max(100, Math.min(7680, parsed)) : 800;
-                                        const cleanVal = rawVal % 2 !== 0 ? rawVal + 1 : rawVal;
-                                        const next = [...((config as any).chatRender.gameProfiles || [])];
-                                        next[pIdx] = { ...next[pIdx], height: cleanVal };
-                                        updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
-                                      }}
-                                      className="w-20 bg-[#141416] border border-white/10 rounded px-2 py-1 text-xs sm:text-sm font-mono text-white focus:outline-none focus:border-purple-500/50"
-                                    />
-                                  </div>
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      const next = ((config as any).chatRender.gameProfiles || []).filter((_: any, i: number) => i !== pIdx);
-                                      updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: next } } as any);
-                                    }}
-                                    className="p-1.5 rounded hover:bg-red-500/15 text-gray-400 hover:text-red-400 transition-colors cursor-pointer"
-                                    title="Remove game profile"
-                                  >
-                                    <Trash2 className="w-4 h-4" />
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <div className="text-xs text-gray-500 bg-[#0a0a0c] border border-dashed border-white/10 rounded-lg px-3 py-2.5">
-                            No per-game resolution profiles configured yet. All games currently use Default Width × Default Height ({(config as any)?.chatRender?.width ?? 350}×{(config as any)?.chatRender?.height ?? 800}).
-                          </div>
-                        )}
-
-                        {/* Add New Game Profile Row */}
-                        <div className="bg-[#0a0a0c] border border-white/10 rounded-lg p-3 flex flex-col sm:flex-row sm:items-end gap-3">
-                          <div className="flex-1 space-y-1">
-                            <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Game / Category Name</label>
-                            <input
-                              type="text"
-                              value={newProfileGameName}
-                              onChange={e => setNewProfileGameName(e.target.value)}
-                              placeholder="e.g. Just Chatting, VALORANT, League of Legends"
-                              className="w-full bg-[#141416] border border-white/10 rounded-lg px-3 py-1.5 text-xs sm:text-sm text-white placeholder-gray-600 focus:outline-none focus:border-purple-500/50"
-                            />
-                          </div>
-                          <div className="w-24 space-y-1">
-                            <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Width</label>
-                            <input
-                              type="number"
-                              min="100"
-                              max="7680"
-                              step="2"
-                              value={newProfileWidth}
-                              onChange={e => setNewProfileWidth(e.target.value)}
-                              className="w-full bg-[#141416] border border-white/10 rounded-lg px-2.5 py-1.5 text-xs sm:text-sm font-mono text-white focus:outline-none focus:border-purple-500/50"
-                            />
-                          </div>
-                          <div className="w-24 space-y-1">
-                            <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">Height</label>
-                            <input
-                              type="number"
-                              min="100"
-                              max="7680"
-                              step="2"
-                              value={newProfileHeight}
-                              onChange={e => setNewProfileHeight(e.target.value)}
-                              className="w-full bg-[#141416] border border-white/10 rounded-lg px-2.5 py-1.5 text-xs sm:text-sm font-mono text-white focus:outline-none focus:border-purple-500/50"
-                            />
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const trimmed = newProfileGameName.trim();
-                              if (!trimmed) {
-                                showToast("Enter a Twitch game/category name first.", "error", "Game Profile");
-                                return;
-                              }
-                              const rawW = parseInt(newProfileWidth, 10) || 350;
-                              const rawH = parseInt(newProfileHeight, 10) || 800;
-                              const clampedW = Math.max(100, Math.min(7680, rawW));
-                              const clampedH = Math.max(100, Math.min(7680, rawH));
-                              const evenW = clampedW % 2 !== 0 ? clampedW + 1 : clampedW;
-                              const evenH = clampedH % 2 !== 0 ? clampedH + 1 : clampedH;
-                              const existing: { gameName: string; width: number; height: number }[] = Array.isArray((config as any)?.chatRender?.gameProfiles)
-                                ? [...(config as any).chatRender.gameProfiles]
-                                : [];
-                              const idx = existing.findIndex(p => p.gameName.trim().toLowerCase() === trimmed.toLowerCase());
-                              if (idx >= 0) {
-                                existing[idx] = { gameName: trimmed, width: evenW, height: evenH };
-                              } else {
-                                existing.push({ gameName: trimmed, width: evenW, height: evenH });
-                              }
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gameProfiles: existing } } as any);
-                              setNewProfileGameName("");
-                            }}
-                            className="flex items-center justify-center gap-1.5 px-3.5 py-1.5 bg-purple-600/20 hover:bg-purple-600 text-purple-300 hover:text-white border border-purple-500/30 rounded-lg text-xs font-semibold uppercase tracking-wider transition-all cursor-pointer shrink-0"
-                          >
-                            <Plus className="w-3.5 h-3.5" />
-                            <span>Add / Update</span>
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Hardware Acceleration & Memory (ChatRenderCLI) */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
-                      <div>
-                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Parallel Pipeline &amp; Memory (`ChatRenderCLI`)</h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Controls multi-FFmpeg segmented rendering (`-j / --jobs`) and decoded sprite/GIF frame memory budget (`--image-cache-mb`).
-                        </p>
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Parallel Render Jobs (-j / --jobs)</label>
-                          <input
-                            type="number"
-                            min="0"
-                            max="16"
-                            value={(config as any)?.chatRender?.jobs ?? 0}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, jobs: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseInt(e.target.value, 10);
-                              const cleanVal = Number.isFinite(parsed) ? Math.max(0, Math.min(16, parsed)) : 0;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, jobs: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                          <p className="text-xs text-gray-500">`0` = Auto-scale by CPU core count (`1`–`4` parallel FFmpeg workers). Set `1`–`16` to override.</p>
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Image &amp; GIF Cache Budget (MB)</label>
-                          <input
-                            type="number"
-                            min="64"
-                            max="8192"
-                            step="64"
-                            value={(config as any)?.chatRender?.imageCacheMb ?? 256}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, imageCacheMb: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseInt(e.target.value, 10);
-                              const cleanVal = Number.isFinite(parsed) ? Math.max(64, Math.min(8192, parsed)) : 256;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, imageCacheMb: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                          <p className="text-xs text-gray-500">Memory cap (`64`–`8192` MB, default: `256` MB) for decoded animated emotes &amp; Giphy GIFs before LRU eviction.</p>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Timeline Sync, Smoothing & Output Flags */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
-                      <div>
-                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Timeline Sync, Smoothing &amp; Output Flags</h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Compensates for broadcaster encoder latency, integer VOD timestamp clumping, and multi-hour subathon clock drift.
-                        </p>
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat Sync - H.264 / 1080p (s)</label>
-                          <input
-                            type="number"
-                            step="0.5"
-                            value={(config as any)?.chatRender?.syncOffset ?? -2.5}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffset: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseFloat(e.target.value);
-                              const cleanVal = Number.isFinite(parsed) ? parsed : -2.5;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffset: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                          <p className="text-xs text-gray-500">Default: `-2.5s`. Negative shifts chat earlier.</p>
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat Sync - HEVC / 1440p (s)</label>
-                          <input
-                            type="number"
-                            step="0.5"
-                            value={(config as any)?.chatRender?.syncOffsetHevc ?? -7.5}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffsetHevc: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseFloat(e.target.value);
-                              const cleanVal = Number.isFinite(parsed) ? parsed : -7.5;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, syncOffsetHevc: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                          <p className="text-xs text-gray-500">Default: `-7.5s` for Enhanced Broadcasts.</p>
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Dispersion (Message Smoothing)</label>
-                          <select
-                            value={
-                              (config as any)?.chatRender?.dispersion === true || (config as any)?.chatRender?.dispersion === "on"
-                                ? "on"
-                                : (config as any)?.chatRender?.dispersion === false || (config as any)?.chatRender?.dispersion === "off"
-                                ? "off"
-                                : "smart"
-                            }
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, dispersion: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                          >
-                            <option value="smart">Smart (VOD Chat Only)</option>
-                            <option value="on">On (Always)</option>
-                            <option value="off">Off (Never)</option>
-                          </select>
-                          <p className="text-xs text-gray-500">Spreads out whole-second VOD chat timestamps.</p>
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-3 border-t border-white/10">
-                        {[
-                          { key: 'autoCompensateClockDrift', label: 'Auto-Compensate Clock Drift (10+ hr streams)', def: true },
-                          { key: 'generateMask', label: 'Generate Separate Alpha Mask (--generate-mask)', def: false },
-                          { key: 'sharpening', label: 'Sub-Pixel Text Sharpening (--sharpening)', def: false },
-                          { key: 'offline', label: 'Offline Mode - Never Fetch Missing Assets (--offline)', def: false },
-                        ].map(opt => (
-                          <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
-                            <input
-                              type="checkbox"
-                              checked={(config as any)?.chatRender?.[opt.key] ?? opt.def}
-                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
-                              className="w-4.5 h-4.5 rounded border-white/20 bg-[#0a0a0c] text-purple-600 focus:ring-0 focus:ring-offset-0"
-                            />
-                            <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Manual Chat Render Launcher */}
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-purple-950/20 border border-purple-500/20 rounded-xl p-4">
-                      <div>
-                        <h4 className="text-sm font-semibold text-white flex items-center gap-2">
-                          <Film className="w-4 h-4 text-purple-400" />
-                          Manual Chat Render
-                        </h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Select or provide any downloaded chat JSON to test your rendering pipeline and output settings.
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={openManualRenderModal}
-                        className="flex items-center justify-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-semibold transition-colors cursor-pointer shrink-0 shadow-sm"
-                      >
-                        <Play className="w-3.5 h-3.5 fill-current" />
-                        Manual Render...
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {settingsTab === 'render_appearance' && (
-                  <div className="space-y-6">
-                    {/* Live Broadcast Overlays (v2.0-extended StickyTop / ChatScroll / Off) */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
-                      <div>
-                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Live Broadcast Overlays (`v2.0-extended`)</h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Choose how real-time PubSub channel overlays are rendered by <code className="text-purple-300">ChatRenderCLI</code>: pinned at the top of the video canvas (<code className="text-purple-300">StickyTop</code>), inline in the scrolling chat (<code className="text-gray-300">ChatScroll</code>), or disabled (<code className="text-gray-300">Off</code>).
-                        </p>
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                        {[
-                          { key: 'predictionMode', label: 'Predictions (--prediction-mode)', desc: 'Live odds, points & winning outcome' },
-                          { key: 'pollMode', label: 'Polls (--poll-mode)', desc: 'Vote bars, percentages & winner' },
-                          { key: 'pinnedChatMode', label: 'Pinned Chat (--pinned-chat-mode)', desc: 'Mod-pinned messages & Hype pins' },
-                          { key: 'hypeTrainMode', label: 'Hype Train (--hype-train-mode)', desc: 'Level progress bar & goal %' },
-                        ].map(item => (
-                          <div key={item.key} className="space-y-1.5">
-                            <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{item.label}</label>
-                            <select
-                              value={(config as any)?.chatRender?.[item.key] || "StickyTop"}
-                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [item.key]: e.target.value } } as any)}
-                              className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                            >
-                              <option value="StickyTop">StickyTop (Pinned Card)</option>
-                              <option value="ChatScroll">ChatScroll (Inline Notice)</option>
-                              <option value="Off">Off (Hidden)</option>
-                            </select>
-                            <p className="text-xs text-gray-500">{item.desc}</p>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Enriched Chat & Broadcast Events */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
-                      <div>
-                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Enriched Chat &amp; Broadcast Events (`v2.0-extended`)</h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Toggle rich visual cards, reply headers, highlights, and Bits Power-Ups captured from Twitch IRCv3 and PubSub.
-                        </p>
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                        {[
-                          { key: 'subMessages', label: 'Sub, Resub & Gift Notices (--sub-messages)' },
-                          { key: 'replies', label: 'Threaded Reply Headers (--replies)' },
-                          { key: 'firstChatter', label: 'First-Time / Returning Chatter (--first-chatter)' },
-                          { key: 'announcements', label: 'Moderator Announcements (--announcements)' },
-                          { key: 'raids', label: 'Incoming & Outgoing Raids (--raids)' },
-                          { key: 'channelPoints', label: 'Channel Point Redemptions (--channel-points)' },
-                          { key: 'hypeChat', label: 'Paid Hype Chat Currency Pills (--hype-chat)' },
-                          { key: 'powerUps', label: 'Bits Power-Ups & Giant Emotes (--power-ups)' },
-                          { key: 'sharedChatBadge', label: 'Shared Chat Source Badges (--shared-chat-badge)' },
-                        ].map(opt => (
-                          <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
-                            <input
-                              type="checkbox"
-                              checked={(config as any)?.chatRender?.[opt.key] ?? true}
-                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
-                              className="w-4.5 h-4.5 rounded border-white/20 bg-[#0a0a0c] text-purple-600 focus:ring-0 focus:ring-offset-0"
-                            />
-                            <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Moderation, Roomstate & User Filtering */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
-                      <div>
-                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Moderation, Roomstate &amp; User Highlighting</h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Configure how timeouts, bans, deleted messages (`CLEARMSG`), `/clear`, room mode changes, and highlighted chatters are displayed.
-                        </p>
-                      </div>
-
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Moderated Message Mode (--moderation-mode)</label>
-                          <select
-                            value={(config as any)?.chatRender?.moderationMode || "Strikethrough"}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, moderationMode: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                          >
-                            <option value="Strikethrough">Strikethrough (Dim + Red Strikethrough after ban/delete)</option>
-                            <option value="ReplaceDeleted">ReplaceDeleted (&lt;message deleted&gt;)</option>
-                            <option value="Hide">Hide (Remove from scroll when moderated)</option>
-                            <option value="Off">Off (Leave messages untouched)</option>
-                          </select>
-                          <p className="text-xs text-gray-500">Messages appear normally until the exact timestamp the moderator times out, bans, or deletes them.</p>
-                        </div>
-
-                        <div className="space-y-2.5 flex flex-col justify-center pt-1">
-                          {[
-                            { key: 'moderationNotices', label: 'Show Timeout / Ban System Lines in Scroll (--moderation-notices)' },
-                            { key: 'roomstateNotices', label: 'Show Roomstate Mode Notices (Sub/Emote/Slow) (--roomstate-notices)' },
-                            { key: 'clearAll', label: 'Wipe Active Screen on Mod /clear (--clear-all)' },
-                          ].map(opt => (
-                            <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
-                              <input
-                                type="checkbox"
-                                checked={(config as any)?.chatRender?.[opt.key] ?? true}
-                                onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
-                                className="w-4.5 h-4.5 rounded border-white/20 bg-[#0a0a0c] text-purple-600 focus:ring-0 focus:ring-offset-0"
-                              />
-                              <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
-                            </label>
-                          ))}
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-white/10">
-                        <div className="space-y-1.5">
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Highlight Users (comma separated)</label>
-                            {config?.channels && config.channels.length > 0 && (
-                              <span className="text-[11px] font-mono text-purple-300 bg-purple-500/15 border border-purple-500/30 px-2 py-0.5 rounded">
-                                Auto-included: {config.channels.map(c => `@${c}`).join(', ')}
-                              </span>
-                            )}
-                          </div>
-                          <input
-                            type="text"
-                            value={(config as any)?.chatRender?.highlightUsers || ""}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, highlightUsers: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            placeholder="moderator1, vip_friend, streamer_alt"
-                          />
-                          <p className="text-xs text-gray-500">The broadcaster of the monitored/rendered channel is included automatically. Add any extra usernames here (`--highlight-users`).</p>
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Highlight User Color (Hex)</label>
-                          <input
-                            type="text"
-                            value={(config as any)?.chatRender?.highlightUserColor || "#3D1A52"}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, highlightUserColor: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            placeholder="#3D1A52"
-                          />
-                          <p className="text-xs text-gray-500">Background tint for highlighted users (`--highlight-user-color`, default: `#3D1A52`).</p>
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Ignore Users (comma separated)</label>
-                          <input
-                            type="text"
-                            value={(config as any)?.chatRender?.ignoreUsers || ""}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, ignoreUsers: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            placeholder="nightbot, streamelements, fossabot"
-                          />
-                          <p className="text-xs text-gray-500">Excludes messages sent by these accounts (`--ignore-users`).</p>
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Banned Words (comma separated)</label>
-                          <input
-                            type="text"
-                            value={(config as any)?.chatRender?.bannedWords || ""}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, bannedWords: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            placeholder="spoiler1, word2"
-                          />
-                          <p className="text-xs text-gray-500">Hides any message containing these substrings (`--banned-words`).</p>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Colors & Typography */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
-                      <div>
-                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Colors &amp; Typography</h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Customize background colors (supports `#RRGGBB` or `#AARRGGBB` alpha), font family, font weights, and outline rendering.
-                        </p>
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Background Color (Hex)</label>
-                          <input
-                            type="text"
-                            value={(config as any)?.chatRender?.backgroundColor || "#111111"}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, backgroundColor: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            placeholder="#111111 or #00000000"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Alt Background Color (Hex)</label>
-                          <input
-                            type="text"
-                            value={(config as any)?.chatRender?.altBackgroundColor || "#191919"}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, altBackgroundColor: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            placeholder="#191919"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Message Color (Hex)</label>
-                          <input
-                            type="text"
-                            value={(config as any)?.chatRender?.messageColor || "#ffffff"}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, messageColor: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            placeholder="#ffffff"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Font Family</label>
-                          <input
-                            type="text"
-                            value={(config as any)?.chatRender?.font || "Inter Embedded"}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, font: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            placeholder="Inter Embedded"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Font Size</label>
-                          <input
-                            type="number"
-                            value={(config as any)?.chatRender?.fontSize ?? 24}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, fontSize: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseInt(e.target.value, 10);
-                              const cleanVal = Number.isFinite(parsed) && parsed > 0 ? parsed : 24;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, fontSize: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Outline Size</label>
-                          <input
-                            type="number"
-                            value={(config as any)?.chatRender?.outlineSize ?? 4}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, outlineSize: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseFloat(e.target.value);
-                              const cleanVal = Number.isFinite(parsed) && parsed >= 0 ? parsed : 4;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, outlineSize: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Username Font Style</label>
-                          <select
-                            value={(config as any)?.chatRender?.usernameFontStyle || "bold"}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, usernameFontStyle: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                          >
-                            <option value="normal">Normal</option>
-                            <option value="bold">Bold</option>
-                            <option value="italic">Italic</option>
-                            <option value="bolditalic">Bold Italic</option>
-                          </select>
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Message Font Style</label>
-                          <select
-                            value={(config as any)?.chatRender?.messageFontStyle || "normal"}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, messageFontStyle: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                          >
-                            <option value="normal">Normal</option>
-                            <option value="bold">Bold</option>
-                            <option value="italic">Italic</option>
-                            <option value="bolditalic">Bold Italic</option>
-                          </select>
-                        </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Emoji Vendor</label>
-                          <select
-                            value={(config as any)?.chatRender?.emojiVendor || "notocolor"}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, emojiVendor: e.target.value } } as any)}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base focus:outline-none focus:border-purple-500/50 transition-colors text-white cursor-pointer"
-                          >
-                            <option value="notocolor">Google Noto Color (notocolor)</option>
-                            <option value="twemoji">Twitter Twemoji (twemoji)</option>
-                            <option value="system">OS System Font (system)</option>
-                            <option value="none">None (none)</option>
-                          </select>
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-3 border-t border-white/10">
-                        {[
-                          { key: 'readableColors', label: 'Readable Username Colors (--readable-colors)', def: true },
-                          { key: 'alternateBackgrounds', label: 'Alternating Row Backgrounds (--alternate-backgrounds)', def: false },
-                          { key: 'outline', label: 'Text Drop-Shadow / Outline (--outline)', def: false },
-                        ].map(opt => (
-                          <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
-                            <input
-                              type="checkbox"
-                              checked={(config as any)?.chatRender?.[opt.key] ?? opt.def}
-                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
-                              className="w-4.5 h-4.5 rounded border-white/20 bg-[#0a0a0c] text-purple-600 focus:ring-0 focus:ring-offset-0"
-                            />
-                            <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Emotes, Badges, Avatars & Giphy GIFs */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
-                      <div>
-                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Emotes, Badges, Avatars &amp; Giphy GIFs</h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Control 3rd-party emote providers, Giphy GIF scaling, profile avatars, and badge bitmask filtering.
-                        </p>
-                      </div>
-
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                        {[
-                          { key: 'stv', label: '7TV Emotes', def: true },
-                          { key: 'bttv', label: 'BTTV Emotes', def: true },
-                          { key: 'ffz', label: 'FFZ Emotes', def: true },
-                          { key: 'allowUnlistedEmotes', label: 'Allow Unlisted Emotes', def: true },
-                          { key: 'giphy', label: 'Giphy GIFs (--giphy)', def: true },
-                          { key: 'badges', label: 'Chat Badges (--badges)', def: true },
-                          { key: 'avatars', label: 'User Avatars (--avatars)', def: false },
-                        ].map(opt => (
-                          <label key={opt.key} className="flex items-center gap-2.5 cursor-pointer group">
-                            <input
-                              type="checkbox"
-                              checked={(config as any)?.chatRender?.[opt.key] ?? opt.def}
-                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.checked } } as any)}
-                              className="w-4.5 h-4.5 rounded border-white/20 bg-[#0a0a0c] text-purple-600 focus:ring-0 focus:ring-offset-0"
-                            />
-                            <span className="text-sm text-gray-300 font-medium group-hover:text-white transition-colors">{opt.label}</span>
-                          </label>
-                        ))}
-                      </div>
-
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-3 border-t border-white/10">
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Max GIF Height (% of Chat Height)</label>
-                          <input
-                            type="number"
-                            min="5"
-                            max="100"
-                            value={(config as any)?.chatRender?.gifMaxHeightPercent ?? 33}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gifMaxHeightPercent: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseInt(e.target.value, 10);
-                              const cleanVal = Number.isFinite(parsed) ? Math.max(5, Math.min(100, parsed)) : 33;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, gifMaxHeightPercent: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                          <p className="text-xs text-gray-500">Caps Giphy GIF height (`5`–`100%`, default: `33%`).</p>
-                        </div>
-                        <div className="space-y-1.5 md:col-span-2">
-                          <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Chat Badge Filter Bitmask (--badge-filter)</label>
-                          <input
-                            type="number"
-                            min="0"
-                            value={(config as any)?.chatRender?.badgeFilter ?? 0}
-                            onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, badgeFilter: e.target.value } } as any)}
-                            onBlur={(e) => {
-                              const parsed = parseInt(e.target.value, 10);
-                              const cleanVal = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
-                              updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, badgeFilter: cleanVal } } as any);
-                            }}
-                            className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                          />
-                          <p className="text-xs text-gray-500">
-                            Bitmask of badge types to HIDE (`0` = Show All, `1` = Other, `2` = Broadcaster, `4` = Moderator, `8` = VIP, `16` = Subscriber, `32` = Predictions, `64` = NoAudio/NoVideo, `128` = Prime Gaming). Sum values to combine.
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Fine-Grained Layout & Element Scaling */}
-                    <div className="bg-[#141416] border border-white/10 rounded-xl p-4 space-y-4">
-                      <div>
-                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Fine-Grained Layout &amp; Element Scaling</h4>
-                        <p className="text-xs text-gray-400 mt-0.5">
-                          Multipliers applied relative to Font Size (`1.0` = 100%). Includes `--scale-username` for independent username sizing.
-                        </p>
-                      </div>
-                      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
-                        {[
-                          { key: 'scaleUsername', label: 'Scale Username' },
-                          { key: 'scaleEmote', label: 'Scale Emote' },
-                          { key: 'scaleBadge', label: 'Scale Badge' },
-                          { key: 'scaleEmoji', label: 'Scale Emoji' },
-                          { key: 'scaleAvatar', label: 'Scale Avatar' },
-                          { key: 'scaleVertical', label: 'Scale Vertical' },
-                          { key: 'scaleSidePadding', label: 'Scale Side Padding' },
-                          { key: 'scaleSectionHeight', label: 'Scale Section Height' },
-                          { key: 'scaleWordSpace', label: 'Scale Word Space' },
-                          { key: 'scaleEmoteSpace', label: 'Scale Emote Space' },
-                          { key: 'scaleHighlightStroke', label: 'Scale Highlight Stroke' },
-                          { key: 'scaleHighlightIndent', label: 'Scale Highlight Indent' },
-                        ].map(opt => (
-                          <div key={opt.key} className="space-y-1.5">
-                            <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{opt.label}</label>
-                            <input
-                              type="number"
-                              step="0.05"
-                              value={(config as any)?.chatRender?.[opt.key] ?? (opt.key === 'scaleVertical' ? 0.5 : 1.0)}
-                              onChange={(e) => updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: e.target.value } } as any)}
-                              onBlur={(e) => {
-                                const defVal = opt.key === 'scaleVertical' ? 0.5 : 1.0;
-                                const parsed = parseFloat(e.target.value);
-                                const cleanVal = Number.isFinite(parsed) && parsed > 0 ? parsed : defVal;
-                                updateDraftConfig({ ...config!, chatRender: { ...(config as any)?.chatRender, [opt.key]: cleanVal } } as any);
-                              }}
-                              className="w-full bg-[#0a0a0c] border border-white/10 rounded-lg px-3 py-2 text-sm sm:text-base font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                            />
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                <div className="flex flex-wrap justify-end items-center gap-4 mt-6 pt-6 border-t border-white/10">
-                  <div className="flex flex-wrap items-center gap-3">
-                    {isConfigDirty && (
-                      <div className="flex items-center gap-2">
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-semibold">
-                          <AlertCircle className="w-3.5 h-3.5" />
-                          Unsaved changes
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => fetchConfig()}
-                          className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white border border-white/10 transition-colors cursor-pointer"
-                        >
-                          <RotateCcw className="w-3.5 h-3.5" />
-                          Discard
-                        </button>
-                      </div>
-                    )}
-                    {saveStatusMessage && (
-                      <div className={`flex items-center gap-2 text-sm font-semibold ${saveStatusMessage.type === 'success' ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {saveStatusMessage.type === 'success' && <Check className="w-4 h-4" />}
-                        {saveStatusMessage.text}
-                      </div>
-                    )}
-                    <button 
-                      type="submit" 
-                      disabled={isSavingConfig}
-                      className={`flex items-center gap-2 bg-purple-600 hover:bg-purple-500 text-white px-6 py-2.5 rounded-lg text-sm font-semibold uppercase tracking-wider transition-all shadow-md shadow-purple-900/30 cursor-pointer ${
-                        isSavingConfig ? "opacity-75 cursor-wait" : ""
-                      }`}
-                    >
-                      {isSavingConfig && <RefreshCw className="w-4 h-4 animate-spin" />}
-                      {isSavingConfig ? "Saving..." : "Save Configuration"}
-                    </button>
-                  </div>
-                </div>
-              </form>
-
-              {/* Separated Emergency Reset / Danger Zone Card */}
-              <div className="bg-red-950/15 border border-red-500/20 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div>
-                  <h4 className="text-sm font-bold text-red-400 uppercase tracking-wider flex items-center gap-2">
-                    <AlertTriangle className="w-4 h-4" />
-                    Emergency Reset
-                  </h4>
-                  <p className="text-xs text-gray-400 mt-1">
-                    Immediately aborts all active FFmpeg stitches, chat renders, and recording sessions, and clears the task queue.
-                  </p>
-                </div>
-                <button 
-                  type="button" 
-                  disabled={isResetting}
-                  onClick={() => setShowRebootConfirm(true)}
-                  className={`flex items-center justify-center gap-2 bg-red-500/10 text-red-400 border border-red-500/30 px-4 py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider hover:bg-red-600 hover:text-white transition-all cursor-pointer shrink-0 ${
-                    isResetting ? "opacity-75 cursor-wait" : ""
-                  }`}
-                >
-                  {isResetting && <RefreshCw className="w-4 h-4 animate-spin" />}
-                  {isResetting ? "Rebooting..." : "Reboot Program"}
-                </button>
-              </div>
-            </motion.div>
+            <SettingsView
+              config={config}
+              channelsInput={channelsInput}
+              isConfigDirty={isConfigDirty}
+              isSavingConfig={isSavingConfig}
+              saveStatusMessage={saveStatusMessage}
+              isResetting={isResetting}
+              onChannelsInputChange={setChannelsInput}
+              onUpdateDraftConfig={updateDraftConfig}
+              onSaveConfig={handleSaveConfig}
+              onDiscardChanges={() => refreshConfig()}
+              onOpenFolder={handleOpenFolder}
+              onOpenManualRenderModal={openManualRenderModal}
+              onRequestReboot={() => setShowRebootConfirm(true)}
+              onShowToast={showToast}
+            />
           )}
 
           {activeTab === "logs" && (
-            <motion.div key="logs" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="space-y-5">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div>
-                  <h2 className="text-3xl font-bold text-white tracking-tight">System Log</h2>
-                  <p className="text-sm text-gray-400 mt-0.5">Detailed history of all monitoring and download events.</p>
-                </div>
-                <div className="flex items-center gap-3">
-                  {!autoScrollLogs ? (
-                    <button 
-                      onClick={scrollToBottomLogs}
-                      className="flex items-center gap-2 px-3 py-2 bg-purple-600/20 text-purple-400 border border-purple-500/30 hover:bg-purple-600 hover:text-white rounded-lg text-sm font-semibold transition-all shadow-sm cursor-pointer"
-                    >
-                      <ArrowDown className="w-4 h-4 animate-bounce" />
-                      Auto-scroll paused (click to resume)
-                    </button>
-                  ) : (
-                    <span className="flex items-center gap-2 text-sm text-gray-400 bg-white/5 px-3 py-1.5 rounded-lg border border-white/5 font-medium">
-                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                      Auto-scroll on
-                    </span>
-                  )}
-                  <a
-                    href="/api/system-log"
-                    download="system.log"
-                    className="flex items-center gap-2 px-3 py-2 bg-white/5 hover:bg-white/10 text-gray-300 rounded-lg text-sm font-semibold transition-colors border border-white/10"
-                  >
-                    <Download className="w-4 h-4" />
-                    Download File
-                  </a>
-                </div>
-              </div>
-              {/* System Log Filter & Search Bar */}
-              <div className="bg-[#111113] border border-white/10 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div className="relative flex-1">
-                  <Search className="w-4 h-4 text-gray-500 absolute left-3 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="text"
-                    value={logSearchQuery}
-                    onChange={e => setLogSearchQuery(e.target.value)}
-                    placeholder="Filter logs by keyword, channel, error, or sequence..."
-                    className="w-full bg-[#18181b] border border-white/10 rounded-lg pl-9 pr-8 py-1.5 text-xs font-mono text-white placeholder-gray-500 focus:outline-none focus:border-purple-500/50"
-                  />
-                  {logSearchQuery && (
-                    <button
-                      type="button"
-                      onClick={() => setLogSearchQuery("")}
-                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white cursor-pointer"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                </div>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {[
-                    { id: 'all', label: 'All Events' },
-                    { id: 'errors', label: 'Errors & Warnings' },
-                    { id: 'video', label: 'Video & Stitch' },
-                    { id: 'chat', label: 'Chat & Render' }
-                  ].map((cat) => (
-                    <button
-                      key={cat.id}
-                      type="button"
-                      onClick={() => setLogCategory(cat.id as any)}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
-                        logCategory === cat.id
-                          ? "bg-purple-600 text-white"
-                          : "bg-white/5 text-gray-400 hover:text-white hover:bg-white/10"
-                      }`}
-                    >
-                      {cat.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="bg-[#111113] border border-white/10 rounded-xl overflow-hidden shadow-md">
-                <div 
-                  ref={logContainerRef}
-                  onScroll={handleLogScroll}
-                  className="p-3 h-[620px] overflow-y-auto font-mono text-xs leading-tight space-y-0 scrollbar-thin scrollbar-thumb-white/10"
-                >
-                  {(() => {
-                    const allLogs = status?.logs || [];
-                    const filteredLogs = allLogs.filter(line => {
-                      const lower = line.toLowerCase();
-                      if (logCategory === 'errors') {
-                        if (!lower.includes('error') && !lower.includes('warn') && !lower.includes('critical') && !lower.includes('fail')) return false;
-                      } else if (logCategory === 'video') {
-                        if (
-                          !lower.includes('[video') &&
-                          !lower.includes('[stitch') &&
-                          !lower.includes('[backfill]') &&
-                          !lower.includes('[game slicing]') &&
-                          !lower.includes('[game change]') &&
-                          !lower.includes('[manual splice') &&
-                          !lower.includes('[time splice]') &&
-                          !lower.includes('[recovery]') &&
-                          !lower.includes('[stream') &&
-                          !lower.includes('[resumption') &&
-                          !lower.includes('[session resumption]')
-                        ) return false;
-                      } else if (logCategory === 'chat') {
-                        if (
-                          !lower.includes('[chat') &&
-                          !lower.includes('[vod chat]') &&
-                          !lower.includes('[render') &&
-                          !lower.includes('[auto-render]') &&
-                          !lower.includes('[manual render]') &&
-                          !lower.includes('[pubsub]') &&
-                          !lower.includes('[emotes]') &&
-                          !lower.includes('[game profile]')
-                        ) return false;
-                      }
-                      if (logSearchQuery.trim()) {
-                        return lower.includes(logSearchQuery.trim().toLowerCase());
-                      }
-                      return true;
-                    });
-
-                    if (filteredLogs.length === 0) {
-                      return (
-                        <div className="text-gray-500 text-center py-20 text-xs">
-                          {allLogs.length === 0 ? "No logs recorded yet." : "No log entries match your current filter."}
-                        </div>
-                      );
-                    }
-
-                    return filteredLogs.map((log, i) => {
-                      const lower = log.toLowerCase();
-                      const isErr = lower.includes('error]') || lower.includes('critical') || lower.includes('fatal') || lower.includes('failed');
-                      const isWarn = !isErr && (lower.includes('warn') || lower.includes('warning]'));
-                      return (
-                        <div 
-                          key={i} 
-                          className={`px-2 py-[1px] leading-[1.3] rounded-sm transition-colors break-words font-mono select-text whitespace-pre-wrap ${
-                            isErr
-                              ? "text-red-300 bg-red-500/10 hover:bg-red-500/15"
-                              : isWarn
-                              ? "text-amber-300 bg-amber-500/10 hover:bg-amber-500/15"
-                              : "text-gray-300 hover:bg-white/[0.04]"
-                          }`}
-                        >
-                          {log}
-                        </div>
-                      );
-                    });
-                  })()}
-                  <div ref={logEndRef} />
-                </div>
-              </div>
-            </motion.div>
+            <SystemLogView logs={status?.logs || []} />
           )}
         </AnimatePresence>
 
-        {/* Manual Chat Render Modal */}
-        {manualRenderDialog && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-            <div className="bg-[#141416] border border-white/15 rounded-2xl w-full max-w-lg p-6 shadow-2xl space-y-5">
-              <div className="flex items-center justify-between border-b border-white/10 pb-4">
-                <div className="flex items-center gap-2.5">
-                  <Film className="w-5 h-5 text-purple-400" />
-                  <h3 className="text-lg font-bold text-white tracking-tight">Manual Chat Render</h3>
-                </div>
-                <button 
-                  type="button"
-                  onClick={() => setManualRenderDialog(false)}
-                  className="text-gray-400 hover:text-white p-1 rounded-lg transition-colors cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
+        {/* Modals */}
+        <TaskRenderModal
+          renderDialog={renderDialog}
+          defaultWidth={defaultRenderW}
+          defaultHeight={defaultRenderH}
+          isSubmitting={isSubmittingRender}
+          onChange={setRenderDialog}
+          onClose={() => setRenderDialog(null)}
+          onSubmit={submitRenderChat}
+        />
 
-              <div className="space-y-4">
-                {recentFolders.some(f => f.chatFiles.length > 0) && (
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
-                      Quick Select Recent Chat JSON
-                    </label>
-                    <select
-                      value=""
-                      onChange={(e) => {
-                        if (e.target.value) {
-                          setManualRenderPath(e.target.value);
-                          setManualRenderMsg(null);
-                          applyManualRenderProfileForPath(e.target.value);
-                        }
-                      }}
-                      className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-purple-500/50 cursor-pointer"
-                    >
-                      <option value="">-- Choose a downloaded chat file from recent sessions --</option>
-                      {recentFolders.map(folder =>
-                        folder.chatFiles.map(cf => {
-                          const sep = folder.folderPath.includes('\\') ? '\\' : '/';
-                          const fullFile = `${folder.folderPath}${sep}${cf}`;
-                          return (
-                            <option key={fullFile} value={fullFile}>
-                              {folder.name} / {cf}
-                            </option>
-                          );
-                        })
-                      )}
-                    </select>
-                  </div>
-                )}
+        <ManualRenderModal
+          isOpen={manualRenderDialog}
+          recentFolders={recentFolders}
+          filePath={manualRenderPath}
+          width={manualRenderWidth}
+          height={manualRenderHeight}
+          defaultWidth={defaultRenderW}
+          defaultHeight={defaultRenderH}
+          matchedProfile={manualRenderMatchedProfile}
+          isStarting={isStartingManualRender}
+          statusMsg={manualRenderMsg}
+          onChangePath={(path) => {
+            setManualRenderPath(path);
+            setManualRenderMsg(null);
+          }}
+          onBlurOrSelectPath={applyManualRenderProfileForPath}
+          onChangeWidth={setManualRenderWidth}
+          onChangeHeight={setManualRenderHeight}
+          onClose={() => setManualRenderDialog(false)}
+          onSubmit={submitManualRender}
+        />
 
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
-                      Chat JSON File Path
-                    </label>
-                    {manualRenderMatchedProfile && (
-                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30">
-                        Matched Profile: {manualRenderMatchedProfile}
-                      </span>
-                    )}
-                  </div>
-                  <input
-                    type="text"
-                    value={manualRenderPath}
-                    onChange={(e) => {
-                      setManualRenderPath(e.target.value);
-                      setManualRenderMsg(null);
-                    }}
-                    onBlur={(e) => applyManualRenderProfileForPath(e.target.value)}
-                    placeholder="e.g. downloads/channel_2026-10-18/chat.json (or full path)"
-                    className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3.5 py-2.5 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white placeholder-gray-600 shadow-inner"
-                  />
-                  <p className="text-xs text-gray-500">
-                    Select a file above or paste the path to any chat JSON file. Dimensions auto-fill if the game matches a saved profile.
-                  </p>
-                </div>
+        <QuickGameProfileModal
+          modalState={quickGameProfileModal}
+          isSaving={isSavingQuickGameProfile}
+          onChange={setQuickGameProfileModal}
+          onClose={() => setQuickGameProfileModal(null)}
+          onSave={saveQuickGameProfile}
+        />
 
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Width (px)</label>
-                    <input
-                      type="number"
-                      value={manualRenderWidth ?? ""}
-                      onChange={(e) => setManualRenderWidth(e.target.value as any)}
-                      onBlur={(e) => setManualRenderWidth(parseInt(e.target.value, 10) || ((config as any)?.chatRender?.width || 350))}
-                      className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Height (px)</label>
-                    <input
-                      type="number"
-                      value={manualRenderHeight ?? ""}
-                      onChange={(e) => setManualRenderHeight(e.target.value as any)}
-                      onBlur={(e) => setManualRenderHeight(parseInt(e.target.value, 10) || ((config as any)?.chatRender?.height || 800))}
-                      className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                    />
-                  </div>
-                </div>
+        <RecoverFolderModal
+          isOpen={recoverFolderDialog}
+          recentFolders={recentFolders}
+          isLoadingRecent={isLoadingRecentFolders}
+          folderPath={recoverFolderPath}
+          isStarting={isStartingRecovery}
+          statusMsg={recoverFolderMsg}
+          onChangePath={(path) => {
+            setRecoverFolderPath(path);
+            setRecoverFolderMsg(null);
+          }}
+          onClose={() => setRecoverFolderDialog(false)}
+          onSubmit={submitRecoverFolder}
+        />
 
-                {manualRenderMsg && (
-                  <div className={`p-3 rounded-lg text-xs flex items-center gap-2 ${
-                    manualRenderMsg.type === 'success' 
-                      ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400' 
-                      : 'bg-red-500/10 border border-red-500/20 text-red-400'
-                  }`}>
-                    {manualRenderMsg.type === 'success' ? (
-                      <CheckCircle2 className="w-4 h-4 shrink-0" />
-                    ) : (
-                      <AlertCircle className="w-4 h-4 shrink-0" />
-                    )}
-                    <span>{manualRenderMsg.text}</span>
-                  </div>
-                )}
-              </div>
+        <SpliceModal
+          channel={manualSpliceChannel}
+          activeSession={spliceActiveSession}
+          config={config}
+          onClose={() => setManualSpliceChannel(null)}
+          onExecute={(ch, act, sc, mins, leadMins) => {
+            setManualSpliceChannel(null);
+            executeManualSplice(ch, act, sc, mins, leadMins);
+          }}
+        />
 
-              <div className="flex items-center justify-end gap-3 pt-3 border-t border-white/10">
-                <button
-                  type="button"
-                  onClick={() => setManualRenderDialog(false)}
-                  disabled={isStartingManualRender}
-                  className="px-4 py-2 text-sm font-semibold text-gray-400 hover:text-white rounded-lg transition-colors cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={submitManualRender}
-                  disabled={isStartingManualRender || !manualRenderPath.trim()}
-                  className={`flex items-center gap-2 px-5 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-semibold uppercase tracking-wider transition-colors shadow-md shadow-purple-900/30 cursor-pointer ${
-                    isStartingManualRender || !manualRenderPath.trim() ? "opacity-75 cursor-not-allowed" : ""
-                  }`}
-                >
-                  {isStartingManualRender && <RefreshCw className="w-4 h-4 animate-spin" />}
-                  {isStartingManualRender ? "Starting..." : "Start Render"}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
+        <UnsavedSettingsModal
+          pendingTab={pendingTabSwitch}
+          onStay={() => setPendingTabSwitch(null)}
+          onDiscardAndLeave={(dest) => {
+            setPendingTabSwitch(null);
+            refreshConfig();
+            setActiveTab(dest);
+          }}
+          onSaveAndLeave={async (dest) => {
+            const saved = await saveConfigInternal();
+            if (saved) {
+              setPendingTabSwitch(null);
+              setActiveTab(dest);
+            }
+          }}
+        />
 
-        {/* Quick Game Resolution Profile Modal (triggered by clicking live game badge) */}
-        {quickGameProfileModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-            <div className="bg-[#141416] border border-white/15 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-5">
-              <div className="flex items-center justify-between border-b border-white/10 pb-4">
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <Gamepad2 className="w-5 h-5 text-purple-400 shrink-0" />
-                  <div className="min-w-0">
-                    <h3 className="text-base font-bold text-white tracking-tight truncate">Game Render Resolution</h3>
-                    <p className="text-xs text-purple-300 font-medium truncate">{quickGameProfileModal.gameName}</p>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setQuickGameProfileModal(null)}
-                  className="text-gray-400 hover:text-white p-1 rounded-lg transition-colors cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
+        <StopRecordingModal
+          channel={stopConfirmChannel}
+          activeSessions={status?.activeSessions || []}
+          config={config}
+          onCancel={() => setStopConfirmChannel(null)}
+          onConfirmStop={(ch) => {
+            setStopConfirmChannel(null);
+            executeToggleChannelMonitoring(ch);
+          }}
+        />
 
-              <div className="space-y-4">
-                <p className="text-xs text-gray-400 leading-relaxed">
-                  Set a dedicated chat render resolution (`Width × Height`) for <strong className="text-white">{quickGameProfileModal.gameName}</strong>. Used automatically when Auto-Render or Manual Render processes segments for this game.
-                </p>
+        <RebootConfirmModal
+          isOpen={showRebootConfirm}
+          onCancel={() => setShowRebootConfirm(false)}
+          onConfirm={() => {
+            setShowRebootConfirm(false);
+            executeReset();
+          }}
+        />
 
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Width (px)</label>
-                    <input
-                      type="number"
-                      min="100"
-                      max="7680"
-                      step="2"
-                      value={quickGameProfileModal.width}
-                      onChange={e => setQuickGameProfileModal({ ...quickGameProfileModal, width: e.target.value })}
-                      className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Height (px)</label>
-                    <input
-                      type="number"
-                      min="100"
-                      max="7680"
-                      step="2"
-                      value={quickGameProfileModal.height}
-                      onChange={e => setQuickGameProfileModal({ ...quickGameProfileModal, height: e.target.value })}
-                      className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white"
-                    />
-                  </div>
-                </div>
-              </div>
+        <CancelRenderModal
+          task={cancelRenderConfirmTask}
+          onCancel={() => setCancelRenderConfirmTask(null)}
+          onConfirmCancel={(taskId) => {
+            setCancelRenderConfirmTask(null);
+            handleTaskAction(taskId, "cancel_render");
+          }}
+        />
 
-              <div className="flex items-center justify-between gap-3 pt-3 border-t border-white/10">
-                {quickGameProfileModal.hasExistingProfile ? (
-                  <button
-                    type="button"
-                    disabled={isSavingQuickGameProfile}
-                    onClick={() => saveQuickGameProfile(true)}
-                    className="px-3 py-2 text-xs font-semibold text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg transition-colors cursor-pointer"
-                  >
-                    Reset to Default
-                  </button>
-                ) : <div />}
-
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={isSavingQuickGameProfile}
-                    onClick={() => setQuickGameProfileModal(null)}
-                    className="px-3.5 py-2 text-xs font-semibold text-gray-400 hover:text-white rounded-lg transition-colors cursor-pointer"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    disabled={isSavingQuickGameProfile}
-                    onClick={() => saveQuickGameProfile(false)}
-                    className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-semibold uppercase tracking-wider transition-colors shadow-md shadow-purple-900/30 cursor-pointer"
-                  >
-                    {isSavingQuickGameProfile && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
-                    <span>Save Profile</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Recover Folder Video Modal */}
-        {recoverFolderDialog && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-            <div className="bg-[#141416] border border-white/15 rounded-2xl w-full max-w-lg p-6 shadow-2xl space-y-5">
-              <div className="flex items-center justify-between border-b border-white/10 pb-4">
-                <div className="flex items-center gap-2.5">
-                  <Wrench className="w-5 h-5 text-purple-400" />
-                  <h3 className="text-lg font-bold text-white tracking-tight">Recover Folder Video</h3>
-                </div>
-                <button 
-                  type="button"
-                  onClick={() => setRecoverFolderDialog(false)}
-                  className="text-gray-400 hover:text-white p-1 rounded-lg transition-colors cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              <div className="space-y-4">
-                <p className="text-xs text-gray-400 leading-relaxed">
-                  Scans a recording session directory for uncompiled live (<code>seq_*.ts</code>) and VOD backfill (<code>vod_seq_*.ts</code>) chunks and stitches them into standalone MP4 videos with paired chat JSON files.
-                </p>
-
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
-                    Select Recent Session Folder
-                  </label>
-                  <select
-                    value={recoverFolderPath}
-                    onChange={(e) => {
-                      setRecoverFolderPath(e.target.value);
-                      setRecoverFolderMsg(null);
-                    }}
-                    disabled={isLoadingRecentFolders}
-                    className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-purple-500/50 cursor-pointer"
-                  >
-                    <option value="">
-                      {isLoadingRecentFolders ? "Scanning downloads directory..." : "-- Select a session folder --"}
-                    </option>
-                    {recentFolders.map(folder => (
-                      <option key={folder.folderPath} value={folder.folderPath}>
-                        {folder.name} ({folder.liveChunkCount} live chunks, {folder.vodChunkCount} VOD chunks, {folder.mp4Files.length} MP4s)
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
-                    Or Enter Folder Path Manually
-                  </label>
-                  <input
-                    type="text"
-                    value={recoverFolderPath}
-                    onChange={(e) => {
-                      setRecoverFolderPath(e.target.value);
-                      setRecoverFolderMsg(null);
-                    }}
-                    placeholder="e.g. downloads/streamer_2026-10-18_123456"
-                    className="w-full bg-[#1c1c1f] border border-white/10 rounded-lg px-3.5 py-2.5 text-sm font-mono focus:outline-none focus:border-purple-500/50 transition-colors text-white placeholder-gray-600 shadow-inner"
-                  />
-                </div>
-
-                {recoverFolderMsg && (
-                  <div className={`p-3 rounded-lg text-xs flex items-center gap-2 ${
-                    recoverFolderMsg.type === 'success' 
-                      ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400' 
-                      : 'bg-red-500/10 border border-red-500/20 text-red-400'
-                  }`}>
-                    {recoverFolderMsg.type === 'success' ? (
-                      <CheckCircle2 className="w-4 h-4 shrink-0" />
-                    ) : (
-                      <AlertCircle className="w-4 h-4 shrink-0" />
-                    )}
-                    <span>{recoverFolderMsg.text}</span>
-                  </div>
-                )}
-              </div>
-
-              <div className="flex items-center justify-end gap-3 pt-3 border-t border-white/10">
-                <button
-                  type="button"
-                  onClick={() => setRecoverFolderDialog(false)}
-                  disabled={isStartingRecovery}
-                  className="px-4 py-2 text-sm font-semibold text-gray-400 hover:text-white rounded-lg transition-colors cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={submitRecoverFolder}
-                  disabled={isStartingRecovery || !recoverFolderPath.trim()}
-                  className={`flex items-center gap-2 px-5 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-semibold uppercase tracking-wider transition-colors shadow-md shadow-purple-900/30 cursor-pointer ${
-                    isStartingRecovery || !recoverFolderPath.trim() ? "opacity-75 cursor-not-allowed" : ""
-                  }`}
-                >
-                  {isStartingRecovery && <RefreshCw className="w-4 h-4 animate-spin" />}
-                  {isStartingRecovery ? "Recovering..." : "Recover Video"}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Unsaved Settings Changes Confirmation Modal */}
-        {pendingTabSwitch && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-            <div className="bg-[#141416] border border-amber-500/30 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-amber-500/10 border border-amber-500/25 flex items-center justify-center shrink-0">
-                  <AlertCircle className="w-5 h-5 text-amber-400" />
-                </div>
-                <div>
-                  <h3 className="text-base font-bold text-white tracking-tight">Unsaved Settings Changes</h3>
-                  <p className="text-xs text-gray-400">You have modified settings that haven't been saved yet</p>
-                </div>
-              </div>
-
-              <p className="text-sm text-gray-300 leading-relaxed">
-                Would you like to save your configuration changes before leaving the Settings tab, or discard them?
-              </p>
-
-              <div className="flex flex-wrap items-center justify-end gap-2.5 pt-3 border-t border-white/10">
-                <button
-                  type="button"
-                  onClick={() => setPendingTabSwitch(null)}
-                  className="px-3.5 py-2 rounded-lg text-xs font-semibold text-gray-400 hover:text-white transition-colors cursor-pointer"
-                >
-                  Stay Here
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const dest = pendingTabSwitch;
-                    setPendingTabSwitch(null);
-                    fetchConfig();
-                    setActiveTab(dest);
-                  }}
-                  className="px-3.5 py-2 rounded-lg text-xs font-semibold text-gray-300 bg-white/5 hover:bg-white/10 border border-white/10 transition-colors cursor-pointer"
-                >
-                  Discard & Leave
-                </button>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    const dest = pendingTabSwitch;
-                    const saved = await saveConfigInternal();
-                    if (saved) {
-                      setPendingTabSwitch(null);
-                      setActiveTab(dest);
-                    }
-                  }}
-                  className="px-4 py-2 rounded-lg text-xs font-semibold uppercase tracking-wider text-white bg-purple-600 hover:bg-purple-500 transition-colors shadow-md shadow-purple-900/30 cursor-pointer"
-                >
-                  Save & Leave
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Stop Live Recording Confirmation Modal */}
-        {stopConfirmChannel && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-            <div className="bg-[#141416] border border-red-500/30 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-red-500/10 border border-red-500/25 flex items-center justify-center shrink-0">
-                  <AlertTriangle className="w-5 h-5 text-red-400" />
-                </div>
-                <div>
-                  <h3 className="text-base font-bold text-white tracking-tight">Stop Live Recording?</h3>
-                  <p className="text-xs text-gray-400 font-mono">@{stopConfirmChannel} is actively recording</p>
-                </div>
-              </div>
-
-              {(() => {
-                const stopSession = status?.activeSessions.find(
-                  s => cleanChannel(s.channel) === cleanChannel(stopConfirmChannel)
-                );
-                const stopMode = stopSession?.captureMode || config?.channelCaptureModes?.[cleanChannel(stopConfirmChannel)] || 'both';
-                const stopAutoRender = stopSession
-                  ? Boolean(stopSession.autoRenderChat)
-                  : Boolean(config?.channelAutoRender?.[cleanChannel(stopConfirmChannel)] ?? config?.autoRenderChat);
-                const stopActionText = stopMode === 'video_only'
-                  ? 'segment video stitching'
-                  : stopMode === 'chat_only'
-                  ? (stopAutoRender ? 'chat segment slicing and chat rendering' : 'chat segment slicing')
-                  : (stopAutoRender ? 'segment stitching, chat slicing, and automatic chat rendering' : 'segment video stitching and chat slicing');
-                return (
-                  <p className="text-sm text-gray-300 leading-relaxed">
-                    Stream @{stopConfirmChannel} is actively recording! Stopping monitoring now will conclude recording and immediately trigger {stopActionText}.
-                  </p>
-                );
-              })()}
-
-              <div className="flex items-center justify-end gap-3 pt-3 border-t border-white/10">
-                <button
-                  type="button"
-                  onClick={() => setStopConfirmChannel(null)}
-                  className="px-4 py-2 rounded-lg text-sm font-semibold text-gray-400 hover:text-white transition-colors cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const channel = stopConfirmChannel;
-                    setStopConfirmChannel(null);
-                    executeToggleChannelMonitoring(channel);
-                  }}
-                  className="px-4 py-2 rounded-lg text-sm font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors shadow-md shadow-red-900/30 cursor-pointer"
-                >
-                  Stop Recording
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Reboot Program Confirmation Modal */}
-        {showRebootConfirm && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-            <div className="bg-[#141416] border border-red-500/30 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-red-500/10 border border-red-500/25 flex items-center justify-center shrink-0">
-                  <RefreshCw className="w-5 h-5 text-red-400" />
-                </div>
-                <div>
-                  <h3 className="text-base font-bold text-white tracking-tight">Reboot Program?</h3>
-                  <p className="text-xs text-gray-400">Cancel all tasks and reset state</p>
-                </div>
-              </div>
-
-              <p className="text-sm text-gray-300 leading-relaxed">
-                Are you sure you want to reboot the program? This will cancel all active background tasks, terminate active chat renders, and reset stream monitoring.
-              </p>
-
-              <div className="flex items-center justify-end gap-3 pt-3 border-t border-white/10">
-                <button
-                  type="button"
-                  onClick={() => setShowRebootConfirm(false)}
-                  className="px-4 py-2 rounded-lg text-sm font-semibold text-gray-400 hover:text-white transition-colors cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowRebootConfirm(false);
-                    executeReset();
-                  }}
-                  className="px-4 py-2 rounded-lg text-sm font-semibold text-white bg-red-600 hover:bg-red-500 transition-colors shadow-md shadow-red-900/30 cursor-pointer"
-                >
-                  Reboot Program
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-        {/* 4-Mode Manual Stream Splice & Clip Modal */}
-        {manualSpliceChannel && (() => {
-          const activeSession = status?.activeSessions.find(
-            s => cleanChannel(s.channel) === cleanChannel(manualSpliceChannel)
-          );
-          const sessionCaptureMode = activeSession?.captureMode || config?.channelCaptureModes?.[cleanChannel(manualSpliceChannel)] || 'both';
-          const isChatOnlyMode = sessionCaptureMode === 'chat_only';
-          const isVideoOnlyMode = sessionCaptureMode === 'video_only';
-          const mediaNoun = isChatOnlyMode ? 'chat log' : isVideoOnlyMode ? 'video' : 'video and chat';
-          const games = activeSession?.games || [];
-          const hasPrevious = games.length > 1;
-          const previousGameName = hasPrevious ? games[games.length - 2].gameName : null;
-          const currentGameName = activeSession?.currentGame || (games.length > 0 ? games[games.length - 1].gameName : "Current Game");
-          const currentGameDurationSec = Math.max(0, (activeSession?.videoDurationSeconds || 0) - (games[games.length - 1]?.startTimeOffset || 0));
-          const currentGameDurationMins = Math.max(0.1, currentGameDurationSec / 60).toFixed(1);
-
-          return (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-y-auto">
-              <div className="bg-[#141416] border border-purple-500/30 rounded-2xl w-full max-w-xl p-6 shadow-2xl space-y-5 my-8">
-                {/* Header */}
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-xl bg-purple-500/10 border border-purple-500/25 flex items-center justify-center shrink-0">
-                      <Scissors className="w-5 h-5 text-purple-400" />
-                    </div>
-                    <div>
-                      <h3 className="text-base font-bold text-white tracking-tight">Manual Stream Splice &amp; Clip</h3>
-                      <p className="text-xs text-purple-300 font-mono">@{manualSpliceChannel} • Playing {currentGameName}</p>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setManualSpliceChannel(null)}
-                    className="p-1.5 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 transition-colors cursor-pointer"
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
-                </div>
-
-                <p className="text-xs text-gray-400 leading-relaxed">
-                  Choose what to do with the {mediaNoun} recorded up to this moment:
-                </p>
-
-                {/* 4 Options */}
-                <div className="space-y-3">
-                  {/* Option 1: Append to Previous Game */}
-                  <label
-                    className={`block p-3.5 rounded-xl border transition-all cursor-pointer ${
-                      !hasPrevious
-                        ? "opacity-40 border-white/5 bg-white/[0.02] cursor-not-allowed"
-                        : spliceAction === 'append_previous'
-                        ? "border-purple-500/70 bg-purple-950/25 shadow-sm shadow-purple-500/10"
-                        : "border-white/10 bg-white/[0.03] hover:border-white/20"
-                    }`}
-                  >
-                    <div className="flex items-start gap-3">
-                      <input
-                        type="radio"
-                        name="splice_action"
-                        value="append_previous"
-                        disabled={!hasPrevious}
-                        checked={spliceAction === 'append_previous'}
-                        onChange={() => setSpliceAction('append_previous')}
-                        className="mt-1 text-purple-600 focus:ring-0 cursor-pointer disabled:cursor-not-allowed"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-sm font-semibold text-white">Append Extension to Previous Game</span>
-                          {hasPrevious ? (
-                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30 truncate max-w-[150px]">
-                              {previousGameName}
-                            </span>
-                          ) : (
-                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-white/5 text-gray-400 border border-white/10">
-                              Unavailable: 1st segment
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-xs text-gray-400 mt-1 leading-relaxed">
-                          {isChatOnlyMode
-                            ? `Slices chat recorded up to now as a standalone extension file for ${previousGameName || 'the previous game'} and shifts ${currentGameName}'s start point to now.`
-                            : isVideoOnlyMode
-                            ? `Slices video recorded up to now and stitches it as a seamless extension file to ${previousGameName || 'the previous game'}. Shifts ${currentGameName}'s start point to now.`
-                            : `Slices footage recorded up to now and stitches it as a seamless extension file to ${previousGameName || 'the previous game'} with matching chat. Shifts ${currentGameName}'s start point to now.`}
-                        </p>
-                      </div>
-                    </div>
-                  </label>
-
-                  {/* Option 2: Extract Standalone Highlight / Clip */}
-                  <label
-                    className={`block p-3.5 rounded-xl border transition-all cursor-pointer ${
-                      spliceAction === 'extract_clip'
-                        ? "border-purple-500/70 bg-purple-950/25 shadow-sm shadow-purple-500/10"
-                        : "border-white/10 bg-white/[0.03] hover:border-white/20"
-                    }`}
-                  >
-                    <div className="flex items-start gap-3">
-                      <input
-                        type="radio"
-                        name="splice_action"
-                        value="extract_clip"
-                        checked={spliceAction === 'extract_clip'}
-                        onChange={() => setSpliceAction('extract_clip')}
-                        className="mt-1 text-purple-600 focus:ring-0 cursor-pointer"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-sm font-semibold text-white">Extract Standalone Highlight / Clip</span>
-                          <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 border border-blue-500/30">
-                            Non-destructive
-                          </span>
-                        </div>
-                        <p className="text-xs text-gray-400 mt-1 leading-relaxed">
-                          {isChatOnlyMode
-                            ? "Exports a standalone chat clip right now. The ongoing broadcast recording continues completely untouched without splitting the master game segment."
-                            : isVideoOnlyMode
-                            ? "Remuxes a standalone video clip right now. The ongoing broadcast recording continues completely untouched without splitting the master game VOD."
-                            : "Remuxes a standalone video and chat clip right now. The ongoing broadcast recording continues completely untouched without splitting the master game VOD."}
-                        </p>
-
-                        {/* Sub-options for Clip */}
-                        {spliceAction === 'extract_clip' && (
-                          <div className="mt-3 pt-3 border-t border-white/10 space-y-2.5">
-                            <div className="flex items-center gap-4 text-xs">
-                              <label className="flex items-center gap-1.5 cursor-pointer text-gray-300 hover:text-white">
-                                <input
-                                  type="radio"
-                                  name="clip_scope"
-                                  value="whole_game"
-                                  checked={clipScope === 'whole_game'}
-                                  onChange={() => setClipScope('whole_game')}
-                                  className="text-purple-600 focus:ring-0"
-                                />
-                                <span>Whole game until now (~{currentGameDurationMins} min)</span>
-                              </label>
-
-                              <label className="flex items-center gap-1.5 cursor-pointer text-gray-300 hover:text-white">
-                                <input
-                                  type="radio"
-                                  name="clip_scope"
-                                  value="custom_duration"
-                                  checked={clipScope === 'custom_duration'}
-                                  onChange={() => setClipScope('custom_duration')}
-                                  className="text-purple-600 focus:ring-0"
-                                />
-                                <span>Last X minutes</span>
-                              </label>
-                            </div>
-
-                            {clipScope === 'custom_duration' && (
-                              <div className="flex items-center gap-2 pt-1">
-                                <span className="text-xs text-gray-400">Duration:</span>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.preventDefault();
-                                    setClipMinutes(prev => Math.max(0.5, Number((prev - 0.5).toFixed(1))));
-                                  }}
-                                  className="px-2 py-1 rounded bg-white/10 hover:bg-white/20 text-white font-mono text-xs font-bold transition-colors cursor-pointer"
-                                >
-                                  -0.5m
-                                </button>
-                                <input
-                                  type="number"
-                                  min="0.5"
-                                  max="180"
-                                  step="0.5"
-                                  value={clipMinutes}
-                                  onChange={(e) => setClipMinutes(Math.max(0.5, Math.min(180, parseFloat(e.target.value) || 0.5)))}
-                                  className="w-20 px-2.5 py-1 text-xs text-center rounded bg-black/40 border border-white/20 text-white font-mono focus:outline-none focus:border-purple-500"
-                                />
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.preventDefault();
-                                    setClipMinutes(prev => Math.min(180, Number((prev + 0.5).toFixed(1))));
-                                  }}
-                                  className="px-2 py-1 rounded bg-white/10 hover:bg-white/20 text-white font-mono text-xs font-bold transition-colors cursor-pointer"
-                                >
-                                  +0.5m
-                                </button>
-                                <span className="text-[11px] text-gray-400 font-mono">
-                                  ({Math.round(clipMinutes * 60)}s{!isChatOnlyMode ? ` • ~${Math.round(clipMinutes * 30)} chunks` : ''})
-                                </span>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </label>
-
-                  {/* Option 3: Split into New Part */}
-                  <label
-                    className={`block p-3.5 rounded-xl border transition-all cursor-pointer ${
-                      spliceAction === 'split_new_part'
-                        ? "border-purple-500/70 bg-purple-950/25 shadow-sm shadow-purple-500/10"
-                        : "border-white/10 bg-white/[0.03] hover:border-white/20"
-                    }`}
-                  >
-                    <div className="flex items-start gap-3">
-                      <input
-                        type="radio"
-                        name="splice_action"
-                        value="split_new_part"
-                        checked={spliceAction === 'split_new_part'}
-                        onChange={() => setSpliceAction('split_new_part')}
-                        className="mt-1 text-purple-600 focus:ring-0 cursor-pointer"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-sm font-semibold text-white">Split Game into New Part / Chapter</span>
-                          <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                            New segment
-                          </span>
-                        </div>
-                        <p className="text-xs text-gray-400 mt-1 leading-relaxed">
-                          Finalizes the current segment now for {isChatOnlyMode ? 'chat slicing' : 'stitching'} and starts the next part immediately, preserving the transition buffer.
-                        </p>
-                      </div>
-                    </div>
-                  </label>
-
-                  {/* Option 4: End Current Game & Await Next Twitch Category Switch */}
-                  {(() => {
-                    const lastSegmentName = games.length > 0 ? games[games.length - 1].gameName : currentGameName;
-                    const partMatch = lastSegmentName.match(/^(.*?)\s+Part\s+(\d+)$/i);
-                    const fallbackNextName = partMatch
-                      ? `${partMatch[1]} Part ${parseInt(partMatch[2], 10) + 1}`
-                      : `${lastSegmentName} Part 2`;
-                    const defaultBufMins = (config as any)?.gameSwitchBufferMins ?? 5;
-                    const parsedLeadMins = parseFloat(awaitLeadingBufferInput);
-                    const effectiveLeadMins = Number.isFinite(parsedLeadMins) && parsedLeadMins >= 0 ? parsedLeadMins : defaultBufMins * 2;
-
-                    return (
-                      <label
-                        className={`block p-3.5 rounded-xl border transition-all cursor-pointer ${
-                          spliceAction === 'await_next_game'
-                            ? "border-purple-500/70 bg-purple-950/25 shadow-sm shadow-purple-500/10"
-                            : "border-white/10 bg-white/[0.03] hover:border-white/20"
-                        }`}
-                      >
-                        <div className="flex items-start gap-3">
-                          <input
-                            type="radio"
-                            name="splice_action"
-                            value="await_next_game"
-                            checked={spliceAction === 'await_next_game'}
-                            onChange={() => setSpliceAction('await_next_game')}
-                            className="mt-1 text-purple-600 focus:ring-0 cursor-pointer"
-                          />
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="text-sm font-semibold text-white">End Current Game &amp; Await Next Category Switch</span>
-                              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
-                                Late category update
-                              </span>
-                            </div>
-                            <p className="text-xs text-gray-400 mt-1 leading-relaxed">
-                              Immediately ends and {isChatOnlyMode ? 'slices' : 'stitches'} <strong>{lastSegmentName}</strong>, then records upcoming {isChatOnlyMode ? 'chat' : 'footage'} into the next game segment (temporarily labeled <strong>{fallbackNextName}</strong> until the broadcaster updates their Twitch category).
-                            </p>
-
-                            {spliceAction === 'await_next_game' && (
-                              <div className="mt-3 pt-3 border-t border-white/10 space-y-2">
-                                <div className="flex flex-wrap items-center gap-2.5">
-                                  <span className="text-xs text-gray-300 font-medium">Leading Buffer Override (minutes):</span>
-                                  <input
-                                    type="number"
-                                    min="0"
-                                    max="120"
-                                    step="0.5"
-                                    value={awaitLeadingBufferInput}
-                                    onClick={(e) => e.stopPropagation()}
-                                    onChange={(e) => setAwaitLeadingBufferInput(e.target.value)}
-                                    onBlur={(e) => {
-                                      const v = parseFloat(e.target.value);
-                                      const clamped = Number.isFinite(v) ? Math.max(0, Math.min(120, v)) : defaultBufMins * 2;
-                                      setAwaitLeadingBufferInput(String(clamped));
-                                    }}
-                                    className="w-24 px-2.5 py-1 text-xs text-center rounded bg-black/40 border border-white/20 text-white font-mono focus:outline-none focus:border-purple-500"
-                                  />
-                                  <span className="text-[11px] text-gray-400 font-mono">
-                                    (Default: {defaultBufMins * 2}m = 2x {defaultBufMins}m buffer{!isChatOnlyMode ? ` • ~${Math.round(effectiveLeadMins * 30)} chunks` : ''})
-                                  </span>
-                                </div>
-                                <p className="text-[11px] text-gray-400 leading-relaxed">
-                                  Includes the last <strong>{effectiveLeadMins} minutes</strong> before now as leading {isChatOnlyMode ? 'chat' : 'footage'} for the new game so early activity before you clicked splice is retained.
-                                </p>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </label>
-                    );
-                  })()}
-                </div>
-
-                {/* Live Preview Summary */}
-                <div className="p-3 rounded-xl bg-purple-950/30 border border-purple-500/20 text-xs text-purple-200 flex items-start gap-2">
-                  <span className="font-bold text-purple-400 shrink-0">Summary:</span>
-                  <div className="leading-relaxed">
-                    {spliceAction === 'append_previous' && (
-                      <span>
-                        {isChatOnlyMode
-                          ? <>Will slice extra chat up to now as an extension file for <strong>{previousGameName}</strong>, then advance <strong>{currentGameName}</strong>'s start point.</>
-                          : isVideoOnlyMode
-                          ? <>Will stitch extra video up to now as an extension file for <strong>{previousGameName}</strong>, then advance <strong>{currentGameName}</strong>'s start point.</>
-                          : <>Will stitch extra footage up to now as an extension file for <strong>{previousGameName}</strong> with matching chat, then advance <strong>{currentGameName}</strong>'s start point.</>}
-                      </span>
-                    )}
-                    {spliceAction === 'extract_clip' && clipScope === 'whole_game' && (
-                      <span>
-                        Will export a standalone ~<strong>{currentGameDurationMins}m</strong> {mediaNoun} clip of <strong>{currentGameName}</strong> up to now. The live recording continues without interruption.
-                      </span>
-                    )}
-                    {spliceAction === 'extract_clip' && clipScope === 'custom_duration' && (
-                      <span>
-                        Will extract a standalone <strong>{clipMinutes}m</strong> {mediaNoun} clip of <strong>{currentGameName}</strong> ending now. The live recording continues without interruption.
-                      </span>
-                    )}
-                    {spliceAction === 'split_new_part' && (
-                      <span>
-                        Will finalize <strong>{currentGameName}</strong> (Segment {games.length || 1}) and immediately begin Part {games.length + 1} with leading buffer preserved.
-                      </span>
-                    )}
-                    {spliceAction === 'await_next_game' && (() => {
-                      const lastSegmentName = games.length > 0 ? games[games.length - 1].gameName : currentGameName;
-                      const partMatch = lastSegmentName.match(/^(.*?)\s+Part\s+(\d+)$/i);
-                      const fallbackNextName = partMatch
-                        ? `${partMatch[1]} Part ${parseInt(partMatch[2], 10) + 1}`
-                        : `${lastSegmentName} Part 2`;
-                      const defaultBufMins = (config as any)?.gameSwitchBufferMins ?? 5;
-                      const parsedLeadMins = parseFloat(awaitLeadingBufferInput);
-                      const effectiveLeadMins = Number.isFinite(parsedLeadMins) && parsedLeadMins >= 0 ? parsedLeadMins : defaultBufMins * 2;
-                      return (
-                        <span>
-                          Will finalize and {isChatOnlyMode ? 'slice' : 'stitch'} <strong>{lastSegmentName}</strong> now, retain a <strong>{effectiveLeadMins}m</strong> leading buffer for the new segment (labeled <strong>{fallbackNextName}</strong>), and automatically rename it when the Twitch game category updates.
-                        </span>
-                      );
-                    })()}
-                  </div>
-                </div>
-
-                {/* Modal Actions */}
-                <div className="flex items-center justify-end gap-3 pt-3 border-t border-white/10">
-                  <button
-                    type="button"
-                    onClick={() => setManualSpliceChannel(null)}
-                    className="px-4 py-2 rounded-lg text-sm font-semibold text-gray-400 hover:text-white transition-colors cursor-pointer"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const ch = manualSpliceChannel;
-                      const act = spliceAction;
-                      const sc = clipScope;
-                      const mins = clipMinutes;
-                      const defaultBufMins = (config as any)?.gameSwitchBufferMins ?? 5;
-                      const parsedLead = parseFloat(awaitLeadingBufferInput);
-                      const leadMins = Number.isFinite(parsedLead) && parsedLead >= 0 ? parsedLead : defaultBufMins * 2;
-                      setManualSpliceChannel(null);
-                      executeManualSplice(ch, act, sc, mins, leadMins);
-                    }}
-                    className="px-4 py-2 rounded-lg text-sm font-semibold text-white bg-purple-600 hover:bg-purple-500 transition-colors shadow-md shadow-purple-900/30 cursor-pointer"
-                  >
-                    Execute Splice
-                  </button>
-                </div>
-              </div>
-            </div>
-          );
-        })()}
-        {/* Cancel Chat Render Confirmation Modal */}
-        {cancelRenderConfirmTask && (
-          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-            <div className="bg-[#141416] border border-red-500/30 p-6 rounded-xl max-w-md w-full space-y-4 shadow-2xl">
-              <div className="flex items-center gap-3 text-red-400">
-                <div className="w-10 h-10 rounded-lg bg-red-500/10 border border-red-500/20 flex items-center justify-center shrink-0">
-                  <AlertTriangle className="w-5 h-5 text-red-400" />
-                </div>
-                <div>
-                  <h3 className="text-lg font-bold text-white tracking-tight">Cancel Chat Render?</h3>
-                  <p className="text-xs text-gray-400 mt-0.5">{cancelRenderConfirmTask.name}</p>
-                </div>
-              </div>
-              <p className="text-sm text-gray-300 leading-relaxed">
-                Are you sure you want to cancel this chat render? The render process will terminate and any partial render progress will be discarded.
-              </p>
-              <div className="flex justify-end gap-3 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setCancelRenderConfirmTask(null)}
-                  className="px-4 py-2 bg-white/5 hover:bg-white/10 text-gray-300 rounded-lg text-sm font-semibold transition-colors border border-white/10 cursor-pointer"
-                >
-                  Keep Rendering
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const taskId = cancelRenderConfirmTask.id;
-                    setCancelRenderConfirmTask(null);
-                    handleTaskAction(taskId, 'cancel_render');
-                  }}
-                  className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-sm font-semibold transition-colors shadow-md shadow-red-900/30 cursor-pointer"
-                >
-                  Yes, Cancel Render
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Global Toast Notification */}
-        {toastMessage && (
-          <div className="fixed bottom-6 right-6 z-50 max-w-md animate-in fade-in slide-in-from-bottom-3 duration-200">
-            <div className={`p-4 rounded-xl shadow-2xl border flex items-start gap-3 ${
-              toastMessage.type === 'error'
-                ? 'bg-red-950/95 border-red-500/40 text-red-200'
-                : toastMessage.type === 'success'
-                ? 'bg-emerald-950/95 border-emerald-500/40 text-emerald-200'
-                : 'bg-zinc-900/95 border-purple-500/40 text-gray-200'
-            }`}>
-              {toastMessage.type === 'error' ? (
-                <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-              ) : toastMessage.type === 'success' ? (
-                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
-              ) : (
-                <Folder className="w-5 h-5 text-purple-400 shrink-0 mt-0.5" />
-              )}
-              <div className="flex-1 min-w-0">
-                <p className={`text-xs font-semibold uppercase tracking-wider ${
-                  toastMessage.type === 'error'
-                    ? 'text-red-300'
-                    : toastMessage.type === 'success'
-                    ? 'text-emerald-300'
-                    : 'text-purple-300'
-                }`}>
-                  {toastMessage.title || (toastMessage.type === 'error' ? 'Error' : toastMessage.type === 'success' ? 'Success' : 'File Manager')}
-                </p>
-                <p className="text-sm mt-0.5 break-words font-mono">{toastMessage.text}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setToastMessage(null)}
-                className="text-gray-400 hover:text-white p-1 rounded hover:bg-white/10 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-        )}
+        <ToastBanner
+          toast={toastMessage}
+          onDismiss={() => setToastMessage(null)}
+        />
       </main>
     </div>
   );

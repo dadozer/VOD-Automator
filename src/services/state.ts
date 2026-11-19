@@ -1,222 +1,54 @@
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
-import { ActiveTask, ActiveDownloadSession, Config } from "../types";
+import { ActiveTask, ActiveDownloadSession, Config, TaskStatus } from "../types";
+import {
+  PROJECT_ROOT,
+  CONFIG_FILE,
+  CONFIG_BAK_FILE,
+  DEFAULT_TWITCH_BROWSER_CLIENT_ID,
+  LEGACY_TWITCH_BROWSER_CLIENT_ID,
+  cleanChannelName,
+  normalizeConfigSavePath,
+  resolveSavePathFromRoot,
+  resolveTdExecutablePath,
+  defaultConfig,
+  normalizeGameSlug,
+  resolveChatRenderDimensionsForGame,
+  resolveChatRenderDimensionsForChatFile,
+  loadConfigFromDisk,
+  saveConfigToDiskAtomic,
+} from "./configRepository";
+import {
+  STATE_FILE,
+  TASK_TTL_MS,
+  serializeDownloadedSegments,
+  deserializeDownloadedSegments,
+  SessionJournalRepository,
+} from "./sessionRepository";
+import { emitConfigDelta, emitLogLine, emitTasksDelta } from "./eventBus";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+export {
+  PROJECT_ROOT,
+  CONFIG_FILE,
+  CONFIG_BAK_FILE,
+  STATE_FILE,
+  TASK_TTL_MS,
+  DEFAULT_TWITCH_BROWSER_CLIENT_ID,
+  LEGACY_TWITCH_BROWSER_CLIENT_ID,
+  cleanChannelName,
+  normalizeConfigSavePath,
+  defaultConfig,
+  normalizeGameSlug,
+  serializeDownloadedSegments,
+  deserializeDownloadedSegments,
+};
 
-function findProjectRoot(): string {
-  let curr = __dirname;
-  for (let i = 0; i < 4; i++) {
-    if (fs.existsSync(path.join(curr, "package.json")) || fs.existsSync(path.join(curr, "config.json"))) {
-      return curr;
-    }
-    const parent = path.dirname(curr);
-    if (parent === curr) break;
-    curr = parent;
-  }
-  return process.cwd();
-}
-
-export const PROJECT_ROOT = findProjectRoot();
-export const CONFIG_FILE = path.join(PROJECT_ROOT, "config.json");
-export const CONFIG_BAK_FILE = path.join(PROJECT_ROOT, "config.json.bak");
-export const STATE_FILE = path.join(PROJECT_ROOT, "state.json");
 export const LOG_FILE = path.join(PROJECT_ROOT, "system.log");
 export const LOG_ROTATED_FILE = path.join(PROJECT_ROOT, "system.log.1");
 export const MAX_LOG_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB max system.log before rotation
-export const TASK_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days TTL for completed tasks
-
-export const DEFAULT_TWITCH_BROWSER_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko";
-export const LEGACY_TWITCH_BROWSER_CLIENT_ID = "kimne78kx3ncx6brs4h587w9fpb";
-
-export function cleanChannelName(channel: string): string {
-  if (!channel) return "";
-  let cleaned = channel.toLowerCase().trim().replace(/^@/, '');
-  try {
-    const urlString = cleaned.startsWith('http') ? cleaned : `https://${cleaned}`;
-    const url = new URL(urlString);
-    if (url.hostname.includes('twitch.tv')) {
-      cleaned = url.pathname.split('/').filter(Boolean)[0] || cleaned;
-    }
-  } catch (e) {}
-  cleaned = cleaned.replace(/^(https?:\/\/)?(www\.)?twitch\.tv\//, '').split('?')[0].replace(/\/$/, '').replace(/[^a-z0-9_]/g, '');
-  return cleaned.trim();
-}
-
-export function normalizeConfigSavePath(inputPath: any): string {
-  if (!inputPath || typeof inputPath !== "string") {
-    return "downloads";
-  }
-  let p = inputPath.trim();
-  if (!p || p === "." || p === "./" || p === ".\\") {
-    return "downloads";
-  }
-
-  // If path contains NewDownloader (the old hardcoded directory)
-  if (p.toLowerCase().includes("newdownloader")) {
-    return "downloads";
-  }
-
-  // Disallow escaping upward with ..
-  if (p.includes("..")) {
-    return "downloads";
-  }
-
-  // If it's an absolute path
-  if (path.isAbsolute(p)) {
-    // If it points inside PROJECT_ROOT, convert to relative
-    const rel = path.relative(PROJECT_ROOT, p);
-    if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
-      return rel || "downloads";
-    }
-    // If it points to an old nonexistent absolute folder ending in "downloads"
-    if (!fs.existsSync(p) && path.basename(p).toLowerCase() === "downloads") {
-      return "downloads";
-    }
-    // If it ends with "downloads" and is not inside PROJECT_ROOT
-    if (path.basename(p).toLowerCase() === "downloads") {
-      return "downloads";
-    }
-  }
-
-  // Normalize slashes for relative path
-  return p.replace(/^[./\\]+/, "");
-}
-
-export function getResolvedSavePath(configuredPath?: string): string {
-  const norm = normalizeConfigSavePath(configuredPath !== undefined ? configuredPath : state.config?.savePath);
-  return path.resolve(PROJECT_ROOT, norm);
-}
-
-export function resolveTdPath(configuredTdPath?: string): string {
-  const raw = (configuredTdPath !== undefined ? configuredTdPath : state.config?.tdPath)?.trim();
-  if (raw) {
-    const candidate = path.isAbsolute(raw) ? raw : path.resolve(PROJECT_ROOT, raw);
-    if (fs.existsSync(candidate)) return candidate;
-    // If configured path points to TwitchDownloaderCLI.exe but ChatRenderCLI.exe exists in the same folder, use it
-    const dir = path.dirname(candidate);
-    const altChatRender = path.join(dir, process.platform === "win32" ? "ChatRenderCLI.exe" : "ChatRenderCLI");
-    if (fs.existsSync(altChatRender)) return altChatRender;
-  }
-  // Check relative and common candidates in PROJECT_ROOT and C:\TwitchDownloader
-  const isWin = process.platform === "win32";
-  const binNames = isWin ? ["ChatRenderCLI.exe", "TwitchDownloaderCLI.exe"] : ["ChatRenderCLI", "TwitchDownloaderCLI"];
-  const searchDirs = [
-    path.join(PROJECT_ROOT, "TwitchDownloader"),
-    path.join(PROJECT_ROOT, "ChatRenderCLI"),
-    PROJECT_ROOT,
-    path.join(PROJECT_ROOT, "bin"),
-    "C:\\TwitchDownloader",
-    "C:\\ChatRenderCLI"
-  ];
-  for (const dir of searchDirs) {
-    for (const bin of binNames) {
-      const cand = path.join(dir, bin);
-      if (fs.existsSync(cand)) return cand;
-    }
-  }
-  if (raw && !path.isAbsolute(raw)) {
-    return path.resolve(PROJECT_ROOT, raw);
-  }
-  return raw || "C:\\TwitchDownloader\\TwitchDownloaderCLI.exe";
-}
-
-export const defaultConfig: Config = {
-  browserClientId: DEFAULT_TWITCH_BROWSER_CLIENT_ID,
-  browserOAuthToken: "",
-  channels: [],
-  savePath: "downloads",
-  notifyOnStart: true,
-  notifyOnEnd: true,
-  isMonitoring: false,
-  autoStartMonitoring: false,
-  autoRenderChat: false,
-  channelAutoRender: {},
-  channelCaptureModes: {},
-  gameSwitchBufferMins: 5,
-  offlineGracePeriodMins: 5,
-  longGameAutospliceEnabled: true,
-  longGameAutospliceTriggerHours: 9,
-  longGameAutospliceCutHours: 8,
-  tdPath: "C:\\TwitchDownloader\\TwitchDownloaderCLI.exe",
-  chatRender: {
-    syncOffset: -2.5,
-    syncOffsetHevc: -7.5,
-    width: 350,
-    height: 800,
-    gameProfiles: [],
-    backgroundColor: "#111111",
-    altBackgroundColor: "#191919",
-    alternateBackgrounds: false,
-    messageColor: "#ffffff",
-    highlightUsers: "",
-    highlightUserColor: "#C8FF0059",
-    font: "Inter",
-    fontSize: 24,
-    messageFontStyle: "normal",
-    usernameFontStyle: "bold",
-    scaleUsername: 1.0,
-    outline: false,
-    outlineSize: 4,
-    framerate: 60,
-    updateRate: 0,
-    jobs: 0,
-    imageCacheMb: 256,
-    generateMask: false,
-    bttv: true,
-    ffz: true,
-    stv: true,
-    giphy: true,
-    gifMaxHeightPercent: 33,
-    allowUnlistedEmotes: true,
-    badges: true,
-    subMessages: true,
-    dispersion: "smart",
-    offline: false,
-    avatars: false,
-    readableColors: true,
-    sharpening: false,
-    emojiVendor: "notocolor",
-    scaleEmote: 1.0,
-    scaleBadge: 1.0,
-    scaleEmoji: 1.0,
-    scaleAvatar: 1.0,
-    scaleVertical: 0.5,
-    scaleSidePadding: 1.0,
-    scaleSectionHeight: 1.0,
-    scaleWordSpace: 1.0,
-    scaleEmoteSpace: 1.0,
-    scaleHighlightStroke: 1.0,
-    scaleHighlightIndent: 1.0,
-    ignoreUsers: "",
-    bannedWords: "",
-    format: "mp4",
-    codec: "h264",
-    badgeFilter: 0,
-    autoCompensateClockDrift: true,
-    predictionMode: "StickyTop",
-    pollMode: "StickyTop",
-    pinnedChatMode: "StickyTop",
-    hypeTrainMode: "ChatScroll",
-    moderationMode: "Strikethrough",
-    moderationNotices: true,
-    clearAll: false,
-    roomstateNotices: true,
-    replies: true,
-    firstChatter: true,
-    announcements: true,
-    raids: true,
-    channelPoints: true,
-    hypeChat: true,
-    powerUps: true,
-    sharedChatBadge: true
-  }
-};
 
 export const state = {
-  config: { ...defaultConfig },
+  config: { ...defaultConfig, chatRender: { ...defaultConfig.chatRender! } } as Config,
   monitoringInterval: null as NodeJS.Timeout | null,
   activeTasks: {} as Record<string, ActiveTask>,
   activeProcesses: {} as Record<string, any>,
@@ -224,13 +56,40 @@ export const state = {
   logs: [] as string[],
   monitoredChannels: [] as string[],
   lastCheckTime: null as number | null,
-  hasLoggedInitialCheck: false
+  hasLoggedInitialCheck: false,
 };
+
+const sessionJournal = new SessionJournalRepository(() => ({
+  activeDownloadSessions: state.activeDownloadSessions,
+  activeTasks: state.activeTasks,
+}));
+
+export function getResolvedSavePath(configuredPath?: string): string {
+  return resolveSavePathFromRoot(configuredPath !== undefined ? configuredPath : state.config?.savePath);
+}
+
+export function resolveTdPath(configuredTdPath?: string): string {
+  return resolveTdExecutablePath(configuredTdPath !== undefined ? configuredTdPath : state.config?.tdPath);
+}
+
+export function getChatRenderDimensionsForGame(
+  gameName?: string | null,
+  filename?: string | null
+): { width: number; height: number; matchedProfile?: string; isCustomProfile: boolean } {
+  return resolveChatRenderDimensionsForGame(state.config, gameName, filename);
+}
+
+export function getChatRenderDimensionsForChatFile(
+  chatFilePath: string,
+  fallbackGameName?: string | null
+): { width: number; height: number; gameName: string; matchedProfile?: string; isCustomProfile: boolean } {
+  return resolveChatRenderDimensionsForChatFile(state.config, chatFilePath, fallbackGameName);
+}
 
 let logCheckCounter = 0;
 let isRotatingLog = false;
 
-export function checkAndRotateLogFile() {
+export function checkAndRotateLogFile(): void {
   if (isRotatingLog) return;
   try {
     if (!fs.existsSync(LOG_FILE)) return;
@@ -256,13 +115,13 @@ export function checkAndRotateLogFile() {
   }
 }
 
-export const addLog = (msg: string) => {
+export const addLog = (msg: string): void => {
   if (!msg) return;
   const now = new Date();
   const timestamp = now.toLocaleTimeString();
   const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const day = String(now.getDate()).padStart(2, '0');
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
   const localDateStr = `${year}-${month}-${day}`;
 
   logCheckCounter++;
@@ -271,15 +130,14 @@ export const addLog = (msg: string) => {
     checkAndRotateLogFile();
   }
 
-  // If msg contains multiple lines (e.g. stack traces, multi-line error outputs), preserve every line
   const rawLines = String(msg).split(/\r?\n/);
   for (const line of rawLines) {
     if (!line && rawLines.length > 1) continue;
     const logMsg = `[${localDateStr} ${timestamp}] ${line}`;
     console.log(logMsg);
     state.logs.push(logMsg);
-    // Keep last 300 logs in memory for debugging inspection
     if (state.logs.length > 300) state.logs.shift();
+    emitLogLine(logMsg);
 
     const fileLogMessage = `${logMsg}\n`;
     fs.appendFile(LOG_FILE, fileLogMessage, (err) => {
@@ -288,353 +146,28 @@ export const addLog = (msg: string) => {
   }
 };
 
-export function serializeDownloadedSegments(set: Set<string | number> | undefined): any {
-  if (!set || set.size === 0) return { liveRanges: [], vodRanges: [] };
-
-  const liveNums: number[] = [];
-  const vodNums: number[] = [];
-  const other: (string | number)[] = [];
-
-  for (const item of set) {
-    if (typeof item === 'number') {
-      liveNums.push(item);
-    } else if (typeof item === 'string' && item.startsWith('vod_')) {
-      const n = parseInt(item.slice(4), 10);
-      if (!isNaN(n)) vodNums.push(n);
-      else other.push(item);
-    } else {
-      other.push(item);
-    }
-  }
-
-  const toRanges = (nums: number[]): [number, number][] => {
-    if (nums.length === 0) return [];
-    nums.sort((a, b) => a - b);
-    const ranges: [number, number][] = [];
-    let start = nums[0];
-    let end = nums[0];
-
-    for (let i = 1; i < nums.length; i++) {
-      if (nums[i] === end + 1) {
-        end = nums[i];
-      } else if (nums[i] > end + 1) {
-        ranges.push([start, end]);
-        start = nums[i];
-        end = nums[i];
-      }
-    }
-    ranges.push([start, end]);
-    return ranges;
-  };
-
-  return {
-    liveRanges: toRanges(liveNums),
-    vodRanges: toRanges(vodNums),
-    ...(other.length > 0 ? { other } : {})
-  };
+export function scheduleStateSave(immediate = false): void {
+  sessionJournal.scheduleSave(immediate);
 }
 
-export function deserializeDownloadedSegments(data: any): Set<string | number> {
-  const set = new Set<string | number>();
-  if (!data) return set;
-
-  // Backward compatibility: if data is a raw array from older versions
-  if (Array.isArray(data)) {
-    for (const item of data) {
-      set.add(item);
-    }
-    return set;
-  }
-
-  // New compact format with ranges
-  if (Array.isArray(data.liveRanges)) {
-    for (const range of data.liveRanges) {
-      if (Array.isArray(range) && range.length === 2) {
-        for (let i = range[0]; i <= range[1]; i++) {
-          set.add(i);
-        }
-      }
-    }
-  }
-
-  if (Array.isArray(data.vodRanges)) {
-    for (const range of data.vodRanges) {
-      if (Array.isArray(range) && range.length === 2) {
-        for (let i = range[0]; i <= range[1]; i++) {
-          set.add(`vod_${i}`);
-        }
-      }
-    }
-  }
-
-  if (Array.isArray(data.other)) {
-    for (const item of data.other) {
-      set.add(item);
-    }
-  }
-
-  return set;
-}
-
-function getSerializableSessions() {
-  return Object.fromEntries(
-    Object.entries(state.activeDownloadSessions).map(([channel, session]) => [
-      channel,
-      {
-        channel: session.channel,
-        streamId: session.streamId,
-        startTime: session.startTime,
-        chunksDownloaded: session.chunksDownloaded,
-        folderPath: session.folderPath,
-        segmentsFile: session.segmentsFile,
-        currentTitle: session.currentTitle,
-        currentGame: session.currentGame,
-        viewersCount: session.viewersCount,
-        previewImageUrl: session.previewImageUrl,
-        mediaPlaylistUrl: session.mediaPlaylistUrl,
-        highestSeq: session.highestSeq,
-        commentsWritten: session.commentsWritten,
-        games: session.games,
-        chatFilePath: session.chatFilePath,
-        videoDurationSeconds: session.videoDurationSeconds,
-        videoStartTimeMs: session.videoStartTimeMs,
-        streamCreatedAtMs: session.streamCreatedAtMs,
-        initialJoinOffsetSec: session.initialJoinOffsetSec,
-        firstSeqNum: session.firstSeqNum,
-        gapAdjustments: session.gapAdjustments,
-        missingCount: session.missingCount,
-        downloadedSegments: serializeDownloadedSegments(session.downloadedSegments),
-        autoRenderChat: session.autoRenderChat,
-        captureMode: session.captureMode || 'both'
-      }
-    ])
-  );
-}
-
-export function normalizeGameSlug(name: string): string {
-  return (name || '')
-    .trim()
-    .replace(/\s+Part\s+\d+$/i, '')
-    .replace(/\s*\(Part\s+\d+[^)]*\)$/i, '')
-    .replace(/[^a-z0-9]/gi, '_')
-    .replace(/_+/g, '_')
-    .replace(/^_|_$/g, '')
-    .toLowerCase();
-}
-
-export function getChatRenderDimensionsForGame(
-  gameName?: string | null,
-  filename?: string | null
-): { width: number; height: number; matchedProfile?: string; isCustomProfile: boolean } {
-  const defaultW = state.config.chatRender?.width || 350;
-  const defaultH = state.config.chatRender?.height || 800;
-  const profiles = Array.isArray(state.config.chatRender?.gameProfiles)
-    ? state.config.chatRender!.gameProfiles!
-    : [];
-
-  if (profiles.length === 0) {
-    return { width: defaultW, height: defaultH, isCustomProfile: false };
-  }
-
-  const rawGame = (gameName || '').trim();
-  const strippedGame = rawGame
-    .replace(/\s+Part\s+\d+$/i, '')
-    .replace(/\s*\(Part\s+\d+[^)]*\)$/i, '')
-    .trim();
-
-  if (rawGame) {
-    // 1. Exact case-insensitive match on raw gameName
-    const exactMatch = profiles.find(
-      p => p.gameName && p.gameName.trim().toLowerCase() === rawGame.toLowerCase()
-    );
-    if (exactMatch && exactMatch.width >= 100 && exactMatch.height >= 100) {
-      return {
-        width: exactMatch.width,
-        height: exactMatch.height,
-        matchedProfile: exactMatch.gameName.trim(),
-        isCustomProfile: true
-      };
-    }
-
-    // 2. Exact case-insensitive match on stripped gameName (e.g. "Elden Ring Part 2" -> "Elden Ring")
-    if (strippedGame && strippedGame.toLowerCase() !== rawGame.toLowerCase()) {
-      const strippedMatch = profiles.find(
-        p => p.gameName && p.gameName.trim().toLowerCase() === strippedGame.toLowerCase()
-      );
-      if (strippedMatch && strippedMatch.width >= 100 && strippedMatch.height >= 100) {
-        return {
-          width: strippedMatch.width,
-          height: strippedMatch.height,
-          matchedProfile: strippedMatch.gameName.trim(),
-          isCustomProfile: true
-        };
-      }
-    }
-
-    // 3. Slug match on gameName
-    const targetSlug = normalizeGameSlug(rawGame);
-    if (targetSlug) {
-      const slugMatch = profiles.find(
-        p => p.gameName && normalizeGameSlug(p.gameName) === targetSlug
-      );
-      if (slugMatch && slugMatch.width >= 100 && slugMatch.height >= 100) {
-        return {
-          width: slugMatch.width,
-          height: slugMatch.height,
-          matchedProfile: slugMatch.gameName.trim(),
-          isCustomProfile: true
-        };
-      }
-    }
-  }
-
-  // 4. Fallback filename slug inspection (e.g. "1_elden_ring_2026-11-05.json" or "elden_ring_vod_backfill_2026-11-05.json")
-  if (filename) {
-    const base = path.basename(filename).replace(/\.json$/i, '').toLowerCase();
-    // Strip leading index ("1_") or "clip_" and trailing "_2026-11-05..." or "_vod_backfill_..." or "_extension_..."
-    const candidateSlug = base
-      .replace(/^\d+_/, '')
-      .replace(/^clip_/, '')
-      .replace(/_vod_backfill.*$/, '')
-      .replace(/_extension_\d{4}-\d{2}-\d{2}.*$/, '')
-      .replace(/_\d+(?:\.\d+)?m_\d{4}-\d{2}-\d{2}.*$/, '')
-      .replace(/_\d{4}-\d{2}-\d{2}.*$/, '')
-      .replace(/_part_\d+$/, '')
-      .replace(/_+/g, '_')
-      .replace(/^_|_$/g, '');
-
-    if (candidateSlug) {
-      const fileMatch = profiles.find(
-        p => p.gameName && normalizeGameSlug(p.gameName) === candidateSlug
-      );
-      if (fileMatch && fileMatch.width >= 100 && fileMatch.height >= 100) {
-        return {
-          width: fileMatch.width,
-          height: fileMatch.height,
-          matchedProfile: fileMatch.gameName.trim(),
-          isCustomProfile: true
-        };
-      }
-    }
-  }
-
-  return { width: defaultW, height: defaultH, isCustomProfile: false };
-}
-
-export function getChatRenderDimensionsForChatFile(
-  chatFilePath: string,
-  fallbackGameName?: string | null
-): { width: number; height: number; gameName: string; matchedProfile?: string; isCustomProfile: boolean } {
-  let detectedGame = (fallbackGameName || '').trim();
-  const filename = path.basename(chatFilePath);
-
-  if (chatFilePath && fs.existsSync(chatFilePath)) {
-    try {
-      const fd = fs.openSync(chatFilePath, 'r');
-      try {
-        const buf = Buffer.alloc(4096);
-        const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
-        const head = buf.toString('utf8', 0, bytesRead);
-        const gameMatch = head.match(/"game"\s*:\s*"([^"]*)"/);
-        if (gameMatch && gameMatch[1] && gameMatch[1].trim()) {
-          detectedGame = gameMatch[1].trim();
-        }
-      } finally {
-        try { fs.closeSync(fd); } catch (_) {}
-      }
-    } catch (_) {}
-  }
-
-  const res = getChatRenderDimensionsForGame(detectedGame, filename);
-  return {
-    ...res,
-    gameName: detectedGame || res.matchedProfile || ''
-  };
-}
-
-let stateSaveTimeout: NodeJS.Timeout | null = null;
-let isSavingState = false;
-let pendingStateSave = false;
-
-function executeStateSave() {
-  if (isSavingState) {
-    pendingStateSave = true;
-    return;
-  }
-  isSavingState = true;
-  try {
-    const serializableSessions = getSerializableSessions();
-    const tempFile = `${STATE_FILE}.tmp`;
-    fs.promises.writeFile(tempFile, JSON.stringify({
-      activeDownloadSessions: serializableSessions,
-      activeTasks: state.activeTasks
-    }), "utf-8")
-      .then(() => fs.promises.rename(tempFile, STATE_FILE))
-      .catch(err => console.error("Failed to save state.json dynamically", err))
-      .finally(() => {
-        isSavingState = false;
-        if (pendingStateSave) {
-          pendingStateSave = false;
-          executeStateSave();
-        }
-      });
-  } catch (err) {
-    isSavingState = false;
-    console.error("Failed to save state.json", err);
-    if (pendingStateSave) {
-      pendingStateSave = false;
-      executeStateSave();
-    }
-  }
-}
-
-export function scheduleStateSave(immediate = false) {
-  if (immediate) {
-    if (stateSaveTimeout) {
-      clearTimeout(stateSaveTimeout);
-      stateSaveTimeout = null;
-    }
-    executeStateSave();
-    return;
-  }
-  if (stateSaveTimeout) return;
-  stateSaveTimeout = setTimeout(() => {
-    stateSaveTimeout = null;
-    executeStateSave();
-  }, 2500);
-}
-
-export function flushStateSync() {
-  if (stateSaveTimeout) {
-    clearTimeout(stateSaveTimeout);
-    stateSaveTimeout = null;
-  }
-  try {
-    const serializableSessions = getSerializableSessions();
-    const tempFile = `${STATE_FILE}.tmp`;
-    fs.writeFileSync(tempFile, JSON.stringify({
-      activeDownloadSessions: serializableSessions,
-      activeTasks: state.activeTasks
-    }), "utf-8");
-    fs.renameSync(tempFile, STATE_FILE);
-  } catch (err) {
-    console.error("Failed to flush state.json synchronously", err);
-  }
+export function flushStateSync(): void {
+  sessionJournal.flushSync();
 }
 
 export const updateTask = (
   id: string,
   name: string,
   progressText: string,
-  status: 'running' | 'success' | 'error' | 'cancelled' = 'running',
+  status: TaskStatus = "running",
   actionRequired = false,
   actions?: { label: string; value: string }[]
-) => {
+): void => {
   const now = Date.now();
   const existing = state.activeTasks[id];
   const createdAt = existing?.createdAt || now;
-  const isTerminal = status === 'success' || status === 'cancelled';
-  const completedAt = isTerminal ? (existing?.completedAt || now) : undefined;
+  const isTerminal = status === "success" || status === "warning" || status === "cancelled";
+  const completedAt = isTerminal ? existing?.completedAt || now : undefined;
+  const statusChanged = !existing || existing.status !== status || existing.actionRequired !== actionRequired;
 
   if (existing) {
     state.activeTasks[id] = {
@@ -645,7 +178,7 @@ export const updateTask = (
       actionRequired,
       actions,
       createdAt,
-      ...(completedAt ? { completedAt } : {})
+      ...(completedAt ? { completedAt } : {}),
     };
   } else {
     state.activeTasks[id] = {
@@ -656,30 +189,30 @@ export const updateTask = (
       actionRequired,
       actions,
       createdAt,
-      ...(completedAt ? { completedAt } : {})
+      ...(completedAt ? { completedAt } : {}),
     };
   }
   scheduleStateSave();
+  emitTasksDelta(() => Object.values(state.activeTasks), statusChanged);
 };
 
-export const removeTask = (id: string) => {
+export const removeTask = (id: string): void => {
   delete state.activeTasks[id];
   scheduleStateSave();
+  emitTasksDelta(() => Object.values(state.activeTasks), true);
 };
 
 export function pruneExpiredTasks(): number {
   const now = Date.now();
   let prunedCount = 0;
   for (const [taskId, task] of Object.entries(state.activeTasks)) {
-    // Only prune completed or cancelled tasks
-    if (task.status === 'success' || task.status === 'cancelled') {
+    if (task.status === "success" || task.status === "warning" || task.status === "cancelled") {
       let taskAgeMs: number | null = null;
       if (task.completedAt) {
         taskAgeMs = now - task.completedAt;
       } else if (task.createdAt) {
         taskAgeMs = now - task.createdAt;
       } else {
-        // Attempt to extract timestamp from taskId (e.g. recovery_1730000000000)
         const match = taskId.match(/_(\d{10,13})(?:_|$)/);
         if (match) {
           const ts = parseInt(match[1], 10);
@@ -690,7 +223,6 @@ export function pruneExpiredTasks(): number {
         }
       }
 
-      // If task has been finished for > 7 days, prune it
       if (taskAgeMs !== null && taskAgeMs > TASK_TTL_MS) {
         delete state.activeTasks[taskId];
         prunedCount++;
@@ -701,191 +233,28 @@ export function pruneExpiredTasks(): number {
   if (prunedCount > 0) {
     addLog(`[Task Hygiene] Evicted ${prunedCount} completed task(s) older than 7 days.`);
     scheduleStateSave();
+    emitTasksDelta(() => Object.values(state.activeTasks), true);
   }
   return prunedCount;
 }
 
-// Hourly automated task pruning cycle
 setInterval(pruneExpiredTasks, 60 * 60 * 1000).unref();
 
 export async function saveConfigAtomic(config: Config): Promise<void> {
-  const normalizedConfig: Config = {
-    ...config,
-    savePath: normalizeConfigSavePath(config.savePath)
-  };
-  const configStr = JSON.stringify(normalizedConfig, null, 2);
-  const tempFile = `${CONFIG_FILE}.tmp`;
-  try {
-    await fs.promises.writeFile(tempFile, configStr, "utf-8");
-    await fs.promises.rename(tempFile, CONFIG_FILE);
-    await fs.promises.writeFile(CONFIG_BAK_FILE, configStr, "utf-8").catch(() => {});
-  } catch (err) {
-    console.error("Failed to save config.json atomically", err);
-    if (fs.existsSync(tempFile)) {
-      await fs.promises.unlink(tempFile).catch(() => {});
-    }
-    throw err;
-  }
+  const normalized = await saveConfigToDiskAtomic(config);
+  state.config = normalized;
+  emitConfigDelta(state.config);
 }
 
-export function loadState(onOrphanedSession?: (session: any) => void) {
-  let loadedConfig = false;
-  const configCandidatePaths = [
-    CONFIG_FILE,
-    CONFIG_BAK_FILE,
-    path.join(process.cwd(), "config.json"),
-    path.join(process.cwd(), "config.json.bak")
-  ];
+export function loadState(onOrphanedSession?: (session: any) => void): void {
+  state.config = loadConfigFromDisk();
 
-  for (const candidate of configCandidatePaths) {
-    if (fs.existsSync(candidate)) {
-      try {
-        const raw = fs.readFileSync(candidate, "utf-8").trim();
-        if (raw) {
-          const configData = JSON.parse(raw);
-          if (configData.browserClientId === LEGACY_TWITCH_BROWSER_CLIENT_ID) {
-            configData.browserClientId = DEFAULT_TWITCH_BROWSER_CLIENT_ID;
-          }
-          const rawSavePath = configData.savePath;
-          configData.savePath = normalizeConfigSavePath(configData.savePath);
-          state.config = {
-            ...defaultConfig,
-            ...configData,
-            chatRender: {
-              ...defaultConfig.chatRender,
-              ...(configData.chatRender || {})
-            }
-          };
-          if (state.config.chatRender.syncOffset === 0 || state.config.chatRender.syncOffset === undefined) {
-            state.config.chatRender.syncOffset = -2.5;
-          }
-          if (state.config.chatRender.syncOffsetHevc === undefined || state.config.chatRender.syncOffsetHevc === 0) {
-            state.config.chatRender.syncOffsetHevc = -7.5;
-          }
-          if (state.config.chatRender.giphy === undefined) {
-            state.config.chatRender.giphy = true;
-          }
-          if (state.config.chatRender.dispersion === true) {
-            state.config.chatRender.dispersion = "on";
-          } else if (state.config.chatRender.dispersion === false) {
-            state.config.chatRender.dispersion = "off";
-          } else if (state.config.chatRender.dispersion !== "on" && state.config.chatRender.dispersion !== "off" && state.config.chatRender.dispersion !== "smart") {
-            state.config.chatRender.dispersion = "smart";
-          }
-          if (!Array.isArray(state.config.chatRender.gameProfiles)) {
-            state.config.chatRender.gameProfiles = [];
-          }
-          if (!state.config.channelCaptureModes || typeof state.config.channelCaptureModes !== 'object') {
-            state.config.channelCaptureModes = {};
-          }
-          loadedConfig = true;
-          // If we restored from a backup or alternate path, or healed a hardcoded/legacy savePath, synchronize to primary CONFIG_FILE
-          if (candidate !== CONFIG_FILE || (typeof rawSavePath === 'string' && rawSavePath.toLowerCase().includes("newdownloader")) || rawSavePath !== configData.savePath) {
-            try {
-              fs.writeFileSync(CONFIG_FILE, JSON.stringify(state.config, null, 2), "utf-8");
-              console.log(`[Config] Healed and synced configuration from ${candidate} to ${CONFIG_FILE} (savePath: "${state.config.savePath}")`);
-            } catch {}
-          }
-          break;
-        }
-      } catch (err) {
-        console.error(`Failed to parse config from ${candidate}`, err);
-      }
-    }
-  }
+  const { restoredTasks, restoredSessions } = sessionJournal.restoreFromDisk({
+    currentSavePath: getResolvedSavePath(),
+    onOrphanedSession,
+  });
 
-  if (fs.existsSync(STATE_FILE)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
-      if (data.activeTasks) {
-        Object.keys(data.activeTasks).forEach(taskId => {
-          const task = data.activeTasks[taskId];
-          if (taskId.startsWith('prompt_backfill_')) return; // Ignore stale prompts
-
-          if (task.folderPath) {
-            const folderBase = path.basename(task.folderPath);
-            const currentSavePath = getResolvedSavePath();
-            const reanchoredPath = path.join(currentSavePath, folderBase);
-            if (task.folderPath.toLowerCase().includes("newdownloader") || !fs.existsSync(task.folderPath)) {
-              if (fs.existsSync(reanchoredPath)) {
-                task.folderPath = reanchoredPath;
-              }
-            }
-          }
-
-          if (task.status === 'running') {
-            task.status = 'error';
-            task.progressText = 'Process interrupted (App Restarted). Select an action below.';
-            task.actionRequired = true;
-            if (task.name.includes("Stitch") || taskId.includes("stitch")) {
-              task.actions = [{ label: "Retry Stitching", value: "retry_stitch" }, { label: "Dismiss", value: "dismiss" }];
-            } else if (task.name.includes("Render") || taskId.includes("render")) {
-              task.actions = [{ label: "Retry Render", value: "render_chat" }, { label: "Dismiss", value: "dismiss" }];
-            } else if (task.name.includes("Download VOD") || taskId.includes("download")) {
-              task.actions = [{ label: "Retry Download", value: "download_vod_chat" }, { label: "Dismiss", value: "dismiss" }];
-            } else {
-              task.actions = [{ label: "Dismiss", value: "dismiss" }];
-            }
-          }
-          state.activeTasks[taskId] = task;
-        });
-        // Prune any tasks older than 7 days upon application boot
-        pruneExpiredTasks();
-      }
-      if (data.activeDownloadSessions) {
-        Object.keys(data.activeDownloadSessions).forEach(channel => {
-          const savedSession = data.activeDownloadSessions[channel];
-          // Re-anchor folderPath if it was previously saved under an old location (e.g. C:\NewDownloader\downloads)
-          if (savedSession.folderPath) {
-            const folderBase = path.basename(savedSession.folderPath);
-            const currentSavePath = getResolvedSavePath();
-            const reanchoredPath = path.join(currentSavePath, folderBase);
-
-            if (savedSession.folderPath.toLowerCase().includes("newdownloader") || !fs.existsSync(savedSession.folderPath)) {
-              if (fs.existsSync(reanchoredPath)) {
-                console.log(`[State] Re-anchoring session folder from ${savedSession.folderPath} to ${reanchoredPath}`);
-                savedSession.folderPath = reanchoredPath;
-                if (savedSession.segmentsFile) {
-                  savedSession.segmentsFile = path.join(reanchoredPath, path.basename(savedSession.segmentsFile));
-                }
-                if (savedSession.chatFilePath) {
-                  savedSession.chatFilePath = path.join(reanchoredPath, path.basename(savedSession.chatFilePath));
-                }
-              }
-            }
-          }
-
-          // If the user deleted the session's download folder, discard the stale session so a fresh download/backfill occurs
-          if (savedSession.folderPath && !fs.existsSync(savedSession.folderPath)) {
-            console.log(`[State] Session download folder ${savedSession.folderPath} does not exist (deleted by user). Discarding stale session for ${channel}.`);
-            return;
-          }
-
-          const deserializedSegments = deserializeDownloadedSegments(savedSession.downloadedSegments);
-          // Bound restored segment set to most recent 1,000 sequence watermark to keep memory footprint bounded
-          if (savedSession.highestSeq && savedSession.highestSeq > 1000) {
-            const pruneBefore = savedSession.highestSeq - 1000;
-            for (const item of deserializedSegments) {
-              if (typeof item === 'number' && item < pruneBefore) {
-                deserializedSegments.delete(item);
-              }
-            }
-          }
-
-          state.activeDownloadSessions[channel] = {
-            ...savedSession,
-            downloadedSegments: deserializedSegments,
-            playlistPollInterval: null,
-            isRefreshingPlaylist: false,
-            isResumingFromRestart: true,
-            chatWs: null,
-            chatStream: null
-          };
-          if (onOrphanedSession) onOrphanedSession(savedSession);
-        });
-      }
-    } catch (err) {
-      console.error("Failed to read state.json", err);
-    }
-  }
+  state.activeTasks = restoredTasks;
+  pruneExpiredTasks();
+  state.activeDownloadSessions = restoredSessions;
 }

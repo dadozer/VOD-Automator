@@ -2,9 +2,9 @@
 
 ## 1. Architecture & Backward-Compatibility Design
 
-**VOD Automator (`v5.2.4`)** captures the full spectrum of Twitch live chat and broadcast overlay events using two simultaneous WebSocket connections per active stream:
-1. **Twitch IRCv3 WebSocket (`wss://irc-ws.chat.twitch.tv:443`)** with `CAP REQ :twitch.tv/tags twitch.tv/commands`
-2. **Twitch PubSub Edge WebSocket (`wss://pubsub-edge.twitch.tv/v1`)** listening to public channel overlay topics (`predictions-channel-v1`, `polls`, `pinned-chat-updates-v1`, `community-points-channel-v1`, `hype-train-events-v1`, `raid`)
+**VOD Automator (`v6.0.0`)** captures the full spectrum of Twitch live chat and broadcast overlay events using two simultaneous WebSocket connections per active stream:
+1. **Twitch IRCv3 WebSocket (`wss://irc-ws.chat.twitch.tv:443`)** with `CAP REQ :twitch.tv/tags twitch.tv/commands` (`src/services/chat.ts`)
+2. **Twitch Hermes WebSocket Gateway (`wss://hermes.twitch.tv/v1?clientId=<clientId>`)** subscribing to real-time channel overlay topics (`predictions-channel-v1`, `polls`, `pinned-chat-updates-v1`, `community-points-channel-v1`, `hype-train-events-v1`, `raid`) with `welcome` keepalive watchdogs and hitless `reconnect` URL migration (`src/services/hermesClient.ts`). *(Note: Twitch decommissioned legacy `wss://pubsub-edge.twitch.tv/v1`; serialized `events[].source` retains `"pubsub"` in output `.json` files so C# renderers require zero deserialization changes.)*
 
 ### Why Two Top-Level Arrays (`comments[]` + `events[]`)?
 To guarantee **100% drop-in backward compatibility** with both **`ChatRenderCLI`** and un-upgraded legacy **`TwitchDownloaderCLI`** binaries:
@@ -14,11 +14,11 @@ To guarantee **100% drop-in backward compatibility** with both **`ChatRenderCLI`
   - Richer IRCv3 metadata (First-Time Chatter, Returning Chatter, Highlighted Message, Custom Channel Point Redemptions with text, Threaded Reply parent context, Bits Power-Ups / Gigantified Emotes, Paid Hype Chat, Shared Chat) is attached to each comment under `"event_type"` and `"event_data"`.
 - **`events[]`** is a top-level, chronologically sorted array containing **non-chat moderation actions and live overlay state updates** (`clearchat`, `clearmsg`, `roomstate`, `prediction`, `poll`, `pinned_chat`, `channel_points`, `hype_train`, `raid`).
   - Keeping these out of `comments[]` ensures that an un-upgraded renderer never prints hundreds of `"System: Prediction updated..."` spam lines in chat.
-  - Both `comments[]` and `events[]` share the exact same `content_offset_seconds` floating-point timeline (normalized to `0.0s` at the start of each sliced `.mp4` segment, and automatically shifted/scaled together during `--sync` and clock-drift compensation).
+  - Both `comments[]` and `events[]` share the exact same `content_offset_seconds` floating-point timeline (normalized to `0.0s` at the start of each sliced `.mp4` segment, and automatically shifted/scaled together by `compileChatSlice()` in `src/services/chatCompiler.ts` during `--sync` and clock-drift compensation).
 
-### Live Capture vs. VOD Backfill Availability
-- **Live Capture (`*_live_*.json` / `1_<game>_<date>.json`)**: Contains the complete `v2.0-extended` dataset (`comments[]` with full IRCv3 tags + `events[]` with PubSub overlays and moderation timeline). Even when joining a stream mid-broadcast, VOD Automator connects both live WebSockets immediately at second `0` of detection and buffers all live events while awaiting your VOD backfill choice.
-- **Standalone VOD Backfill (`*_vod_backfill_*.json`)**: Because Twitch's VOD comment database (`VideoCommentsByOffsetOrCursor`) permanently discards PubSub overlays, IRCv3 tags (`first-msg`, `reply-parent-*`, `msg-id`), and moderation events (retroactively purging deleted messages instead of recording `CLEARCHAT`/`CLEARMSG`), backfilled VOD segments contain standard chat messages, user badges, colors, and emotes (`events: []`).
+### Live Capture (`.jsonl` Journals) vs. VOD Backfill Availability
+- **Live Capture (`*_live_*.json` / `1_<game>_<date>.json`)**: During live recording, messages and Hermes overlay updates stream append-only into `.comments.jsonl` and `.events.jsonl` journals on disk, then compile through `src/services/chatCompiler.ts` into the complete `v2.0-extended` `.json` dataset (`comments[]` with full IRCv3 tags + `events[]` with Hermes overlays and moderation timeline). Even when joining a stream mid-broadcast, VOD Automator connects both live WebSockets immediately at second `0` of detection and buffers all live events while awaiting your VOD backfill choice.
+- **Standalone VOD Backfill (`*_vod_backfill_*.json`)**: Because Twitch's VOD comment database (`VideoCommentsByOffsetOrCursor`) permanently discards live overlays, IRCv3 tags (`first-msg`, `reply-parent-*`, `msg-id`), and moderation events (retroactively purging deleted messages instead of recording `CLEARCHAT`/`CLEARMSG`), backfilled VOD segments contain standard chat messages, user badges, colors, and emotes (`events: []`).
 
 ---
 
@@ -444,7 +444,7 @@ Every item in the top-level `"events": [...]` array carries both `"type"` and `"
 
 ### 4.8 `event_type: "hype_train"` & `event_type: "raid"`
 - **`hype_train`**: `data.pubsub_type` (`"hype-train-start"`, `"hype-train-progression"`, `"hype-train-level-up"`, `"hype-train-conductor-update"`, `"hype-train-end"`), `data.level`, `data.goal`, `data.total`, `data.progress`, `data.ends_at`.
-  - **Stateful Delta Merging (`pinned_chat` & `hype_train`)**: When Twitch PubSub emits lightweight delta updates (such as `"update-message"` or `"unpin-message"` on `pinned-chat-updates-v1`, or `"hype-train-conductor-update"` / `"hype-train-end"` on `hype-train-events-v1`), VOD Automator merges the delta fields into the active in-memory overlay state and omits absent keys rather than overwriting `message_text`, `sender_display_name`, `goal`, or `progress` with `""` or `0`.
+  - **Stateful Delta Merging (`pinned_chat` & `hype_train`)**: When Twitch Hermes emits lightweight delta notifications (such as `"update-message"` or `"unpin-message"` on `pinned-chat-updates-v1`, or `"hype-train-conductor-update"` / `"hype-train-end"` on `hype-train-events-v1`), VOD Automator merges the delta fields into the active in-memory overlay state and omits absent keys rather than overwriting `message_text`, `sender_display_name`, `goal`, or `progress` with `""` or `0`.
 - **`raid`**: `data.pubsub_type` (`"raid_update_v2"`, `"raid_go_v2"`, `"raid_cancel_v2"`), `data.target_login`, `data.target_display_name`, `data.viewer_count`.
 
 ---
@@ -629,7 +629,7 @@ namespace TwitchDownloaderCore.Chat
         public double ContentOffsetSeconds { get; set; }
 
         [JsonPropertyName("source")]
-        public string Source { get; set; } // "irc" | "pubsub"
+        public string Source { get; set; } // "irc" | "pubsub" (Hermes notifications serialize as "pubsub" for backward compatibility)
 
         [JsonPropertyName("event_type")]
         public string EventType { get; set; } // "clearchat" | "clearmsg" | "roomstate" | "prediction" | "poll" | "pinned_chat" | "channel_points" | "hype_train" | "raid"
@@ -670,14 +670,14 @@ Because your 20x-accelerated renderer steps forward linearly through `currentRen
 
 ---
 
-## 7. `ChatRenderCLI` Command-Line Invocation Mapping (`v5.1.0`)
+## 7. `ChatRenderCLI` Command-Line Invocation Mapping (`v6.0.0`)
 
 VOD Automator (`src/services/chat.ts -> executeChatRenderMultiple`) automatically resolves `ChatRenderCLI.exe` (preferring it over `TwitchDownloaderCLI.exe` if both are present in the same directory) and passes all configured options from the two Settings tabs (**Render: Video & Output** and **Render: Chat & Events**):
 
 | Setting Property (`config.chatRender`) | CLI Flag Passed to `ChatRenderCLI` | Default Value |
 | :--- | :--- | :--- |
-| `width` / `height` | `-w <even_px>` / `-h <even_px>` | `350` / `800` (e.g. `640` / `936`) |
-| `framerate` / `updateRate` | `--framerate <fps>` / `--update-rate <sec>` | `60` / `0.2` |
+| `width` / `height` | `-w <even_px>` / `-h <even_px>` | `350` / `800` (or per-game profile override) |
+| `framerate` / `updateRate` | `--framerate <fps>` / `--update-rate <sec>` | `60` / `0` |
 | `jobs` | `-j <0..16>` | `0` (Auto-scale `1`–`4` workers) |
 | `imageCacheMb` | `--image-cache-mb <64..8192>` | `256` |
 | `giphy` / `gifMaxHeightPercent` | `--giphy=true\|false` / `--gif-max-height-percent <5..100>` | `true` / `33` |
@@ -687,7 +687,7 @@ VOD Automator (`src/services/chat.ts -> executeChatRenderMultiple`) automaticall
 | `hypeTrainMode` | `--hype-train-mode StickyTop\|ChatScroll\|Off` | `ChatScroll` |
 | `moderationMode` | `--moderation-mode Strikethrough\|ReplaceDeleted\|Hide\|Off` | `Strikethrough` |
 | `moderationNotices` | `--moderation-notices=false` (when unchecked) | `true` |
-| `clearAll` | `--clear-all` (when checked) | `true` |
+| `clearAll` | `--clear-all` (when checked) | `false` |
 | `roomstateNotices` | `--roomstate-notices=false` (when unchecked) | `true` |
 | `replies` | `--replies=false` (when unchecked) | `true` |
 | `firstChatter` | `--first-chatter=false` (when unchecked) | `true` |
@@ -697,7 +697,7 @@ VOD Automator (`src/services/chat.ts -> executeChatRenderMultiple`) automaticall
 | `hypeChat` | `--hype-chat=false` (when unchecked) | `true` |
 | `powerUps` | `--power-ups=false` (when unchecked) | `true` |
 | `sharedChatBadge` | `--shared-chat-badge=false` (when unchecked) | `true` |
-| `highlightUsers` / `highlightUserColor` | `--highlight-users <csv>` / `--highlight-user-color <hex>` | `""` / `#3D1A52` |
+| `highlightUsers` / `highlightUserColor` | `--highlight-users <csv>` / `--highlight-user-color <hex>` | `""` / `#C8FF0059` |
 | `scaleUsername` | `--scale-username <double>` | `1.0` |
 
 *(If an older, un-upgraded `TwitchDownloaderCLI` binary is used and returns an unknown-option error, VOD Automator automatically strips the `extendedArgs` list and retries with legacy `TwitchDownloaderCLI` flags.)*

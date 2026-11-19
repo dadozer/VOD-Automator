@@ -2,7 +2,9 @@ import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
 import WebSocket from "ws";
-import { state, addLog, updateTask, removeTask, resolveTdPath, getChatRenderDimensionsForGame, getChatRenderDimensionsForChatFile } from "./state";
+import { state, addLog, updateTask, removeTask, resolveTdPath, getChatRenderDimensionsForGame, getChatRenderDimensionsForChatFile, cleanChannelName } from "./state";
+import { emitSessionsDelta } from "./eventBus";
+import { attachHermesOverlayClient, refreshLiveChatAuth } from "./hermesClient";
 import { postTwitchGql, fetchRecentVods } from "./twitch";
 import {
   fetchThirdPartyEmotes,
@@ -12,8 +14,38 @@ import {
   populateEmbeddedDataForChat
 } from "./emotes";
 import { ensureFfmpeg, getVideoDurationSeconds, checkVideoIsHevc } from "./ffmpeg";
+import { isSessionHevcOrFmp4FromManifest } from "./sessionManifest";
+import {
+  getEventsSidecarPath,
+  getCommentsJournalPath,
+  getChatSessionHeaderPath,
+  hasChatSource,
+  readBroadcastEventsForChatFile,
+  sliceAndCarryOverBroadcastEvents,
+  findLastCompleteCommentEnd,
+  extractChatCommentsFallback,
+  safeParseChatData,
+  writeChatSessionHeader,
+  readCommentsFromJournal,
+  normalizeTwitchDownloaderSchema,
+  writeJsonAtomic,
+  sealMasterChatFileFromJournal
+} from "./chatCompiler";
 
 import type { ChatBroadcastEvent } from "../types";
+
+export {
+  getEventsSidecarPath,
+  getCommentsJournalPath,
+  getChatSessionHeaderPath,
+  hasChatSource,
+  readBroadcastEventsForChatFile,
+  sliceAndCarryOverBroadcastEvents,
+  findLastCompleteCommentEnd,
+  extractChatCommentsFallback,
+  safeParseChatData,
+  refreshLiveChatAuth
+};
 
 export function unescapeIrcTagValue(val: string): string {
   if (!val || !val.includes('\\')) return val || "";
@@ -88,47 +120,6 @@ export function parseIrcMessage(raw: string) {
   return { tags, username, command, channel, message };
 }
 
-export function getEventsSidecarPath(chatFilePath: string): string {
-  return chatFilePath.replace(/\.json$/i, '.events.jsonl');
-}
-
-export function readBroadcastEventsForChatFile(chatFilePath?: string, parsedChatObj?: any): ChatBroadcastEvent[] {
-  const events: ChatBroadcastEvent[] = [];
-  const seenIds = new Set<string>();
-
-  if (parsedChatObj && Array.isArray(parsedChatObj.events)) {
-    for (const evt of parsedChatObj.events) {
-      if (evt && evt._id && !seenIds.has(evt._id)) {
-        seenIds.add(evt._id);
-        events.push(evt);
-      }
-    }
-  }
-
-  if (chatFilePath) {
-    const sidecarPath = getEventsSidecarPath(chatFilePath);
-    if (fs.existsSync(sidecarPath)) {
-      try {
-        const rawLines = fs.readFileSync(sidecarPath, 'utf8').split(/\r?\n/);
-        for (const line of rawLines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          try {
-            const evt = JSON.parse(trimmed);
-            if (evt && evt._id && !seenIds.has(evt._id)) {
-              seenIds.add(evt._id);
-              events.push(evt);
-            }
-          } catch (_) {}
-        }
-      } catch (_) {}
-    }
-  }
-
-  events.sort((a, b) => (a.content_offset_seconds || 0) - (b.content_offset_seconds || 0));
-  return events;
-}
-
 export function appendBroadcastEvent(channelLogin: string, event: ChatBroadcastEvent) {
   const session = state.activeDownloadSessions[channelLogin];
   if (!session || session.isStopped) return;
@@ -146,129 +137,13 @@ export function appendBroadcastEvent(channelLogin: string, event: ChatBroadcastE
   if (session.eventExistingIds.has(event._id)) return;
   session.eventExistingIds.add(event._id);
   session.eventsWritten = (session.eventsWritten || 0) + 1;
+  emitSessionsDelta();
 
   const sidecarPath = session.eventsFilePath || (session.chatFilePath ? getEventsSidecarPath(session.chatFilePath) : "");
   if (sidecarPath) {
     session.eventsFilePath = sidecarPath;
     fs.promises.appendFile(sidecarPath, JSON.stringify(event) + "\n", "utf8").catch(() => {});
   }
-}
-
-export function sliceAndCarryOverBroadcastEvents(
-  events: ChatBroadcastEvent[],
-  videoStartOffset: number,
-  videoEndOffset: number,
-  gapAdjustments: { atChunk: number; missingDurationSec: number }[],
-  baseOffsetSec: number,
-  baseSeq: number,
-  avgChunkDur: number
-): ChatBroadcastEvent[] {
-  if (!Array.isArray(events) || events.length === 0) return [];
-
-  const activePredictionsBeforeStart = new Map<string, ChatBroadcastEvent>();
-  const activePollsBeforeStart = new Map<string, ChatBroadcastEvent>();
-  const activePinsBeforeStart = new Map<string, ChatBroadcastEvent>();
-  let activeHypeTrainBeforeStart: ChatBroadcastEvent | null = null;
-  const sliced: ChatBroadcastEvent[] = [];
-
-  for (const evt of events) {
-    if (!evt) continue;
-    const evtType = evt.event_type || (evt.type as any);
-    let streamTime = evt.content_offset_seconds || 0;
-    if (gapAdjustments && gapAdjustments.length > 0) {
-      for (const gap of gapAdjustments) {
-        const gapOffsetSec = baseOffsetSec + Math.max(0, gap.atChunk - baseSeq) * avgChunkDur;
-        if (streamTime > gapOffsetSec) {
-          streamTime -= gap.missingDurationSec;
-        }
-      }
-    }
-
-    if (streamTime < videoStartOffset) {
-      if (evtType === 'prediction' && evt.data?.prediction_id) {
-        const pid = String(evt.data.prediction_id);
-        const st = String(evt.data.status || '').toUpperCase();
-        if (st === 'RESOLVED' || st === 'CANCELED' || st === 'CANCELLED') {
-          activePredictionsBeforeStart.delete(pid);
-        } else {
-          activePredictionsBeforeStart.set(pid, evt);
-        }
-      } else if (evtType === 'poll' && evt.data?.poll_id) {
-        const pollId = String(evt.data.poll_id);
-        const st = String(evt.data.status || '').toUpperCase();
-        if (st === 'COMPLETED' || st === 'ARCHIVED' || st === 'TERMINATED') {
-          activePollsBeforeStart.delete(pollId);
-        } else {
-          activePollsBeforeStart.set(pollId, evt);
-        }
-      } else if (evtType === 'pinned_chat' && evt.data?.pin_id) {
-        const pinId = String(evt.data.pin_id);
-        if (evt.category === 'unpin_message' || evt.data?.action === 'unpin-message') {
-          activePinsBeforeStart.delete(pinId);
-        } else {
-          const prevPin = activePinsBeforeStart.get(pinId);
-          if (prevPin) {
-            const mergedPin: ChatBroadcastEvent = JSON.parse(JSON.stringify(prevPin));
-            mergedPin.data = { ...mergedPin.data, ...evt.data };
-            activePinsBeforeStart.set(pinId, mergedPin);
-          } else {
-            activePinsBeforeStart.set(pinId, evt);
-          }
-        }
-      } else if (evtType === 'hype_train') {
-        if (evt.category === 'hype_train_end' || evt.data?.pubsub_type === 'hype-train-end' || evt.data?.ended_at) {
-          activeHypeTrainBeforeStart = null;
-        } else if (activeHypeTrainBeforeStart) {
-          const mergedTrain: ChatBroadcastEvent = JSON.parse(JSON.stringify(activeHypeTrainBeforeStart));
-          mergedTrain.data = { ...mergedTrain.data, ...evt.data };
-          activeHypeTrainBeforeStart = mergedTrain;
-        } else {
-          activeHypeTrainBeforeStart = evt;
-        }
-      }
-    } else if (streamTime >= videoStartOffset && streamTime <= videoEndOffset) {
-      const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(evt));
-      if (!cloned.type) cloned.type = cloned.event_type;
-      cloned.content_offset_seconds = parseFloat(Math.max(0, streamTime - videoStartOffset).toFixed(3));
-      sliced.push(cloned);
-    }
-  }
-
-  const carriedOver: ChatBroadcastEvent[] = [];
-  for (const [, predEvt] of activePredictionsBeforeStart) {
-    const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(predEvt));
-    cloned._id = `${cloned._id}_carryover_${Math.round(videoStartOffset)}`;
-    if (!cloned.type) cloned.type = cloned.event_type;
-    cloned.content_offset_seconds = 0;
-    cloned.carried_over = true;
-    carriedOver.push(cloned);
-  }
-  for (const [, pollEvt] of activePollsBeforeStart) {
-    const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(pollEvt));
-    cloned._id = `${cloned._id}_carryover_${Math.round(videoStartOffset)}`;
-    if (!cloned.type) cloned.type = cloned.event_type;
-    cloned.content_offset_seconds = 0;
-    cloned.carried_over = true;
-    carriedOver.push(cloned);
-  }
-  for (const [, pinEvt] of activePinsBeforeStart) {
-    const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(pinEvt));
-    cloned._id = `${cloned._id}_carryover_${Math.round(videoStartOffset)}`;
-    if (!cloned.type) cloned.type = cloned.event_type;
-    cloned.content_offset_seconds = 0;
-    cloned.carried_over = true;
-    carriedOver.push(cloned);
-  }
-  if (activeHypeTrainBeforeStart) {
-    const cloned: ChatBroadcastEvent = JSON.parse(JSON.stringify(activeHypeTrainBeforeStart));
-    cloned._id = `${cloned._id}_carryover_${Math.round(videoStartOffset)}`;
-    if (!cloned.type) cloned.type = cloned.event_type;
-    cloned.content_offset_seconds = 0;
-    cloned.carried_over = true;
-    carriedOver.push(cloned);
-  }
-
-  return [...carriedOver, ...sliced];
 }
 
 export function parseBadges(badgesTag: string) {
@@ -714,275 +589,48 @@ export function buildFragments(message: string, emotesTag: string) {
   }
 
   /**
-   * Scans chat JSON content and returns the index immediately following the closing '}'
-   * of the last complete comment object inside the "comments" array.
-   * Correctly accounts for string quotation, escape characters, and nested objects.
-   * Returns -1 if no complete comment is found.
-   */
-  export function findLastCompleteCommentEnd(content: string): number {
-    const match = content.match(/"comments"\s*:\s*\[/);
-    if (!match || match.index === undefined) return -1;
-    const startPos = match.index + match[0].length;
-
-    let inString = false;
-    let escape = false;
-    let braceDepth = 0;
-    let lastCompleteEnd = -1;
-    let commentStart = -1;
-
-    for (let i = startPos; i < content.length; i++) {
-      const ch = content[i];
-
-      if (escape) {
-        escape = false;
-        continue;
-      }
-      if (ch === '\\' && inString) {
-        escape = true;
-        continue;
-      }
-      if (ch === '"') {
-        inString = !inString;
-        continue;
-      }
-      if (inString) continue;
-
-      if (ch === '{') {
-        if (braceDepth === 0) {
-          commentStart = i;
-        }
-        braceDepth++;
-      } else if (ch === '}') {
-        if (braceDepth > 0) {
-          braceDepth--;
-          if (braceDepth === 0 && commentStart !== -1) {
-            lastCompleteEnd = i + 1;
-            commentStart = -1;
-          }
-        }
-      } else if (ch === ']' && braceDepth === 0) {
-        // If a premature mid-stream seal wrote a closing ']' followed by additional live comments,
-        // return -1 so safeParseChatData falls back to full-file comment extraction across the seam.
-        const remainder = content.substring(i + 1);
-        if (/"content_offset_seconds"\s*:\s*[\d.]+/.test(remainder) && /"commenter"\s*:\s*\{/.test(remainder)) {
-          return -1;
-        }
-        break;
-      }
-    }
-
-    return lastCompleteEnd;
-  }
-
-  /**
-   * Resiliently extracts all complete, valid comments and metadata from a potentially
-   * malformed, incomplete, or corrupted chat JSON string.
-   */
-  export function extractChatCommentsFallback(content: string): any {
-    let fileInfo = {
-      Version: { Major: 1, Minor: 5, Patch: 3 },
-      CreatedAt: new Date().toISOString(),
-      UpdatedAt: new Date().toISOString()
-    };
-    let streamer: any = { name: "streamer", id: 0 };
-    let video: any = {
-      title: "",
-      description: "",
-      id: "",
-      created_at: new Date().toISOString(),
-      start: 0,
-      end: 0,
-      length: 0,
-      viewCount: 0,
-      game: ""
-    };
-
-    const streamerMatch = content.match(/"streamer"\s*:\s*(\{[^}]+\})/);
-    if (streamerMatch) {
-      try { streamer = JSON.parse(streamerMatch[1]); } catch (_) {}
-    }
-    if (!streamer || typeof streamer.id !== 'number' || isNaN(streamer.id)) {
-      streamer = {
-        name: streamer?.name || "streamer",
-        id: parseInt(String(streamer?.id || 0), 10) || 0
-      };
-    }
-    const videoMatch = content.match(/"video"\s*:\s*(\{[^}]+length":\s*[\d.]+\s*,\s*"viewCount":\s*\d+\s*,\s*"game":\s*"[^"]*"\s*\})/);
-    if (videoMatch) {
-      try { video = JSON.parse(videoMatch[1]); } catch (_) {}
-    }
-
-    const comments: any[] = [];
-    const seenIds = new Set<string>();
-
-    const match = content.match(/"comments"\s*:\s*\[/);
-    const startPos = match && match.index !== undefined ? match.index + match[0].length : 0;
-
-    let inString = false;
-    let escape = false;
-    let braceDepth = 0;
-    let commentStart = -1;
-
-    for (let i = startPos; i < content.length; i++) {
-      const ch = content[i];
-      if (escape) { escape = false; continue; }
-      if (ch === '\\' && inString) { escape = true; continue; }
-      if (ch === '"') { inString = !inString; continue; }
-      if (inString) continue;
-
-      if (ch === '{') {
-        if (braceDepth === 0) {
-          commentStart = i;
-        }
-        braceDepth++;
-      } else if (ch === '}') {
-        if (braceDepth > 0) {
-          braceDepth--;
-          if (braceDepth === 0 && commentStart !== -1) {
-            const rawComment = content.substring(commentStart, i + 1);
-            commentStart = -1;
-            try {
-              const commentObj = JSON.parse(rawComment);
-              if (
-                commentObj &&
-                commentObj._id &&
-                commentObj._id !== "dummy-end-message" &&
-                (commentObj.message || commentObj.commenter) &&
-                !seenIds.has(commentObj._id)
-              ) {
-                seenIds.add(commentObj._id);
-                comments.push(commentObj);
-              }
-            } catch (_) {
-              // Skip malformed comment
-            }
-          }
-        }
-      }
-    }
-
-    comments.sort((a, b) => (a.content_offset_seconds || 0) - (b.content_offset_seconds || 0));
-
-    if (comments.length > 0) {
-      const lastOffset = Math.ceil(comments[comments.length - 1].content_offset_seconds || 0);
-      video.length = Math.max(video.length, lastOffset);
-      video.end = Math.max(video.end, lastOffset);
-    }
-
-    let thirdParty: any[] = [];
-    const emotesMatch = content.match(/"thirdParty"\s*:\s*(\[[^\]]*\])/);
-    if (emotesMatch) {
-      try { thirdParty = JSON.parse(emotesMatch[1]); } catch (_) {}
-    }
-
-    return {
-      FileInfo: fileInfo,
-      schemaVersion: "2.0-extended",
-      streamer,
-      video,
-      comments,
-      events: [],
-      embeddedData: {
-        thirdParty,
-        firstParty: [],
-        twitchBadges: []
-      }
-    };
-  }
-
-  /**
-   * Safely parses chat data from raw JSON string, handling:
-   * 1. Valid closed JSON.
-   * 2. Unclosed live stream JSON being actively written (seals cleanly after the last complete comment).
-   * 3. Malformed/partially corrupted files with broken seams (extracts all individual valid comments).
-   */
-  export function safeParseChatData(content: string, chatFilePath?: string): any {
-    if (!content || !content.trim()) return null;
-
-    let result: any = null;
-
-    // 1. Direct parse attempt
-    try {
-      const parsed = JSON.parse(content);
-      if (parsed && Array.isArray(parsed.comments)) {
-        result = parsed;
-      }
-    } catch (_) {}
-
-    // 2. Clean truncation at last complete comment
-    if (!result) {
-      const lastEnd = findLastCompleteCommentEnd(content);
-      if (lastEnd !== -1) {
-        const sealed = content.substring(0, lastEnd) + '\n  ],\n  "embeddedData": null\n}';
-        try {
-          const parsed = JSON.parse(sealed);
-          if (parsed && Array.isArray(parsed.comments)) {
-            result = parsed;
-          }
-        } catch (_) {}
-      }
-    }
-
-    // 3. Fallback extraction of individual comments
-    if (!result) {
-      result = extractChatCommentsFallback(content);
-    }
-
-    if (result) {
-      const mergedEvents = readBroadcastEventsForChatFile(chatFilePath, result);
-      if (mergedEvents.length > 0 || Array.isArray(result.events)) {
-        result.events = mergedEvents;
-      }
-      if (!result.schemaVersion) {
-        result.schemaVersion = "2.0-extended";
-      }
-    }
-
-    return result;
-  }
-
-  /**
-   * Validate and repair corrupted or concatenated chat JSON files.
+   * Validate and repair corrupted or concatenated chat JSON files, or seal uncompiled
+   * `.comments.jsonl` journals for stopped sessions.
    * Reconstructs a valid schema for TwitchDownloaderCLI and chat rendering.
    */
   export async function repairChatJsonFile(filePath: string): Promise<boolean> {
-    if (!fs.existsSync(filePath)) return false;
+    if (!filePath) return false;
     try {
       const resolvedTarget = path.resolve(filePath);
       const activeOpenSession = Object.values(state.activeDownloadSessions).find(
-        (s: any) => s && !s.isStopped && s.chatStream && s.chatFilePath && path.resolve(s.chatFilePath) === resolvedTarget
+        (s: any) =>
+          s &&
+          !s.isStopped &&
+          s.chatStream &&
+          s.chatFilePath &&
+          path.resolve(s.chatFilePath) === resolvedTarget
       );
       if (activeOpenSession) {
-        addLog(`[Chat Repair] Skipping in-place file seal on active open live chat stream: ${path.basename(filePath)} (@${activeOpenSession.channel}).`);
+        addLog(`[Chat Repair] Skipping in-place file seal on active open live chat journal: ${path.basename(filePath)} (@${activeOpenSession.channel}).`);
         return true;
       }
+
+      const journalPath = getCommentsJournalPath(filePath);
+      if (fs.existsSync(journalPath)) {
+        const sealed = await sealMasterChatFileFromJournal(filePath);
+        if (sealed) {
+          addLog(`[Chat Repair] Sealed append-only chat journal into ${path.basename(filePath)} (${sealed.commentCount} comments, ${sealed.eventCount} events).`);
+          return true;
+        }
+      }
+
+      if (!fs.existsSync(filePath)) return false;
 
       const raw = await fs.promises.readFile(filePath, 'utf8');
       let parsed: any = null;
       let needsResave = false;
       try {
         parsed = JSON.parse(raw);
-      } catch (parseErr) {
-        // JSON is malformed, proceed to repair via safeParseChatData
-      }
+      } catch (_) {}
 
       if (parsed && Array.isArray(parsed.comments)) {
-        // Validate and sanitize critical header fields required by TwitchDownloaderCLI (.NET System.Int32)
-        if (!parsed.FileInfo) {
-          parsed.FileInfo = {
-            Version: { Major: 1, Minor: 5, Patch: 3 },
-            CreatedAt: new Date().toISOString(),
-            UpdatedAt: new Date().toISOString()
-          };
-          needsResave = true;
-        }
+        if (!parsed.FileInfo) needsResave = true;
         if (!parsed.streamer || typeof parsed.streamer.id !== 'number' || isNaN(parsed.streamer.id)) {
-          const rawId = parsed.streamer?.id;
-          const numId = parseInt(String(rawId || 0), 10) || 0;
-          parsed.streamer = {
-            name: parsed.streamer?.name || "streamer",
-            id: numId
-          };
           needsResave = true;
         }
         const mergedEvents = readBroadcastEventsForChatFile(filePath, parsed);
@@ -990,17 +638,12 @@ export function buildFragments(message: string, emotesTag: string) {
           parsed.events = mergedEvents;
           needsResave = true;
         }
-        if (!parsed.embeddedData) {
-          parsed.embeddedData = {
-            thirdParty: Array.isArray(parsed.emotes) ? parsed.emotes : [],
-            firstParty: [],
-            twitchBadges: []
-          };
-          needsResave = true;
-        }
+        if (!parsed.embeddedData) needsResave = true;
+
         if (needsResave) {
-          await fs.promises.writeFile(filePath, JSON.stringify(parsed, null, 2), 'utf8');
-          addLog(`[Chat Repair] Sanitized header structure (streamer.id: ${parsed.streamer.id}) in ${path.basename(filePath)}.`);
+          const normalized = normalizeTwitchDownloaderSchema(parsed);
+          await writeJsonAtomic(filePath, normalized);
+          addLog(`[Chat Repair] Sanitized header structure (streamer.id: ${normalized.streamer.id}) in ${path.basename(filePath)}.`);
         }
         return true;
       }
@@ -1012,30 +655,9 @@ export function buildFragments(message: string, emotesTag: string) {
         throw new Error("Unable to extract comments from file");
       }
 
-      // Guarantee streamer.id is numeric integer
-      if (!cleanChatObj.streamer || typeof cleanChatObj.streamer.id !== 'number' || isNaN(cleanChatObj.streamer.id)) {
-        cleanChatObj.streamer = {
-          name: cleanChatObj.streamer?.name || "streamer",
-          id: parseInt(String(cleanChatObj.streamer?.id || 0), 10) || 0
-        };
-      }
-      if (!cleanChatObj.FileInfo) {
-        cleanChatObj.FileInfo = {
-          Version: { Major: 1, Minor: 5, Patch: 3 },
-          CreatedAt: new Date().toISOString(),
-          UpdatedAt: new Date().toISOString()
-        };
-      }
-      if (!cleanChatObj.embeddedData) {
-        cleanChatObj.embeddedData = {
-          thirdParty: Array.isArray(cleanChatObj.emotes) ? cleanChatObj.emotes : [],
-          firstParty: [],
-          twitchBadges: []
-        };
-      }
-
-      await fs.promises.writeFile(filePath, JSON.stringify(cleanChatObj, null, 2), 'utf8');
-      addLog(`[Chat Repair] Successfully repaired ${path.basename(filePath)} (${cleanChatObj.comments.length} comments recovered).`);
+      const normalized = normalizeTwitchDownloaderSchema(cleanChatObj);
+      await writeJsonAtomic(filePath, normalized);
+      addLog(`[Chat Repair] Successfully repaired ${path.basename(filePath)} (${normalized.comments.length} comments recovered).`);
       return true;
     } catch (err: any) {
       addLog(`[Chat Repair Error] Failed to repair ${path.basename(filePath)}: ${err.message}`);
@@ -1051,41 +673,20 @@ export function buildFragments(message: string, emotesTag: string) {
     if (!fs.existsSync(filePath)) return;
     try {
       const raw = await fs.promises.readFile(filePath, 'utf8');
-      let data = safeParseChatData(raw, filePath);
+      const data = safeParseChatData(raw, filePath);
       if (!data) return;
-      let modified = false;
 
-      if (!data.FileInfo) {
-        data.FileInfo = {
-          Version: { Major: 1, Minor: 5, Patch: 3 },
-          CreatedAt: new Date().toISOString(),
-          UpdatedAt: new Date().toISOString()
-        };
-        modified = true;
-      }
+      const needsUpdate =
+        !data.FileInfo ||
+        !data.streamer ||
+        typeof data.streamer.id !== 'number' ||
+        isNaN(data.streamer.id) ||
+        !data.embeddedData;
 
-      if (!data.streamer || typeof data.streamer.id !== 'number' || isNaN(data.streamer.id)) {
-        const rawId = data.streamer?.id;
-        const numId = parseInt(String(rawId || 0), 10) || 0;
-        data.streamer = {
-          name: data.streamer?.name || "streamer",
-          id: numId
-        };
-        modified = true;
-      }
-
-      if (!data.embeddedData) {
-        data.embeddedData = {
-          thirdParty: Array.isArray(data.emotes) ? data.emotes : [],
-          firstParty: [],
-          twitchBadges: []
-        };
-        modified = true;
-      }
-
-      if (modified) {
-        await fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
-        addLog(`[Render Sanitizer] Pre-flight verified and updated ${path.basename(filePath)} (streamer.id=${data.streamer.id}).`);
+      if (needsUpdate) {
+        const normalized = normalizeTwitchDownloaderSchema(data);
+        await writeJsonAtomic(filePath, normalized);
+        addLog(`[Render Sanitizer] Pre-flight verified and updated ${path.basename(filePath)} (streamer.id=${normalized.streamer.id}).`);
       }
     } catch (err: any) {
       addLog(`[Render Sanitizer] Warning: Pre-flight sanitization check for ${path.basename(filePath)}: ${err.message}`);
@@ -1347,65 +948,66 @@ export function buildFragments(message: string, emotesTag: string) {
 
       // Determine stream codec / container type to select correct sync offset:
       // HEVC / 1440p (Enhanced Broadcasting / CMAF fMP4) vs Standard H.264 (1080p / MPEG-TS)
-      let isHevcStream = false;
+      const isVodChatTarget = /vod_chat|vod_backfill|vod_broadcast/i.test(chatFile);
+      const manifestHevc = isSessionHevcOrFmp4FromManifest(folderPath, isVodChatTarget);
+      let isHevcStream = manifestHevc === true;
 
-      // Check 1: Active session or cached session metadata matching this folder
-      const matchingSession = Object.values(state.activeDownloadSessions).find(
-        (s: any) => s.folderPath && path.resolve(s.folderPath) === path.resolve(folderPath)
-      );
-      if (matchingSession?.isFmp4) {
-        isHevcStream = true;
-      }
+      if (manifestHevc === null) {
+        // Fallback heuristics for historical folders created prior to session_manifest.json
+        const matchingSession = Object.values(state.activeDownloadSessions).find(
+          (s: any) => s.folderPath && path.resolve(s.folderPath) === path.resolve(folderPath)
+        );
+        if (matchingSession?.isFmp4) {
+          isHevcStream = true;
+        }
 
-      // Check 2: Task object metadata
-      const taskObj = state.activeTasks[taskId];
-      if ((taskObj as any)?.isFmp4) {
-        isHevcStream = true;
-      }
+        const taskObj = state.activeTasks[taskId];
+        if (taskObj?.isFmp4) {
+          isHevcStream = true;
+        }
 
-      // Check 3: Presence of initialization segment in folder (authoritative for CMAF fMP4 / Enhanced)
-      if (!isHevcStream && fs.existsSync(path.join(folderPath, 'init.mp4'))) {
-        try {
-          const st = await fs.promises.stat(path.join(folderPath, 'init.mp4'));
-          if (st.size > 100) isHevcStream = true;
-        } catch (_) {}
-      }
+        const targetInitName = isVodChatTarget ? 'vod_init.mp4' : 'init.mp4';
+        if (!isHevcStream && fs.existsSync(path.join(folderPath, targetInitName))) {
+          try {
+            const st = await fs.promises.stat(path.join(folderPath, targetInitName));
+            if (st.size > 100) isHevcStream = true;
+          } catch (_) {}
+        }
 
-      // Check 4: Inspect existing segment files in folder
-      if (!isHevcStream) {
-        try {
-          const filesInDir = await fs.promises.readdir(folderPath);
-          const firstSeg = filesInDir.find(f => (f.startsWith('seq_') || f.startsWith('vod_seq_')) && (f.endsWith('.ts') || f.endsWith('.mp4')));
-          if (firstSeg) {
-            const segBuf = Buffer.alloc(4096);
-            const fd = await fs.promises.open(path.join(folderPath, firstSeg), 'r');
-            try {
-              const { bytesRead } = await fd.read(segBuf, 0, 4096, 0);
-              if (bytesRead > 0) {
-                if (segBuf[0] !== 0x47) {
-                  isHevcStream = true;
-                } else {
-                  const raw = segBuf.slice(0, bytesRead).toString('binary');
-                  if (raw.includes('moof') || raw.includes('styp') || raw.includes('ftyp')) {
+        if (!isHevcStream) {
+          try {
+            const filesInDir = await fs.promises.readdir(folderPath);
+            const firstSeg = filesInDir.find(f => (f.startsWith('seq_') || f.startsWith('vod_seq_')) && (f.endsWith('.ts') || f.endsWith('.mp4')));
+            if (firstSeg) {
+              const segBuf = Buffer.alloc(4096);
+              const fd = await fs.promises.open(path.join(folderPath, firstSeg), 'r');
+              try {
+                const { bytesRead } = await fd.read(segBuf, 0, 4096, 0);
+                if (bytesRead > 0) {
+                  if (segBuf[0] !== 0x47) {
                     isHevcStream = true;
+                  } else {
+                    const raw = segBuf.slice(0, bytesRead).toString('binary');
+                    if (raw.includes('moof') || raw.includes('styp') || raw.includes('ftyp')) {
+                      isHevcStream = true;
+                    }
                   }
                 }
+              } finally {
+                await fd.close().catch(() => {});
               }
-            } finally {
-              await fd.close().catch(() => {});
             }
-          }
-        } catch (_) {}
-      }
+          } catch (_) {}
+        }
 
-      // Check 5: Probe video file stream codec directly with ffprobe
-      if (!isHevcStream) {
-        for (const vFile of potentialVideoFiles) {
-          if (fs.existsSync(vFile)) {
-            const isHevc = await checkVideoIsHevc(vFile, state.config.tdPath);
-            if (isHevc) {
-              isHevcStream = true;
-              break;
+        if (!isHevcStream) {
+          for (const vFile of potentialVideoFiles) {
+            if (fs.existsSync(vFile)) {
+              const isHevc = await checkVideoIsHevc(vFile, state.config.tdPath);
+              if (isHevc) {
+                isHevcStream = true;
+                break;
+              }
             }
           }
         }
@@ -1418,7 +1020,7 @@ export function buildFragments(message: string, emotesTag: string) {
         : (cr.syncOffset !== undefined ? cr.syncOffset : -2.5);
       const syncOffset = typeof configuredOffset === 'number' ? configuredOffset : (parseFloat(configuredOffset) || defaultOffset);
 
-      addLog(`[Render] Detected stream format for ${chatFile}: ${isHevcStream ? 'HEVC / 1440p (Enhanced)' : 'Standard H.264 (1080p)'}. Using sync offset: ${syncOffset}s.`);
+      addLog(`[Render] Detected stream format for ${chatFile}: ${isHevcStream ? 'HEVC / 1440p (Enhanced)' : 'Standard H.264 (1080p)'}${manifestHevc !== null ? ' [manifest]' : ''}. Using sync offset: ${syncOffset}s.`);
 
       // Inspect raw input chat file before syncOffset / drift scaling to detect VOD chat messages for Smart Dispersion
       let containsVodChat = /vod_chat|vod_backfill|vod_broadcast/i.test(chatFile);
@@ -1951,21 +1553,17 @@ export function flushPendingChatWrites(session: any) {
   }
   extractUsedEmotesAndBadgesFromComments(batch, undefined, session.usedFirstPartyEmotes, session.usedTwitchBadges);
 
-  let batchStr = "";
+  let ndjsonBatch = "";
   for (let i = 0; i < batch.length; i++) {
-    if (session.commentsWritten > 0 || i > 0) {
-      batchStr += ',\n    ';
-    } else {
-      batchStr += '    ';
-    }
-    batchStr += JSON.stringify(batch[i]);
-    session.commentsWritten++;
+    ndjsonBatch += JSON.stringify(batch[i]) + "\n";
+    session.commentsWritten = (session.commentsWritten || 0) + 1;
   }
 
   try {
-    session.chatStream.write(batchStr);
+    session.chatStream.write(ndjsonBatch);
+    emitSessionsDelta();
   } catch (err: any) {
-    console.error("[Chat] Error writing batched comments:", err);
+    console.error("[Chat] Error writing batched NDJSON comments:", err);
   }
 }
 
@@ -1973,147 +1571,70 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
     const activeSession = state.activeDownloadSessions[channelLogin];
     if (activeSession && !activeSession.isStopped) {
       if (activeSession.chatWs && (activeSession.chatWs.readyState === WebSocket.OPEN || activeSession.chatWs.readyState === WebSocket.CONNECTING) && activeSession.chatStream) {
-        // Chat recording is already actively streaming; prevent duplicate sockets and backups
         return;
       }
     }
 
-    addLog(`[Chat] Starting live chat recording for ${channelLogin}...`);
+    addLog(`[Chat] Starting live chat recording for ${channelLogin} (append-only journal + Hermes overlays)...`);
     const dateStr = startTime.split('T')[0];
     const chatFilePath = path.join(folderPath, `chat_${dateStr}.json`);
-    
-    // Phase 3: Recovery Check
+    const commentsJournalPath = getCommentsJournalPath(chatFilePath);
+
     let isRecovery = false;
     let recoveredOffset = 0;
     let recoveredCommentsWritten = 0;
     const existingIds = new Set<string>();
 
-    if (fs.existsSync(chatFilePath)) {
+    // 1. Recover from append-only `.comments.jsonl` journal if present
+    if (fs.existsSync(commentsJournalPath)) {
       try {
-        const stats = fs.statSync(chatFilePath);
-        // Only create backup if the file has meaningful content (> 1KB)
-        if (stats.size > 1024) {
-          let shouldCreateBackup = true;
-          try {
-            const files = fs.readdirSync(folderPath);
-            const backupFiles = files.filter(f => f.startsWith(`chat_${dateStr}_backup_`));
-            if (backupFiles.length > 0) {
-              const latestBackup = backupFiles.sort().reverse()[0];
-              const match = latestBackup.match(/backup_(\d+)\.json/);
-              if (match) {
-                const lastBackupTime = parseInt(match[1], 10);
-                if (Date.now() - lastBackupTime < 15 * 60 * 1000) {
-                  shouldCreateBackup = false; // Backed up within the last 15 minutes
-                }
-              }
-            }
-          } catch (e) {}
-
-          if (shouldCreateBackup) {
-            const backupFilePath = path.join(folderPath, `chat_${dateStr}_backup_${Date.now()}.json`);
-            try {
-              fs.copyFileSync(chatFilePath, backupFilePath);
-              addLog(`[Chat Recovery] Created safety backup of existing chat: ${path.basename(backupFilePath)}`);
-
-              // Keep at most 5 recent backups to prevent folder clutter
-              try {
-                const files = fs.readdirSync(folderPath);
-                const backups = files.filter(f => f.startsWith(`chat_${dateStr}_backup_`)).sort();
-                if (backups.length > 5) {
-                  const toDelete = backups.slice(0, backups.length - 5);
-                  for (const delFile of toDelete) {
-                    try { fs.unlinkSync(path.join(folderPath, delFile)); } catch (err) {}
-                  }
-                }
-              } catch (e) {}
-            } catch (backupErr: any) {
-              addLog(`[Chat Recovery] Note: Could not create chat backup: ${backupErr.message}`);
-            }
-          }
+        const journalRes = await readCommentsFromJournal(commentsJournalPath);
+        for (const id of journalRes.seenIds) {
+          existingIds.add(id);
         }
-
-        const content = fs.readFileSync(chatFilePath, 'utf8');
-        const commentsStartMatch = content.match(/"comments"\s*:\s*\[/);
-
-        if (commentsStartMatch && commentsStartMatch.index !== undefined) {
-          // If a dummy end message exists, slice before it so we don't truncate inside it
-          let contentToScan = content;
-          const dummyPos = content.indexOf('"_id": "dummy-end-message"');
-          if (dummyPos !== -1) {
-            const dummyStart = content.lastIndexOf('{', dummyPos);
-            if (dummyStart > commentsStartMatch.index) {
-              contentToScan = content.substring(0, dummyStart);
-            }
-          }
-
-          const lastCommentEnd = findLastCompleteCommentEnd(contentToScan);
-
-          if (lastCommentEnd !== -1 && lastCommentEnd > commentsStartMatch.index) {
-            let fd: number | null = null;
-            try {
-              fd = fs.openSync(chatFilePath, 'r+');
-              fs.ftruncateSync(fd, Buffer.byteLength(content.substring(0, lastCommentEnd), 'utf8'));
-            } finally {
-              if (fd !== null) {
-                try { fs.closeSync(fd); } catch (e) {}
-              }
-            }
-
-            const validPart = content.substring(0, lastCommentEnd);
-            for (const m of validPart.matchAll(/"_id":\s*"([^"]+)"/g)) {
-              if (m[1] !== "dummy-end-message") {
-                existingIds.add(m[1]);
-              }
-            }
-
-            const validOffsets = [...validPart.matchAll(/"content_offset_seconds":\s*([\d.]+)/g)];
-            if (validOffsets.length > 0) {
-              recoveredOffset = parseFloat(validOffsets[validOffsets.length - 1][1]);
-            }
-            recoveredCommentsWritten = validOffsets.length;
-            isRecovery = true;
-            addLog(`[Chat Recovery] Found existing chat file. Resuming from offset ${recoveredOffset.toFixed(1)}s (${recoveredCommentsWritten} messages, ${existingIds.size} unique IDs).`);
-          } else {
-            const fallbackExtracted = extractChatCommentsFallback(contentToScan);
-            const openCommentsEnd = commentsStartMatch.index + commentsStartMatch[0].length;
-            if (fallbackExtracted && Array.isArray(fallbackExtracted.comments) && fallbackExtracted.comments.length > 0) {
-              const headerPrefix = content.substring(0, openCommentsEnd);
-              const rebuiltComments = fallbackExtracted.comments
-                .map((c: any, idx: number) => (idx === 0 ? "\n    " : ",\n    ") + JSON.stringify(c))
-                .join("");
-              fs.writeFileSync(chatFilePath, headerPrefix + rebuiltComments, 'utf8');
-              for (const c of fallbackExtracted.comments) {
-                if (c._id && c._id !== "dummy-end-message") {
-                  existingIds.add(c._id);
-                }
-              }
-              const lastComment = fallbackExtracted.comments[fallbackExtracted.comments.length - 1];
-              recoveredOffset = parseFloat(String(lastComment?.content_offset_seconds || 0));
-              recoveredCommentsWritten = fallbackExtracted.comments.length;
-              isRecovery = true;
-              addLog(`[Chat Recovery] Reconstructed multi-segment chat file across mid-stream seal. Resuming from offset ${recoveredOffset.toFixed(1)}s (${recoveredCommentsWritten} messages, ${existingIds.size} unique IDs).`);
-            } else {
-              let fd: number | null = null;
-              try {
-                fd = fs.openSync(chatFilePath, 'r+');
-                fs.ftruncateSync(fd, Buffer.byteLength(content.substring(0, openCommentsEnd), 'utf8'));
-              } finally {
-                if (fd !== null) {
-                  try { fs.closeSync(fd); } catch (e) {}
-                }
-              }
-              recoveredCommentsWritten = 0;
-              isRecovery = true;
-              addLog(`[Chat Recovery] Found existing chat file header without messages. Ready for recording.`);
-            }
-          }
+        recoveredOffset = journalRes.maxOffsetSec;
+        recoveredCommentsWritten = journalRes.comments.length;
+        if (recoveredCommentsWritten > 0) {
+          isRecovery = true;
+          addLog(`[Chat Recovery] Resuming append-only chat journal from offset ${recoveredOffset.toFixed(1)}s (${recoveredCommentsWritten} messages).`);
         }
       } catch (e: any) {
-        addLog(`[Chat Recovery Error] Failed to parse existing chat file: ${e.message}`);
+        addLog(`[Chat Recovery] Note reading .comments.jsonl journal: ${e.message}`);
       }
     }
 
-    let chatStream = fs.createWriteStream(chatFilePath, { flags: isRecovery ? 'a' : 'w' });
+    // 2. Seamless migration if resuming a pre-5.3.0 session that still has an open/legacy `chat_YYYY-MM-DD.json`
+    if (fs.existsSync(chatFilePath)) {
+      try {
+        const legacyContent = await fs.promises.readFile(chatFilePath, 'utf8');
+        const legacyParsed = safeParseChatData(legacyContent, chatFilePath);
+        if (legacyParsed && Array.isArray(legacyParsed.comments) && legacyParsed.comments.length > 0) {
+          let migratedLines = "";
+          let migratedCount = 0;
+          for (const c of legacyParsed.comments) {
+            if (c && c._id && c._id !== "dummy-end-message" && !existingIds.has(c._id)) {
+              existingIds.add(c._id);
+              migratedLines += JSON.stringify(c) + "\n";
+              migratedCount++;
+              recoveredCommentsWritten++;
+              const off = Number(c.content_offset_seconds) || 0;
+              if (off > recoveredOffset) recoveredOffset = off;
+            }
+          }
+          if (migratedLines) {
+            await fs.promises.appendFile(commentsJournalPath, migratedLines, 'utf8');
+          }
+          isRecovery = true;
+          // Remove unclosed legacy JSON now that all comments are safely persisted in `.comments.jsonl`
+          await fs.promises.unlink(chatFilePath).catch(() => {});
+          addLog(`[Chat Recovery] Migrated ${migratedCount} legacy chat messages into append-only journal (resume offset: ${recoveredOffset.toFixed(1)}s).`);
+        }
+      } catch (e: any) {
+        addLog(`[Chat Recovery] Note inspecting legacy chat file: ${e.message}`);
+      }
+    }
+
+    const chatStream = fs.createWriteStream(commentsJournalPath, { flags: 'a' });
     const eventsFilePath = getEventsSidecarPath(chatFilePath);
     const eventExistingIds = new Set<string>();
     let recoveredEventsCount = 0;
@@ -2136,6 +1657,7 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
     if (state.activeDownloadSessions[channelLogin]) {
       state.activeDownloadSessions[channelLogin].chatStream = chatStream;
       state.activeDownloadSessions[channelLogin].chatFilePath = chatFilePath;
+      state.activeDownloadSessions[channelLogin].commentsJournalPath = commentsJournalPath;
       state.activeDownloadSessions[channelLogin].eventsFilePath = eventsFilePath;
       state.activeDownloadSessions[channelLogin].eventExistingIds = eventExistingIds;
       state.activeDownloadSessions[channelLogin].commentsWritten = isRecovery ? recoveredCommentsWritten : 0;
@@ -2149,48 +1671,32 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
       addLog(`[Chat] Non-fatal error fetching some 3rd party emotes.`);
     }
 
-    const headerObj = {
-      FileInfo: {
-        Version: { Major: 1, Minor: 5, Patch: 3 },
-        CreatedAt: new Date().toISOString(),
-        UpdatedAt: new Date().toISOString()
-      },
-      schemaVersion: "2.0-extended",
-      streamer: { name: channelLogin, id: parseInt(twitchId, 10) || 0 },
-      video: {
+    const headerObj = normalizeTwitchDownloaderSchema(
+      {},
+      {
+        channelLogin,
+        streamerId: twitchId,
+        streamId,
         title: state.activeDownloadSessions[channelLogin]?.currentTitle || "",
-        description: "",
-        id: streamId,
-        created_at: startTime,
-        start: 0,
-        end: 0,
-        length: 0,
-        viewCount: 0,
-        game: ""
+        createdAt: startTime,
+        gameName: state.activeDownloadSessions[channelLogin]?.currentGame || "",
+        durationSec: 0,
+        thirdPartyEmotes,
       }
-    };
+    );
 
     if (state.activeDownloadSessions[channelLogin]) {
       state.activeDownloadSessions[channelLogin].thirdPartyEmotes = thirdPartyEmotes;
       state.activeDownloadSessions[channelLogin].twitchId = twitchId;
     }
 
-    let headerStr = JSON.stringify(headerObj, null, 2);
-    headerStr = headerStr.replace('"end": 0,', '"end": 0       ,');
-    headerStr = headerStr.replace('"length": 0', '"length": 0       ');
-    headerStr = headerStr.replace(/}$/, ',\n  "comments": [\n');
-
-    if (!isRecovery) {
-      chatStream.write(headerStr);
-    }
+    await writeChatSessionHeader(chatFilePath, headerObj).catch(() => {});
 
     const startTimestamp = new Date(startTime).getTime();
     const session = state.activeDownloadSessions[channelLogin];
     const currentVideoStartMs = session?.streamCreatedAtMs || session?.videoStartTimeMs || startTimestamp;
     const currentLiveOffset = Math.max(0, (Date.now() - currentVideoStartMs) / 1000.0);
 
-    // If recovery, only backfill if there is a gap between recovered offset and current live offset (> 15s)
-    // If fresh start, wait for user prompt decision if stream was already live > 2m
     const shouldAutoBackfill = isRecovery && ((currentLiveOffset - recoveredOffset) > 15);
     const awaitsUserChoice = !isRecovery && (currentLiveOffset > 120);
     let isBackfilling = shouldAutoBackfill;
@@ -2202,17 +1708,34 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
       session.chatExistingIds = existingIds;
     }
 
+    const appendJournalBatch = (commentsToWrite: any[]): number => {
+      let count = 0;
+      let ndjson = "";
+      const s = state.activeDownloadSessions[channelLogin];
+      for (const comment of commentsToWrite) {
+        if (!comment || !comment._id || existingIds.has(comment._id)) continue;
+        ndjson += JSON.stringify(comment) + "\n";
+        existingIds.add(comment._id);
+        if (s) s.commentsWritten = (s.commentsWritten || 0) + 1;
+        count++;
+      }
+      if (ndjson) {
+        chatStream.write(ndjson);
+      }
+      return count;
+    };
+
     if (awaitsUserChoice) {
       addLog(`[Chat] Stream was already live (${Math.round(currentLiveOffset / 60)}m). Buffering live chat awaiting user backfill selection...`);
     } else if (shouldAutoBackfill) {
       addLog(`[Chat] Recovering missing gap (${recoveredOffset.toFixed(1)}s -> ${currentLiveOffset.toFixed(1)}s) chat backfill...`);
       const autoBackfillPromise = downloadVodChat(
-        channelLogin, 
-        folderPath, 
-        true, 
-        chatFilePath, 
-        recoveredOffset, 
-        isRecovery, 
+        channelLogin,
+        folderPath,
+        true,
+        chatFilePath,
+        recoveredOffset,
+        isRecovery,
         recoveredCommentsWritten,
         currentLiveOffset + 15,
         existingIds
@@ -2220,73 +1743,17 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
         if (!result || !result.backfillComments || result.backfillComments.length === 0) {
           addLog(`[Chat] No missing gap messages returned from VOD chat or VOD not yet published.`);
         } else {
-          let gapCount = 0;
-          let gapBatchStr = "";
-          for (const comment of result.backfillComments) {
-            if (!existingIds.has(comment._id)) {
-              if (state.activeDownloadSessions[channelLogin] && state.activeDownloadSessions[channelLogin].commentsWritten > 0) {
-                gapBatchStr += ',\n    ';
-              } else {
-                gapBatchStr += '    ';
-              }
-              gapBatchStr += JSON.stringify(comment);
-              if (state.activeDownloadSessions[channelLogin]) {
-                state.activeDownloadSessions[channelLogin].commentsWritten++;
-              }
-              existingIds.add(comment._id);
-              gapCount++;
-            }
-          }
-          if (gapBatchStr) {
-            chatStream.write(gapBatchStr);
-          }
+          const gapCount = appendJournalBatch(result.backfillComments);
           addLog(`[Chat] Backfill appended ${gapCount} missing gap messages.`);
         }
 
-        // Drain buffered live messages in order with a single batched write
-        let liveCount = 0;
-        let liveBatchStr = "";
-        for (const comment of liveBuffer) {
-          if (!existingIds.has(comment._id)) {
-            if (state.activeDownloadSessions[channelLogin] && state.activeDownloadSessions[channelLogin].commentsWritten > 0) {
-              liveBatchStr += ',\n    ';
-            } else {
-              liveBatchStr += '    ';
-            }
-            liveBatchStr += JSON.stringify(comment);
-            if (state.activeDownloadSessions[channelLogin]) {
-              state.activeDownloadSessions[channelLogin].commentsWritten++;
-            }
-            existingIds.add(comment._id);
-            liveCount++;
-          }
-        }
-        if (liveBatchStr) {
-          chatStream.write(liveBatchStr);
-        }
+        const liveCount = appendJournalBatch(liveBuffer);
         addLog(`[Chat] Merged ${liveCount} buffered live messages. Seamless chat resume active.`);
         isBackfilling = false;
         liveBuffer = [];
       }).catch(err => {
         addLog(`[Chat] Backfill error: ${err.message}. Resuming normal live chat.`);
-        let errBatchStr = "";
-        for (const comment of liveBuffer) {
-          if (!existingIds.has(comment._id)) {
-            if (state.activeDownloadSessions[channelLogin] && state.activeDownloadSessions[channelLogin].commentsWritten > 0) {
-              errBatchStr += ',\n    ';
-            } else {
-              errBatchStr += '    ';
-            }
-            errBatchStr += JSON.stringify(comment);
-            if (state.activeDownloadSessions[channelLogin]) {
-              state.activeDownloadSessions[channelLogin].commentsWritten++;
-            }
-            existingIds.add(comment._id);
-          }
-        }
-        if (errBatchStr) {
-          chatStream.write(errBatchStr);
-        }
+        appendJournalBatch(liveBuffer);
         isBackfilling = false;
         liveBuffer = [];
       }).finally(() => {
@@ -2348,6 +1815,16 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
       return Math.max(0, parseFloat(((eventTsMs - startMs) / 1000.0).toFixed(3)));
     };
 
+      const gifterSenderCountCache = new Map<string, number>();
+      const rewardMetadataCache = new Map<string, { title: string; cost: number; prompt: string; background_color: string }>();
+      const lastRoomState: {
+        emote_only?: boolean;
+        subs_only?: boolean;
+        slow_seconds?: number;
+        followers_only_minutes?: number;
+        r9k?: boolean;
+      } = {};
+
     function connectWebSocket() {
       const activeSession = state.activeDownloadSessions[channelLogin];
       if (!activeSession || activeSession.isStopped) {
@@ -2386,6 +1863,8 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
         ws.send('PASS SCHMOOPIIE');
         ws.send('NICK justinfan' + Math.floor(Math.random() * 100000));
         ws.send(`JOIN #${channelLogin}`);
+        state.activeDownloadSessions[channelLogin].ircConnected = true;
+        emitSessionsDelta(true);
         addLog(`[Chat] Connected to live IRCv3 chat for ${channelLogin} (capturing PRIVMSG, USERNOTICE, CLEARCHAT, CLEARMSG, ROOMSTATE).`);
 
         clearHeartbeat();
@@ -2863,6 +2342,8 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
         addLog(`[Chat] Live chat connection closed.`);
         const currentSession = state.activeDownloadSessions[channelLogin];
         if (currentSession) {
+          currentSession.ircConnected = false;
+          emitSessionsDelta(true);
           flushPendingChatWrites(currentSession);
         }
         if (currentSession && !currentSession.isStopped) {
@@ -2890,610 +2371,19 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
       ws.on('error', handleError);
     }
 
-    // Companion Twitch PubSub WebSocket Client for Predictions, Polls, Pinned Messages, Channel Points, Hype Trains & Raids
-    const lastPredictionTracker = new Map<string, { sig: string; ts: number; status: string }>();
-    const lastPollTracker = new Map<string, { sig: string; ts: number; status: string }>();
-    const activePinnedChatTracker = new Map<string, Record<string, any>>();
-    let latestActivePinId: string | null = null;
-    let activeHypeTrainState: Record<string, any> | null = null;
-    const gifterSenderCountCache = new Map<string, number>();
-    const rewardMetadataCache = new Map<string, { title: string; cost: number; prompt: string; background_color: string }>();
-    const lastRoomState: {
-      emote_only?: boolean;
-      subs_only?: boolean;
-      slow_seconds?: number;
-      followers_only_minutes?: number;
-      r9k?: boolean;
-    } = {};
-
-    function connectPubSubWebSocket() {
-      const activeSession = state.activeDownloadSessions[channelLogin];
-      if (!activeSession || activeSession.isStopped || !twitchId) {
-        return;
-      }
-
-      if (activeSession.pubsubWs) {
-        try {
-          activeSession.pubsubWs.removeAllListeners();
-          activeSession.pubsubWs.terminate();
-        } catch (_) {}
-        activeSession.pubsubWs = null;
-      }
-
-      let pubsubHeartbeat: NodeJS.Timeout | null = null;
-      const clearPubsubHeartbeat = () => {
-        if (pubsubHeartbeat) {
-          clearInterval(pubsubHeartbeat);
-          pubsubHeartbeat = null;
-        }
-        if (activeSession.pubsubHeartbeatInterval) {
-          clearInterval(activeSession.pubsubHeartbeatInterval);
-          activeSession.pubsubHeartbeatInterval = null;
-        }
-      };
-
-      const pubWs = new WebSocket('wss://pubsub-edge.twitch.tv/v1');
-      activeSession.pubsubWs = pubWs;
-
-      const handlePubOpen = () => {
-        const curSession = state.activeDownloadSessions[channelLogin];
-        if (!curSession || curSession.isStopped) {
-          clearPubsubHeartbeat();
-          try { pubWs.terminate(); } catch (_) {}
-          return;
-        }
-
-        const topics = [
-          `predictions-channel-v1.${twitchId}`,
-          `polls.${twitchId}`,
-          `pinned-chat-updates-v1.${twitchId}`,
-          `community-points-channel-v1.${twitchId}`,
-          `hype-train-events-v1.${twitchId}`,
-          `raid.${twitchId}`
-        ];
-
-        try {
-          pubWs.send(JSON.stringify({
-            type: "LISTEN",
-            nonce: `vod_auto_${channelLogin}_${Date.now()}`,
-            data: { topics }
-          }));
-          addLog(`[PubSub] Subscribed to live broadcast overlay events for @${channelLogin} (Predictions, Polls, Pinned Messages, Channel Points, Hype Trains, Raids).`);
-        } catch (err: any) {
-          addLog(`[PubSub] Failed to send LISTEN packet for @${channelLogin}: ${err.message}`);
-        }
-
-        clearPubsubHeartbeat();
-        pubsubHeartbeat = setInterval(() => {
-          const s = state.activeDownloadSessions[channelLogin];
-          if (!s || s.isStopped || pubWs.readyState !== WebSocket.OPEN) {
-            clearPubsubHeartbeat();
-            return;
-          }
-          try {
-            pubWs.send(JSON.stringify({ type: "PING" }));
-          } catch (_) {}
-        }, 210_000 + Math.floor(Math.random() * 15_000)); // ~3.5m keepalive
-        activeSession.pubsubHeartbeatInterval = pubsubHeartbeat;
-      };
-
-      const handlePubMessage = (rawData: WebSocket.Data) => {
-        const curSession = state.activeDownloadSessions[channelLogin];
-        if (!curSession || curSession.isStopped) return;
-
-        let packet: any;
-        try {
-          packet = JSON.parse(rawData.toString());
-        } catch (_) {
-          return;
-        }
-
-        if (packet.type === "RECONNECT") {
-          addLog(`[PubSub] Server requested RECONNECT for @${channelLogin}. Cycling PubSub connection...`);
-          try { pubWs.close(); } catch (_) {}
-          return;
-        }
-
-        if (packet.type !== "MESSAGE" || !packet.data?.topic || !packet.data?.message) {
-          return;
-        }
-
-        const topic: string = packet.data.topic;
-        let inner: any;
-        try {
-          inner = JSON.parse(packet.data.message);
-        } catch (_) {
-          return;
-        }
-
-        const nowMs = Date.now();
-        const offsetSec = computeOffsetSec(nowMs);
-
-        // Topic 1: Predictions (predictions-channel-v1)
-        if (topic.startsWith('predictions-channel-v1.')) {
-          const ev = inner?.data?.event;
-          if (!ev || !ev.id) return;
-
-          const predId = String(ev.id);
-          const status = String(ev.status || 'ACTIVE').toUpperCase();
-          const outcomes = Array.isArray(ev.outcomes) ? ev.outcomes.map((o: any) => ({
-            id: o.id,
-            title: o.title,
-            color: o.color,
-            total_points: o.total_points || 0,
-            total_users: o.total_users || 0,
-            top_predictors: Array.isArray(o.top_predictors) ? o.top_predictors.slice(0, 5).map((tp: any) => ({
-              user_id: tp.user_id,
-              user_display_name: tp.user_display_name,
-              points: tp.points
-            })) : []
-          })) : [];
-
-          const sig = `${status}|${outcomes.map((o: any) => `${o.id}:${o.total_points}:${o.total_users}`).join(',')}`;
-          const prev = lastPredictionTracker.get(predId);
-
-          if (inner.type === 'event-updated' && status === 'ACTIVE' && prev) {
-            if (prev.sig === sig || (nowMs - prev.ts) < 900) {
-              return;
-            }
-          }
-
-          let category = 'prediction_updated';
-          if (inner.type === 'event-created' || !prev) {
-            category = 'prediction_created';
-            addLog(`[PubSub] Prediction started on @${channelLogin}: "${ev.title}" (${outcomes.map((o: any) => o.title).join(' vs ')})`);
-          } else if (inner.type === 'event-locked' || (status === 'LOCKED' && prev.status !== 'LOCKED')) {
-            category = 'prediction_locked';
-            addLog(`[PubSub] Prediction locked on @${channelLogin}: "${ev.title}"`);
-          } else if (status === 'RESOLVED' && prev.status !== 'RESOLVED') {
-            category = 'prediction_resolved';
-            const winner = outcomes.find((o: any) => o.id === ev.winning_outcome_id);
-            addLog(`[PubSub] Prediction resolved on @${channelLogin}: "${ev.title}" -> Winner: "${winner?.title || ev.winning_outcome_id}"`);
-          } else if ((status === 'CANCELED' || status === 'CANCELLED') && prev.status !== status) {
-            category = 'prediction_canceled';
-            addLog(`[PubSub] Prediction canceled on @${channelLogin}: "${ev.title}"`);
-          }
-
-          lastPredictionTracker.set(predId, { sig, ts: nowMs, status });
-
-          appendBroadcastEvent(channelLogin, {
-            _id: `pred-${predId}-${category}-${nowMs}`,
-            created_at: new Date(nowMs).toISOString(),
-            content_offset_seconds: offsetSec,
-            source: 'pubsub',
-            type: 'prediction',
-            event_type: 'prediction',
-            category,
-            data: {
-              pubsub_type: inner.type || 'event-updated',
-              prediction_id: predId,
-              title: ev.title || "",
-              status,
-              prediction_window_seconds: ev.prediction_window_seconds || 0,
-              created_at: ev.created_at || new Date(nowMs).toISOString(),
-              locked_at: ev.locked_at || null,
-              ended_at: ev.ended_at || null,
-              winning_outcome_id: ev.winning_outcome_id || null,
-              outcomes
-            }
-          });
-          return;
-        }
-
-        // Topic 2: Polls (polls.<twitchId>)
-        if (topic.startsWith('polls.')) {
-          const poll = inner?.data?.poll;
-          if (!poll || !poll.poll_id) return;
-
-          const pollId = String(poll.poll_id);
-          const status = String(poll.status || 'ACTIVE').toUpperCase();
-          const choices = Array.isArray(poll.choices) ? poll.choices.map((c: any) => ({
-            choice_id: c.choice_id,
-            title: c.title,
-            total_voters: c.votes?.total ?? c.total_voters ?? 0,
-            bits_votes: c.votes?.bits ?? 0,
-            channel_points_votes: c.votes?.channel_points ?? 0
-          })) : [];
-          const totalVoters = choices.reduce((sum: number, c: any) => sum + (c.total_voters || 0), 0);
-
-          const sig = `${status}|${choices.map((c: any) => `${c.choice_id}:${c.total_voters}`).join(',')}`;
-          const prev = lastPollTracker.get(pollId);
-
-          if (inner.type === 'POLL_UPDATE' && status === 'ACTIVE' && prev) {
-            if (prev.sig === sig || (nowMs - prev.ts) < 900) {
-              return;
-            }
-          }
-
-          let category = 'poll_updated';
-          if (inner.type === 'POLL_CREATE' || !prev) {
-            category = 'poll_created';
-            addLog(`[PubSub] Poll started on @${channelLogin}: "${poll.title}"`);
-          } else if (inner.type === 'POLL_COMPLETE' || status === 'COMPLETED') {
-            category = 'poll_completed';
-            addLog(`[PubSub] Poll completed on @${channelLogin}: "${poll.title}"`);
-          } else if (inner.type === 'POLL_ARCHIVE' || status === 'ARCHIVED') {
-            category = 'poll_archived';
-          } else if (inner.type === 'POLL_TERMINATE' || status === 'TERMINATED') {
-            category = 'poll_terminated';
-          }
-
-          lastPollTracker.set(pollId, { sig, ts: nowMs, status });
-
-          appendBroadcastEvent(channelLogin, {
-            _id: `poll-${pollId}-${category}-${nowMs}`,
-            created_at: new Date(nowMs).toISOString(),
-            content_offset_seconds: offsetSec,
-            source: 'pubsub',
-            type: 'poll',
-            event_type: 'poll',
-            category,
-            data: {
-              pubsub_type: inner.type || 'POLL_UPDATE',
-              poll_id: pollId,
-              title: poll.title || "",
-              status,
-              duration_seconds: poll.duration_seconds || 0,
-              started_at: poll.started_at || new Date(nowMs).toISOString(),
-              ended_at: poll.ended_at || null,
-              total_voters: totalVoters,
-              choices
-            }
-          });
-          return;
-        }
-
-        // Topic 3: Moderator / Streamer Pinned Messages (pinned-chat-updates-v1.<twitchId>)
-        if (topic.startsWith('pinned-chat-updates-v1.')) {
-          const d = inner?.data;
-          if (!d) return;
-          const rawAction = inner.type === 'unpin-message'
-            ? 'unpin-message'
-            : inner.type === 'update-message'
-            ? 'update-message'
-            : 'pin-message';
-          const category = rawAction === 'unpin-message'
-            ? 'unpin_message'
-            : rawAction === 'update-message'
-            ? 'update_pinned_message'
-            : 'pin_message';
-
-          const incomingPinId = d.id || d.pin_id || null;
-          const pinId = String(incomingPinId || latestActivePinId || `pin-${nowMs}`);
-          const prevPinState = activePinnedChatTracker.get(pinId) || (latestActivePinId ? activePinnedChatTracker.get(latestActivePinId) : undefined);
-
-          const msgObj = d.message || {};
-          if (category === 'pin_message') {
-            addLog(`[PubSub] Message pinned on @${channelLogin} by ${d.pinned_by?.display_name || 'Moderator'}: "${msgObj.content?.text || ''}"`);
-          }
-
-          const hasSenderBadges = Array.isArray(msgObj.sender?.badges);
-          const senderBadges = hasSenderBadges ? msgObj.sender.badges.map((b: any) => ({
-            _id: b.id || b._id || b.setID || "",
-            version: String(b.version || "1")
-          })) : undefined;
-
-          if (senderBadges && senderBadges.length > 0) {
-            if (!curSession.usedTwitchBadges) {
-              curSession.usedTwitchBadges = new Map<string, Set<string>>();
-            }
-            for (const b of senderBadges) {
-              if (b._id && b.version) {
-                if (!curSession.usedTwitchBadges.has(b._id)) {
-                  curSession.usedTwitchBadges.set(b._id, new Set<string>());
-                }
-                curSession.usedTwitchBadges.get(b._id)!.add(b.version);
-              }
-            }
-          }
-
-          // Build delta fields only for properties actually present on this PubSub packet
-          const deltaData: Record<string, any> = {
-            action: rawAction,
-            pin_id: pinId
-          };
-
-          const rawPinType = d.type || msgObj.type;
-          if (rawPinType) {
-            deltaData.type = rawPinType;
-            deltaData.pin_type = rawPinType;
-          } else if (!prevPinState && category === 'pin_message') {
-            deltaData.type = 'MOD_PIN';
-            deltaData.pin_type = 'MOD_PIN';
-          }
-
-          if (msgObj.id !== undefined) deltaData.message_id = msgObj.id;
-          if (msgObj.content?.text !== undefined) deltaData.message_text = msgObj.content.text;
-          if (msgObj.sender?.id !== undefined) deltaData.sender_id = msgObj.sender.id;
-          if (msgObj.sender?.display_name !== undefined) deltaData.sender_display_name = msgObj.sender.display_name;
-          if (msgObj.sender !== undefined) {
-            deltaData.sender_color = msgObj.sender.chat_color || null;
-          }
-          if (senderBadges !== undefined) deltaData.sender_badges = senderBadges;
-          if (d.pinned_by?.id !== undefined) deltaData.pinned_by_id = d.pinned_by.id;
-          if (d.pinned_by?.display_name !== undefined) deltaData.pinned_by_display_name = d.pinned_by.display_name;
-          if (msgObj.starts_at !== undefined || d.starts_at !== undefined) {
-            deltaData.starts_at = msgObj.starts_at ?? d.starts_at;
-          } else if (!prevPinState && category === 'pin_message') {
-            deltaData.starts_at = Math.floor(nowMs / 1000);
-          }
-          if (msgObj.ends_at !== undefined || d.ends_at !== undefined) {
-            deltaData.ends_at = msgObj.ends_at ?? d.ends_at;
-          }
-          if (msgObj.updated_at !== undefined || d.updated_at !== undefined) {
-            deltaData.updated_at = msgObj.updated_at ?? d.updated_at;
-          } else {
-            deltaData.updated_at = Math.floor(nowMs / 1000);
-          }
-          if (d.pinned_by) {
-            deltaData.pinned_by = {
-              id: d.pinned_by.id,
-              display_name: d.pinned_by.display_name
-            };
-          }
-          if (d.unpinned_by) {
-            deltaData.unpinned_by = {
-              id: d.unpinned_by.id,
-              display_name: d.unpinned_by.display_name
-            };
-          }
-
-          const mergedData: Record<string, any> = prevPinState
-            ? { ...prevPinState, ...deltaData }
-            : deltaData;
-
-          // Keep nested message object synchronized with merged fields if message details exist
-          if (mergedData.message_id || msgObj.id || prevPinState?.message) {
-            const prevMsg = prevPinState?.message || {};
-            const prevSender = prevMsg.sender || {};
-            mergedData.message = {
-              ...prevMsg,
-              id: mergedData.message_id || prevMsg.id,
-              ...(mergedData.message_text !== undefined ? { text: mergedData.message_text } : {}),
-              ...(mergedData.sender_id || mergedData.sender_display_name || prevMsg.sender ? {
-                sender: {
-                  ...prevSender,
-                  ...(mergedData.sender_id !== undefined ? { id: mergedData.sender_id } : {}),
-                  ...(mergedData.sender_display_name !== undefined ? { display_name: mergedData.sender_display_name } : {}),
-                  chat_color: mergedData.sender_color !== undefined ? mergedData.sender_color : (prevSender.chat_color ?? null),
-                  ...(mergedData.sender_badges !== undefined ? { badges: mergedData.sender_badges } : {})
-                }
-              } : {}),
-              ...(mergedData.starts_at !== undefined ? { starts_at: mergedData.starts_at } : {}),
-              ...(mergedData.ends_at !== undefined ? { ends_at: mergedData.ends_at } : {}),
-              updated_at: mergedData.updated_at
-            };
-          }
-
-          if (category === 'unpin_message') {
-            activePinnedChatTracker.delete(pinId);
-            if (latestActivePinId === pinId) {
-              latestActivePinId = null;
-            }
-          } else {
-            activePinnedChatTracker.set(pinId, mergedData);
-            latestActivePinId = pinId;
-          }
-
-          appendBroadcastEvent(channelLogin, {
-            _id: `pin-${pinId}-${category}-${nowMs}`,
-            created_at: new Date(nowMs).toISOString(),
-            content_offset_seconds: offsetSec,
-            source: 'pubsub',
-            type: 'pinned_chat',
-            event_type: 'pinned_chat',
-            category,
-            action: rawAction,
-            data: mergedData
-          });
-          return;
-        }
-
-        // Topic 4: Channel Points Redemptions (community-points-channel-v1.<twitchId>)
-        if (topic.startsWith('community-points-channel-v1.')) {
-          const redemption = inner?.data?.redemption;
-          if (!redemption || !redemption.id) return;
-
-          const rewardId = redemption.reward?.id || "";
-          const rewardTitle = redemption.reward?.title || "";
-          const rewardCost = redemption.reward?.cost || 0;
-          const rewardPrompt = redemption.reward?.prompt || "";
-          const rewardBgColor = redemption.reward?.background_color || "#9146FF";
-
-          if (rewardId) {
-            rewardMetadataCache.set(rewardId, {
-              title: rewardTitle,
-              cost: rewardCost,
-              prompt: rewardPrompt,
-              background_color: rewardBgColor
-            });
-          }
-
-          appendBroadcastEvent(channelLogin, {
-            _id: `cp-${redemption.id}`,
-            created_at: redemption.redeemed_at || new Date(nowMs).toISOString(),
-            content_offset_seconds: offsetSec,
-            source: 'pubsub',
-            type: 'channel_points',
-            event_type: 'channel_points',
-            category: 'channel_points_custom_reward_redemption',
-            data: {
-              redemption_id: redemption.id,
-              user_id: redemption.user?.id || "",
-              user_login: redemption.user?.login || "",
-              user_display_name: redemption.user?.display_name || "",
-              reward_id: rewardId,
-              reward_title: rewardTitle,
-              reward_cost: rewardCost,
-              reward_prompt: rewardPrompt,
-              reward_background_color: rewardBgColor,
-              user_input: redemption.user_input || null,
-              status: redemption.status || "FULFILLED",
-              user: {
-                id: redemption.user?.id || "",
-                login: redemption.user?.login || "",
-                display_name: redemption.user?.display_name || ""
-              },
-              reward: {
-                id: rewardId,
-                title: rewardTitle,
-                prompt: rewardPrompt,
-                cost: rewardCost,
-                background_color: rewardBgColor
-              }
-            }
-          });
-          return;
-        }
-
-        // Topic 5: Hype Trains (hype-train-events-v1.<twitchId>)
-        if (topic.startsWith('hype-train-events-v1.')) {
-          const d = inner?.data || {};
-          const rawType = String(inner?.type || 'hype-train-progression');
-          const category = rawType.replace(/-/g, '_');
-
-          const deltaTrain: Record<string, any> = {
-            pubsub_type: rawType
-          };
-
-          const rawTrainId = d.id || d.progression?.id || d.train_id;
-          if (rawTrainId) {
-            deltaTrain.train_id = String(rawTrainId);
-          }
-
-          const rawLevel = d.progress?.level?.value ?? d.level;
-          if (rawLevel !== undefined && rawLevel !== null) {
-            deltaTrain.level = rawLevel;
-          }
-
-          const rawGoal = d.progress?.level?.goal ?? d.goal;
-          if (rawGoal !== undefined && rawGoal !== null) {
-            deltaTrain.goal = rawGoal;
-          }
-
-          const rawProgress = d.progress?.value ?? (typeof d.progress === 'number' ? d.progress : undefined) ?? d.value;
-          if (rawProgress !== undefined && rawProgress !== null) {
-            deltaTrain.progress = rawProgress;
-          }
-
-          const rawTotal = d.progress?.total ?? d.total;
-          if (rawTotal !== undefined && rawTotal !== null) {
-            deltaTrain.total = rawTotal;
-          }
-
-          if (d.started_at !== undefined) deltaTrain.started_at = d.started_at;
-          if (d.expires_at !== undefined) {
-            deltaTrain.expires_at = d.expires_at;
-            deltaTrain.ends_at = d.expires_at;
-          }
-          if (d.ended_at !== undefined) {
-            deltaTrain.ended_at = d.ended_at;
-            deltaTrain.ends_at = d.ended_at;
-          }
-          if (d.is_golden_kappa_train !== undefined) {
-            deltaTrain.is_golden_kappa = Boolean(d.is_golden_kappa_train);
-          }
-          if (d.source !== undefined && (d.user_id || d.user_login || d.user_display_name)) {
-            deltaTrain.conductor = {
-              source: d.source,
-              user_id: d.user_id || null,
-              user_login: d.user_login || null,
-              user_display_name: d.user_display_name || null,
-              participations: d.participations || null
-            };
-          }
-
-          const mergedTrainData: Record<string, any> = activeHypeTrainState
-            ? { ...activeHypeTrainState, ...deltaTrain }
-            : deltaTrain;
-
-          if (rawType === 'hype-train-end' || d.ended_at) {
-            activeHypeTrainState = null;
-          } else {
-            activeHypeTrainState = mergedTrainData;
-          }
-
-          appendBroadcastEvent(channelLogin, {
-            _id: `hypetrain-${mergedTrainData.train_id || d.channel_id || twitchId}-${category}-${nowMs}`,
-            created_at: new Date(nowMs).toISOString(),
-            content_offset_seconds: offsetSec,
-            source: 'pubsub',
-            type: 'hype_train',
-            event_type: 'hype_train',
-            category,
-            data: mergedTrainData
-          });
-          return;
-        }
-
-        // Topic 6: Outgoing / Incoming Raid Updates (raid.<twitchId>)
-        if (topic.startsWith('raid.')) {
-          const r = inner?.raid;
-          if (!r) return;
-          const rawType = String(inner.type || 'raid_update_v2');
-
-          appendBroadcastEvent(channelLogin, {
-            _id: `raid-${r.id || nowMs}-${rawType}`,
-            created_at: new Date(nowMs).toISOString(),
-            content_offset_seconds: offsetSec,
-            source: 'pubsub',
-            type: 'raid',
-            event_type: 'raid',
-            category: rawType,
-            data: {
-              pubsub_type: rawType,
-              raid_id: r.id || "",
-              source_id: r.source_id || twitchId,
-              target_id: r.target_id || "",
-              target_login: r.target_login || "",
-              target_display_name: r.target_display_name || "",
-              viewer_count: r.viewer_count || 0
-            }
-          });
-          return;
-        }
-      };
-
-      const cleanupPubListeners = () => {
-        clearPubsubHeartbeat();
-        pubWs.removeListener('open', handlePubOpen);
-        pubWs.removeListener('message', handlePubMessage);
-        pubWs.removeListener('close', handlePubClose);
-        pubWs.removeListener('error', handlePubError);
-      };
-
-      const handlePubClose = () => {
-        cleanupPubListeners();
-        const curSession = state.activeDownloadSessions[channelLogin];
-        if (curSession && !curSession.isStopped) {
-          if (curSession.pubsubReconnectTimer) {
-            clearTimeout(curSession.pubsubReconnectTimer);
-          }
-          curSession.pubsubReconnectTimer = setTimeout(() => {
-            if (state.activeDownloadSessions[channelLogin] && !state.activeDownloadSessions[channelLogin].isStopped) {
-              connectPubSubWebSocket();
-            }
-          }, 5000);
-        }
-      };
-
-      const handlePubError = (err: any) => {
-        addLog(`[PubSub] WebSocket notice for @${channelLogin}: ${err.message}`);
-      };
-
-      pubWs.on('open', handlePubOpen);
-      pubWs.on('message', handlePubMessage);
-      pubWs.on('close', handlePubClose);
-      pubWs.on('error', handlePubError);
-    }
-
     connectWebSocket();
-    connectPubSubWebSocket();
+    attachHermesOverlayClient({
+      channelLogin,
+      twitchId,
+      rewardMetadataCache,
+      computeOffsetSec,
+      appendBroadcastEvent,
+    });
   }
 
   /**
    * Resolves a pending backfill choice for live chat (Full VOD, Current Game Only, or No Backfill).
-   * Ensures seamless ordering and zero duplicate messages.
+   * Appends cleanly to `.comments.jsonl` ensuring seamless ordering and zero duplicate messages.
    */
   export async function resolveLiveChatBackfill(
     channelLogin: string,
@@ -3508,26 +2398,31 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
     const existingIds = session.chatExistingIds || new Set<string>();
     const liveBuffer = session.liveChatBuffer || [];
 
+    const writeJournalLines = (comments: any[], recomputeBroadcastOffsetMs?: number): number => {
+      let count = 0;
+      let ndjson = "";
+      for (const comment of comments) {
+        if (!comment || !comment._id || existingIds.has(comment._id)) continue;
+        if (recomputeBroadcastOffsetMs && comment.created_at) {
+          const t = new Date(comment.created_at).getTime();
+          if (Number.isFinite(t)) {
+            comment.content_offset_seconds = Math.max(0, parseFloat(((t - recomputeBroadcastOffsetMs) / 1000.0).toFixed(3)));
+          }
+        }
+        ndjson += JSON.stringify(comment) + "\n";
+        session.commentsWritten = (session.commentsWritten || 0) + 1;
+        existingIds.add(comment._id);
+        count++;
+      }
+      if (ndjson) {
+        chatStream.write(ndjson);
+      }
+      return count;
+    };
+
     if (mode === 'none') {
       session.isAwaitingBackfillChoice = false;
-      let liveCount = 0;
-      let liveBatchStr = "";
-      for (const comment of liveBuffer) {
-        if (!existingIds.has(comment._id)) {
-          if (session.commentsWritten > 0 || liveCount > 0) {
-            liveBatchStr += ',\n    ';
-          } else {
-            liveBatchStr += '    ';
-          }
-          liveBatchStr += JSON.stringify(comment);
-          session.commentsWritten++;
-          existingIds.add(comment._id);
-          liveCount++;
-        }
-      }
-      if (liveBatchStr) {
-        chatStream.write(liveBatchStr);
-      }
+      const liveCount = writeJournalLines(liveBuffer);
       session.liveChatBuffer = [];
       addLog(`[Chat] User chose No Backfill. Appended ${liveCount} buffered live messages. Continuing live chat.`);
       return;
@@ -3560,21 +2455,10 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
         if (!session.usedTwitchBadges) session.usedTwitchBadges = new Map<string, Set<string>>();
         extractUsedEmotesAndBadgesFromComments(result.backfillComments, undefined, session.usedFirstPartyEmotes, session.usedTwitchBadges);
 
-        let gapCount = 0;
-        for (const comment of result.backfillComments) {
-          if (!existingIds.has(comment._id)) {
-            if (session.commentsWritten > 0) {
-              chatStream.write(',\n');
-            }
-            chatStream.write(JSON.stringify(comment));
-            session.commentsWritten++;
-            existingIds.add(comment._id);
-            gapCount++;
-          }
-        }
+        const gapCount = writeJournalLines(result.backfillComments);
         addLog(`[Chat] Backfill appended ${gapCount} messages from VOD.`);
 
-        // Immediately generate paired standalone VOD backfill chat JSON directly from backfill comments
+        // Immediately generate paired standalone VOD backfill chat JSON directly from in-memory backfill dataset
         try {
           const dateMatch = session.folderPath.match(/_(\d{4}-\d{2}-\d{2})_/);
           const dateStr = dateMatch ? dateMatch[1] : new Date().toISOString().split('T')[0];
@@ -3599,59 +2483,33 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
             standaloneDuration = Math.max(1, lastOffset);
           }
 
-          let streamerId = 0;
-          if (session.twitchId) {
-            streamerId = parseInt(String(session.twitchId), 10) || 0;
-          }
-          if (!streamerId && session.chatFilePath && fs.existsSync(session.chatFilePath)) {
-            try {
-              const head = fs.readFileSync(session.chatFilePath, 'utf8').slice(0, 4096);
-              const m = head.match(/"streamer"\s*:\s*\{[^}]*"id"\s*:\s*"?(\d+)"?/);
-              if (m && m[1]) {
-                streamerId = parseInt(m[1], 10) || 0;
-              }
-            } catch (_) {}
-          }
-
-          const standalonePayload: any = {
-            FileInfo: {
-              Version: { Major: 1, Minor: 5, Patch: 3 },
-              CreatedAt: new Date().toISOString(),
-              UpdatedAt: new Date().toISOString()
+          const standalonePayload = normalizeTwitchDownloaderSchema(
+            {
+              comments: standaloneComments,
+              events: [],
+              ...(session.thirdPartyEmotes ? { emotes: session.thirdPartyEmotes } : {}),
             },
-            streamer: {
-              name: channelLogin,
-              id: streamerId
-            },
-            comments: standaloneComments,
-            video: {
+            {
+              channelLogin,
+              streamerId: session.twitchId,
+              streamId: session.streamId || "",
               title: session.currentTitle || "",
-              description: "",
-              id: session.streamId || "",
-              created_at: session.startTime || new Date(broadcastStartMs).toISOString(),
-              start: 0,
-              end: standaloneDuration,
-              length: standaloneDuration,
-              viewCount: 0,
-              game: vodGameName || ""
-            },
-            embeddedData: {
-              thirdParty: session.thirdPartyEmotes || [],
-              firstParty: [],
-              twitchBadges: []
+              createdAt: session.startTime || new Date(broadcastStartMs).toISOString(),
+              gameName: vodGameName || "",
+              durationSec: standaloneDuration,
+              thirdPartyEmotes: session.thirdPartyEmotes || [],
             }
-          };
+          );
 
-          if (session.thirdPartyEmotes) {
-            standalonePayload.emotes = session.thirdPartyEmotes;
-          }
+          await populateEmbeddedDataForChat(
+            standalonePayload,
+            standalonePayload.streamer.name,
+            standalonePayload.streamer.id
+          );
 
-          await populateEmbeddedDataForChat(standalonePayload, channelLogin, streamerId);
+          await writeJsonAtomic(vodOutChatPath, standalonePayload);
+          addLog(`[VOD Chat] Successfully generated standalone paired chat: ${vodJsonOutputName} (${standaloneComments.length} messages, duration: ${standaloneDuration}s, streamer.id: ${standalonePayload.streamer.id}).`);
 
-          await fs.promises.writeFile(vodOutChatPath, JSON.stringify(standalonePayload, null, 2), 'utf8');
-          addLog(`[VOD Chat] Successfully generated standalone paired chat: ${vodJsonOutputName} (${standaloneComments.length} messages, duration: ${standaloneDuration}s, streamer.id: ${streamerId}).`);
-
-          // In Chat-Only mode, backfillVod is not invoked, so surface completion task & auto-render directly here
           if (session.captureMode === 'chat_only') {
             const vodChatTaskId = `vod_chat_backfill_${session.streamId}_${Date.now()}`;
             updateTask(
@@ -3693,28 +2551,7 @@ export async function startLiveChatDownload(channelLogin: string, folderPath: st
       addLog(`[Chat] Non-fatal error backfilling chat: ${err.message}`);
     } finally {
       session.isAwaitingBackfillChoice = false;
-      let liveCount = 0;
-      let liveBatchStr = "";
-      for (const comment of liveBuffer) {
-        if (!existingIds.has(comment._id)) {
-          if (comment.created_at && broadcastStartMs) {
-            const t = new Date(comment.created_at).getTime();
-            comment.content_offset_seconds = Math.max(0, (t - broadcastStartMs) / 1000.0);
-          }
-          if (session.commentsWritten > 0 || liveCount > 0) {
-            liveBatchStr += ',\n    ';
-          } else {
-            liveBatchStr += '    ';
-          }
-          liveBatchStr += JSON.stringify(comment);
-          session.commentsWritten++;
-          existingIds.add(comment._id);
-          liveCount++;
-        }
-      }
-      if (liveBatchStr) {
-        chatStream.write(liveBatchStr);
-      }
+      const liveCount = writeJournalLines(liveBuffer, broadcastStartMs);
       session.liveChatBuffer = [];
       addLog(`[Chat] Merged ${liveCount} live messages. Seamless chat active.`);
     }
